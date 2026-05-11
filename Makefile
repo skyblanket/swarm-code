@@ -6,11 +6,9 @@ SWC     := $(SWARMRT)/bin/swc
 SRC_DIR := src
 BIN     := bin/swarm-code
 
-SOURCES := $(SRC_DIR)/main.sw \
-           $(SRC_DIR)/agent.sw \
-           $(SRC_DIR)/llm.sw \
-           $(SRC_DIR)/tools.sw \
-           $(SRC_DIR)/prompts.sw
+# All .sw files — let make rebuild on any change. Easier than
+# maintaining this list by hand every time we add a module.
+SOURCES := $(wildcard $(SRC_DIR)/*.sw)
 
 .PHONY: all clean run
 

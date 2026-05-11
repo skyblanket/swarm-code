@@ -2,6 +2,8 @@ module LLM
 
 import Log
 import ToolSchemas
+import Markdown
+import UI
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -413,7 +415,13 @@ fun chat_native(messages, opts) {
                     }
                     prose = if (raw_content == nil) { "" } else { to_string(raw_content) }
                     if (string_length(string_trim(prose)) > 0) {
-                        print("  " ++ prose)
+                        # Run prose through markdown renderer: headers
+                        # become bold, **bold** / `code` get ANSI
+                        # styling, lines soft-wrap at word boundaries.
+                        # Without this, the model's `### Header` and
+                        # `**bold**` show literal markers and the
+                        # terminal hard-wraps mid-word.
+                        print(Markdown.render(prose, UI.term_width()))
                         print("")
                     }
 
