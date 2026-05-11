@@ -1,0 +1,1160 @@
+module Tools
+
+# ============================================================
+# Tools — bash, read, write, edit, multi_edit, glob, grep,
+#         todo_write, web_fetch, task
+# ============================================================
+#
+# Each tool is dispatched by atom name. Arguments arrive as a
+# parsed map (from json_decode on the arguments block of a
+# <tool_call>). Each handler returns a string result that gets
+# sent back to the model.
+#
+# Most tools wrap existing swarmrt builtins — shell(), file_read(),
+# file_write(), string_replace(), http_get() — which keeps the .sw
+# source tiny.
+#
+# Tools that need session state (todos, permissions, etc.) take an
+# `opts` map as the third arg. For simple stateless tools the opts
+# argument is ignored.
+
+import Memory
+import Background
+import Heartbeat
+import Telemetry
+
+export [exec, max_output_bytes]
+
+# Keep tool output well under the 32K context so even a long history +
+# a big bash stdout doesn't push the KV cache over. 6 KB ≈ ~1500 tokens.
+fun max_output_bytes() { 6000 }
+
+# Dispatch a tool call by name.
+fun exec(name, args, opts) {
+    if (name == 'bash') { do_bash(args) }
+    else { if (name == 'read') { do_read(args) }
+    else { if (name == 'write') { do_write(args) }
+    else { if (name == 'edit') { do_edit(args) }
+    else { if (name == 'multi_edit') { do_multi_edit(args) }
+    else { if (name == 'glob') { do_glob(args) }
+    else { if (name == 'grep') { do_grep(args) }
+    else { if (name == 'todo_write') { do_todo_write(args, opts) }
+    else { if (name == 'web_fetch') { do_web_fetch(args) }
+    else { if (name == 'remember') { do_remember(args, opts) }
+    else { if (name == 'recall') { do_recall(args, opts) }
+    else { if (name == 'memory_list') { do_memory_list(args, opts) }
+    else { if (name == 'forget') { do_forget(args, opts) }
+    else { if (name == 'background') { do_background(args, opts) }
+    else { if (name == 'bg_status') { do_bg_status(args, opts) }
+    else { if (name == 'bg_result') { do_bg_result(args, opts) }
+    else { if (name == 'bg_server') { do_bg_server(args, opts) }
+    else { if (name == 'bg_tail') { do_bg_tail(args, opts) }
+    else { if (name == 'bg_kill') { do_bg_kill(args, opts) }
+    else { if (name == 'sys_stats') { Telemetry.sys_stats() }
+    else { if (name == 'heartbeat_status') { do_heartbeat_status(opts) }
+    else { if (name == 'web_search') { do_web_search(args) }
+    else { if (name == 'git_status') { do_git_status(args) }
+    else { if (name == 'git_diff') { do_git_diff(args) }
+    else { if (name == 'git_commit') { do_git_commit(args) }
+    else { if (name == 'code_search') { do_code_search(args) }
+    else { if (name == 'log_wait') { do_log_wait(args, opts) }
+    else { if (name == 'file_watch') { do_file_watch(args) }
+    else { "error: unknown tool '" ++ to_string(name) ++ "'"
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}
+}
+
+# ------------------------------------------------------------
+# Timeout infrastructure
+# ------------------------------------------------------------
+# Every tool that shells out gets wrapped by `with_timeout()` so a
+# hanging command (tail -f, infinite loop, stuck DNS, unresponsive
+# git remote) never pins the whole agent.
+#
+# Mechanism: we prefix the command with `perl -e 'alarm shift; exec
+# @ARGV'`. Perl sets an alarm(N) timer in its own process, then
+# `exec()`s the real command in place. The kernel preserves the
+# pending SIGALRM across exec, so after N seconds SIGALRM fires on
+# whatever the command replaced perl with and terminates it. Zero
+# external deps — perl is on every macOS box.
+#
+# Timeout defaults mirror Claude Code:
+#   bash:       120s default, 600s max, overridable via timeout_ms arg
+#   git/search: 30s (no override — if you need more, use bash directly)
+#   web_fetch:  45s (HTTP is flakier, give it more)
+# ------------------------------------------------------------
+fun bash_default_timeout_s() { 120 }
+fun bash_max_timeout_s() { 600 }
+fun search_timeout_s() { 30 }
+fun git_timeout_s() { 30 }
+fun fetch_timeout_s() { 45 }
+
+# Wrap a shell command with a perl alarm guard. The resulting string
+# can be passed to `shell()` as if it were the original command.
+# SIGALRM terminates the target with exit code 142 (128 + 14), which
+# callers can detect to surface a friendly timeout message.
+fun with_timeout(cmd, seconds) {
+    "perl -e 'alarm shift; exec @ARGV' " ++ to_string(seconds) ++
+    " sh -c " ++ shell_quote(to_string(cmd))
+}
+
+# Given the exit code and output from a shell() call wrapped by
+# with_timeout, return a formatted tool result. If the exit code is
+# 142 (SIGALRM), prepend a visible "timed out" banner so the model
+# knows to retry with a longer budget instead of guessing.
+fun format_timed_result(code, out, seconds) {
+    if (code == 142) {
+        "[timed out after " ++ to_string(seconds) ++ "s — process killed by SIGALRM]\n" ++
+        "(partial output below; retry with a larger timeout_ms or a tighter query)\n\n" ++
+        out
+    } else {
+        "[exit " ++ to_string(code) ++ "]\n" ++ out
+    }
+}
+
+# Clamp a millisecond timeout into [1000, bash_max_timeout_s() * 1000]
+# and convert to seconds. Handles the model passing nil, a string, or
+# a silly number. Returns a positive integer seconds count.
+fun resolve_bash_timeout_s(timeout_ms_raw) {
+    if (timeout_ms_raw == nil) { bash_default_timeout_s() }
+    else {
+        ms = to_string(timeout_ms_raw)
+        parsed = parse_int_safe(ms, bash_default_timeout_s() * 1000)
+        max_ms = bash_max_timeout_s() * 1000
+        clamped = if (parsed <= 0) { bash_default_timeout_s() * 1000 }
+                  else { if (parsed > max_ms) { max_ms } else { parsed } }
+        # Floor division to seconds, minimum 1s.
+        s = clamped / 1000
+        if (s < 1) { 1 } else { s }
+    }
+}
+
+fun parse_int_safe(s, fallback) {
+    parse_int_safe_loop(s, 0, 0, fallback, 'false')
+}
+
+fun parse_int_safe_loop(s, i, acc, fallback, saw_digit) {
+    if (i >= string_length(s)) {
+        if (saw_digit == 'true') { acc } else { fallback }
+    } else {
+        ch = string_sub(s, i, 1)
+        d = digit_of(ch)
+        if (d < 0) {
+            if (saw_digit == 'true') { acc } else { fallback }
+        } else {
+            parse_int_safe_loop(s, i + 1, acc * 10 + d, fallback, 'true')
+        }
+    }
+}
+
+fun digit_of(ch) {
+    if (ch == "0") { 0 } else { if (ch == "1") { 1 }
+    else { if (ch == "2") { 2 } else { if (ch == "3") { 3 }
+    else { if (ch == "4") { 4 } else { if (ch == "5") { 5 }
+    else { if (ch == "6") { 6 } else { if (ch == "7") { 7 }
+    else { if (ch == "8") { 8 } else { if (ch == "9") { 9 }
+    else { 0 - 1 }}}}}}}}}}
+}
+
+# ------------------------------------------------------------
+# bash
+# ------------------------------------------------------------
+# Output is capped at BOTH 100 lines and 6KB. Commands like `ls -R`
+# on large trees produce 400+ short lines that fit under the byte
+# cap but blow the model's effective context anyway. The truncation
+# marker tells the model to use a tighter query next time.
+#
+# Accepts an optional `timeout_ms` (1000..600000, default 120000).
+# Hanging commands are killed via SIGALRM and the model is told to
+# retry with a larger budget.
+#
+# Non-interactive by default. Every command runs with:
+#   * stdin redirected from /dev/null (no tool can read from a tty)
+#   * CI=1, DEBIAN_FRONTEND=noninteractive, NO_COLOR=1 in env
+# This prevents scaffolders like `npm create vite`, `cargo new`,
+# `yarn create`, and apt from hanging on prompts that would never
+# be answered. CI=1 also makes most tools skip interactive wizards.
+fun do_bash(args) {
+    cmd = map_get(args, 'command')
+    timeout_raw = map_get(args, 'timeout_ms')
+    if (cmd == nil) {
+        "error: missing 'command' argument"
+    } else {
+        t_s = resolve_bash_timeout_s(timeout_raw)
+        user_cmd = to_string(cmd)
+        noninteractive = noninteractive_wrap(user_cmd)
+        wrapped = with_timeout(noninteractive, t_s)
+        result = shell(wrapped)
+        code = elem(result, 0)
+        out = elem(result, 1)
+        line_capped = truncate_output_lines(out, bash_max_lines())
+        byte_capped = truncate_output(line_capped, max_output_bytes())
+        format_timed_result(code, byte_capped, t_s)
+    }
+}
+
+# Wrap a user command in a subshell that:
+#   - exports CI=1 and friends BEFORE the command runs (so every
+#     child process, including npm/cargo/pip subcommands, sees them)
+#   - redirects stdin from /dev/null (closes the tty ghost)
+#   - merges stderr into stdout for capture
+# Applied before the timeout wrapper so the alarm covers the whole
+# pipeline including the `export` setup.
+fun noninteractive_wrap(user_cmd) {
+    "( export CI=1 DEBIAN_FRONTEND=noninteractive NO_COLOR=1 FORCE_COLOR=0 " ++
+    "NPM_CONFIG_YES=true PIP_DISABLE_PIP_VERSION_CHECK=1 " ++
+    "PYTHONUNBUFFERED=1; " ++
+    user_cmd ++ " ) </dev/null 2>&1"
+}
+
+fun bash_max_lines() { 100 }
+
+# ------------------------------------------------------------
+# read
+# ------------------------------------------------------------
+fun do_read(args) {
+    path = map_get(args, 'path')
+    if (path == nil) {
+        path2 = map_get(args, 'file_path')
+        if (path2 == nil) {
+            "error: missing 'path' argument"
+        } else {
+            read_file_capped(path2)
+        }
+    } else {
+        read_file_capped(path)
+    }
+}
+
+fun read_file_capped(path) {
+    # Check if file is binary before reading — binary content poisons the
+    # model's context and causes empty responses.
+    file_type = elem(shell("file --brief --mime-type " ++ shell_quote(to_string(path))), 1)
+    is_text = string_starts_with(string_trim(file_type), "text") == 'true'
+    is_json = string_contains(file_type, "json") == 'true'
+    is_xml = string_contains(file_type, "xml") == 'true'
+    if (is_text == 'true' || is_json == 'true' || is_xml == 'true') {
+        content = file_read(path)
+        if (content == nil) {
+            "error: could not read " ++ path
+        } else {
+            truncate_output(content, max_output_bytes())
+        }
+    } else {
+        "error: binary file (" ++ string_trim(file_type) ++ ") — " ++ to_string(path) ++
+        "\nUse bash with hexdump, xxd, strings, or file to inspect binary files."
+    }
+}
+
+# ------------------------------------------------------------
+# write
+# ------------------------------------------------------------
+fun do_write(args) {
+    path = resolve_path_arg(args)
+    content = map_get(args, 'content')
+    if (path == nil) {
+        "error: missing path"
+    } else {
+        if (content == nil) {
+            "error: missing content"
+        } else {
+            rc = file_write(path, content)
+            if (rc == 'ok') {
+                "ok: wrote " ++ to_string(string_length(content)) ++ " bytes to " ++ path
+            } else {
+                "error: file_write failed for " ++ path
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# edit — exact string replacement (single occurrence required)
+# ------------------------------------------------------------
+fun do_edit(args) {
+    path = resolve_path_arg(args)
+    old_s = map_get(args, 'old_string')
+    new_s = map_get(args, 'new_string')
+    if (path == nil) { "error: missing path" }
+    else {
+        if (old_s == nil) { "error: missing old_string" }
+        else {
+            if (new_s == nil) { "error: missing new_string" }
+            else { do_edit_impl(path, old_s, new_s) }
+        }
+    }
+}
+
+fun do_edit_impl(path, old_s, new_s) {
+    original = file_read(path)
+    if (original == nil) {
+        # Missing file. Empty old_string = create it with new_string.
+        if (string_length(old_s) == 0) {
+            rc_c = file_write(path, new_s)
+            if (rc_c == 'ok') {
+                "ok: created " ++ path ++ " (" ++ to_string(string_length(new_s)) ++ " bytes)"
+            } else { "error: could not create " ++ path }
+        } else {
+            "error: file " ++ path ++ " does not exist. Use write to create it, or call edit with old_string=\"\" to initialize it with new_string."
+        }
+    } else {
+        if (string_length(original) == 0) {
+            # Empty file. Empty old_string = initialize. Non-empty = can't match.
+            if (string_length(old_s) == 0) {
+                rc_i = file_write(path, new_s)
+                if (rc_i == 'ok') {
+                    "ok: initialized " ++ path ++ " (" ++ to_string(string_length(new_s)) ++ " bytes)"
+                } else { "error: could not write " ++ path }
+            } else {
+                "error: file " ++ path ++ " is empty. Use write to replace it, or edit with old_string=\"\" to populate it."
+            }
+        } else {
+            if (string_length(old_s) == 0) {
+                # Empty old_string on non-empty file = append new_string
+                rc_a = file_write(path, original ++ new_s)
+                if (rc_a == 'ok') {
+                    "ok: appended " ++ to_string(string_length(new_s)) ++ " bytes to " ++ path
+                } else { "error: could not write " ++ path }
+            } else {
+                if (string_contains(original, old_s) == 'false') {
+                    "error: old_string not found in " ++ path ++ ". Read the file first, then retry with an exact substring."
+                } else {
+                    first_replaced = string_replace(original, old_s, new_s)
+                    if (string_contains(first_replaced, old_s) == 'true') {
+                        "error: old_string appears multiple times in " ++ path ++ " — add more context to make it unique"
+                    } else {
+                        rc_r = file_write(path, first_replaced)
+                        if (rc_r == 'ok') {
+                            "ok: edited " ++ path
+                        } else {
+                            "error: could not write " ++ path
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# glob — find files by pattern (shell-backed)
+# ------------------------------------------------------------
+fun do_glob(args) {
+    pattern = map_get(args, 'pattern')
+    path = map_get(args, 'path')
+    if (pattern == nil) {
+        "error: missing 'pattern'"
+    } else {
+        base = if (path == nil) { "." } else { to_string(path) }
+        # Both path and pattern come from the model — quote them so a
+        # malicious or accidental quote can't break out of the command.
+        cmd = "find " ++ shell_quote(base) ++ " -type f -name " ++
+              shell_quote(to_string(pattern)) ++ " 2>/dev/null | head -n 80"
+        result = shell(with_timeout(cmd, search_timeout_s()))
+        code = elem(result, 0)
+        out = elem(result, 1)
+        if (code == 142) {
+            "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
+        } else {
+            if (string_length(out) == 0) { "(no matches)" } else { out }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# grep — content search (shell-backed, ripgrep if available, 30s)
+# ------------------------------------------------------------
+fun do_grep(args) {
+    pattern = map_get(args, 'pattern')
+    path = map_get(args, 'path')
+    if (pattern == nil) {
+        "error: missing 'pattern'"
+    } else {
+        base = if (path == nil) { "." } else { to_string(path) }
+        base_q = shell_quote(base)
+        cmd = "(command -v rg >/dev/null && rg -n --no-heading --color=never -e " ++
+              shell_quote(to_string(pattern)) ++ " " ++ base_q ++
+              " || grep -rn --color=never -e " ++ shell_quote(to_string(pattern)) ++
+              " " ++ base_q ++ ") 2>&1 | head -n 80"
+        result = shell(with_timeout(cmd, search_timeout_s()))
+        code = elem(result, 0)
+        out = elem(result, 1)
+        if (code == 142) {
+            "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
+        } else {
+            if (string_length(out) == 0) { "(no matches)" } else { out }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# helpers
+# ------------------------------------------------------------
+
+# Accept either 'path' or 'file_path' (Claude Code uses file_path).
+fun resolve_path_arg(args) {
+    p = map_get(args, 'path')
+    if (p != nil) { p } else { map_get(args, 'file_path') }
+}
+
+# Truncate long output to prevent context blowup.
+fun truncate_output(s, cap) {
+    if (string_length(s) <= cap) {
+        s
+    } else {
+        head = string_sub(s, 0, cap)
+        head ++ "\n...[truncated — output exceeded " ++ to_string(cap) ++
+        " bytes. Use a tighter query (head/grep/sed) to get specific info.]"
+    }
+}
+
+# Truncate output to a maximum number of lines. Keeps the first N lines
+# and appends a marker telling the model how many lines were dropped.
+fun truncate_output_lines(s, max_lines) {
+    lines = string_split(s, "\n")
+    total = length(lines)
+    if (total <= max_lines) {
+        s
+    } else {
+        kept = take_first_lines(lines, max_lines, [])
+        head = join_lines(kept, "")
+        dropped = total - max_lines
+        head ++ "\n...[truncated — " ++ to_string(dropped) ++
+        " more lines dropped. Use head/grep/find -maxdepth for a tighter view.]"
+    }
+}
+
+fun take_first_lines(lst, n, acc) {
+    if (n <= 0) { acc }
+    else {
+        if (length(lst) == 0) { acc }
+        else { take_first_lines(tl(lst), n - 1, list_append(acc, hd(lst))) }
+    }
+}
+
+fun join_lines(lst, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        sep = if (string_length(acc) == 0) { "" } else { "\n" }
+        join_lines(tl(lst), acc ++ sep ++ h)
+    }
+}
+
+# Proper shell single-quote wrap. Each embedded single quote is replaced
+# with '\'' — close the current single-quoted string, insert an escaped
+# single quote, reopen the single-quoted string. Handles Python source
+# with raw strings, jq filters, anything.
+fun shell_quote(s) {
+    safe = string_replace(s, "'", "'\\''")
+    "'" ++ safe ++ "'"
+}
+
+# Whitelist check: lowercase letters only. Used to vet things we
+# splice into shell as flags (rg --type=<lang>) where the value must
+# never be a shell metachar.
+fun is_simple_word(s) {
+    if (string_length(s) == 0) { 'false' }
+    else { is_simple_word_loop(s, 0) }
+}
+
+fun is_simple_word_loop(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else {
+        ch = string_sub(s, i, 1)
+        ok = if (ch == "a") { 'true' } else { if (ch == "b") { 'true' }
+            else { if (ch == "c") { 'true' } else { if (ch == "d") { 'true' }
+            else { if (ch == "e") { 'true' } else { if (ch == "f") { 'true' }
+            else { if (ch == "g") { 'true' } else { if (ch == "h") { 'true' }
+            else { if (ch == "i") { 'true' } else { if (ch == "j") { 'true' }
+            else { if (ch == "k") { 'true' } else { if (ch == "l") { 'true' }
+            else { if (ch == "m") { 'true' } else { if (ch == "n") { 'true' }
+            else { if (ch == "o") { 'true' } else { if (ch == "p") { 'true' }
+            else { if (ch == "q") { 'true' } else { if (ch == "r") { 'true' }
+            else { if (ch == "s") { 'true' } else { if (ch == "t") { 'true' }
+            else { if (ch == "u") { 'true' } else { if (ch == "v") { 'true' }
+            else { if (ch == "w") { 'true' } else { if (ch == "x") { 'true' }
+            else { if (ch == "y") { 'true' } else { if (ch == "z") { 'true' }
+            else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}
+        if (ok == 'false') { 'false' }
+        else { is_simple_word_loop(s, i + 1) }
+    }
+}
+
+# Pure digit check — used to vet numeric args we splice into shell.
+fun is_digits_only(s) {
+    if (string_length(s) == 0) { 'false' }
+    else { is_digits_loop(s, 0) }
+}
+
+fun is_digits_loop(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else {
+        ch = string_sub(s, i, 1)
+        d = digit_of(ch)
+        if (d < 0) { 'false' }
+        else { is_digits_loop(s, i + 1) }
+    }
+}
+
+# ------------------------------------------------------------
+# remember — save a memory crumb at ~/.swarm-code/memory/<slug>.md
+# ------------------------------------------------------------
+# Schema matches Claude Code: each memory has a name (title), a
+# one-line description used for retrieval decisions, a type tag
+# (user | feedback | project | reference), and a content body.
+fun do_remember(args, opts) {
+    name = map_get(args, 'name')
+    desc = map_get(args, 'description')
+    type_ = map_get(args, 'type')
+    content = map_get(args, 'content')
+    if (name == nil) {
+        # Back-compat: accept the old {key, value} shape too.
+        old_key = map_get(args, 'key')
+        old_val = map_get(args, 'value')
+        if (old_key == nil || old_val == nil) {
+            "error: remember needs 'name', 'description', 'type', 'content'"
+        } else {
+            Memory.save(to_string(old_key),
+                        "(legacy entry)",
+                        "user",
+                        to_string(old_val))
+        }
+    } else {
+        d = if (desc == nil) { "(no description)" } else { to_string(desc) }
+        t = if (type_ == nil) { "user" } else { to_string(type_) }
+        c = if (content == nil) { "" } else { to_string(content) }
+        Memory.save(to_string(name), d, t, c)
+    }
+}
+
+# ------------------------------------------------------------
+# recall — read one memory file by slug or name
+# ------------------------------------------------------------
+fun do_recall(args, opts) {
+    k = map_get(args, 'slug')
+    k2 = if (k == nil) { map_get(args, 'key') } else { k }
+    k3 = if (k2 == nil) { map_get(args, 'name') } else { k2 }
+    if (k3 == nil) { "error: recall needs 'slug' (or 'name')" }
+    else {
+        v = Memory.recall(to_string(k3))
+        if (v == nil) { "error: no memory named '" ++ to_string(k3) ++ "'" }
+        else { to_string(v) }
+    }
+}
+
+# ------------------------------------------------------------
+# memory_list — show the full MEMORY.md index
+# ------------------------------------------------------------
+fun do_memory_list(args, opts) {
+    idx = Memory.list_index()
+    if (string_length(string_trim(idx)) == 0) { "(no memories yet)" }
+    else { idx }
+}
+
+# ------------------------------------------------------------
+# forget — delete a memory file
+# ------------------------------------------------------------
+fun do_forget(args, opts) {
+    k = map_get(args, 'slug')
+    k2 = if (k == nil) { map_get(args, 'name') } else { k }
+    if (k2 == nil) { "error: forget needs 'slug' (or 'name')" }
+    else { Memory.forget(to_string(k2)) }
+}
+
+# ------------------------------------------------------------
+# background — kick off an async shell task
+# ------------------------------------------------------------
+fun do_background(args, opts) {
+    cmd = map_get(args, 'command')
+    label = map_get(args, 'label')
+    bg_table = map_get(opts, 'bg_table')
+    if (cmd == nil) { "error: background needs 'command'" }
+    else {
+        if (bg_table == nil) { "error: background system not initialized" }
+        else {
+            label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
+            id = Background.launch(bg_table, to_string(cmd), label_str)
+            "launched " ++ id ++ ": " ++ label_str ++
+                "\n(use bg_status and bg_result to check progress)"
+        }
+    }
+}
+
+fun do_bg_status(args, opts) {
+    id = map_get(args, 'task_id')
+    bg_table = map_get(opts, 'bg_table')
+    if (id == nil) { "error: bg_status needs 'task_id'" }
+    else {
+        if (bg_table == nil) { "error: background system not initialized" }
+        else {
+            s = Background.status(bg_table, to_string(id))
+            to_string(s)
+        }
+    }
+}
+
+fun do_bg_result(args, opts) {
+    id = map_get(args, 'task_id')
+    bg_table = map_get(opts, 'bg_table')
+    if (id == nil) { "error: bg_result needs 'task_id'" }
+    else {
+        if (bg_table == nil) { "error: background system not initialized" }
+        else { Background.result(bg_table, to_string(id)) }
+    }
+}
+
+# ------------------------------------------------------------
+# heartbeat_status — query the pulse
+# ------------------------------------------------------------
+fun do_heartbeat_status(opts) {
+    hb_table = map_get(opts, 'heartbeat_table')
+    Heartbeat.format_status(hb_table)
+}
+
+# ------------------------------------------------------------
+# bg_server — launch a detached server, get a task id + log file
+# ------------------------------------------------------------
+fun do_bg_server(args, opts) {
+    cmd = map_get(args, 'command')
+    label = map_get(args, 'label')
+    bg_table = map_get(opts, 'bg_table')
+    if (cmd == nil) { "error: bg_server needs 'command'" }
+    else {
+        if (bg_table == nil) { "error: background system not initialized" }
+        else {
+            label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
+            id = Background.launch_server(bg_table, to_string(cmd), label_str)
+            log_file = Background.log_path_for(id)
+            "launched detached server " ++ id ++ ": " ++ label_str ++
+                "\nlog: " ++ log_file ++
+                "\n(use bg_tail to read log, bg_kill to stop)"
+        }
+    }
+}
+
+fun do_bg_tail(args, opts) {
+    id = map_get(args, 'task_id')
+    n_arg = map_get(args, 'lines')
+    bg_table = map_get(opts, 'bg_table')
+    # Coerce `lines` to a clean positive integer so it can't carry shell
+    # payload into Background.tail_log (which splices it into a `tail -n
+    # N path` command). Anything non-numeric → default 40.
+    n = if (n_arg == nil) { 40 }
+        else {
+            ns = to_string(n_arg)
+            if (is_digits_only(ns) == 'true') {
+                parse_int_safe(ns, 40)
+            } else { 40 }
+        }
+    if (id == nil) { "error: bg_tail needs 'task_id'" }
+    else {
+        if (bg_table == nil) { "error: background system not initialized" }
+        else { Background.tail_log(bg_table, to_string(id), n) }
+    }
+}
+
+fun do_bg_kill(args, opts) {
+    id = map_get(args, 'task_id')
+    bg_table = map_get(opts, 'bg_table')
+    if (id == nil) { "error: bg_kill needs 'task_id'" }
+    else {
+        if (bg_table == nil) { "error: background system not initialized" }
+        else { Background.kill_task(bg_table, to_string(id)) }
+    }
+}
+
+# ------------------------------------------------------------
+# web_search — DuckDuckGo HTML search (matches mally's primary path)
+# ------------------------------------------------------------
+# We shell out to a tiny Python script (python3 is always on macOS) that
+# POSTs to html.duckduckgo.com with urlencoded query, parses the result
+# HTML with the same regex approach as mally's web.ex, and prints JSON to
+# stdout. sw then json_decodes and formats for the model.
+#
+# Free, no API key, no dependency on the Otonomy proxy. If DDG ever blocks
+# or changes format, we can fall back to a Tavily/Otonomy-proxy path here.
+fun do_web_search(args) {
+    q = map_get(args, 'query')
+    if (q == nil) { "error: web_search needs 'query'" }
+    else {
+        max_raw = map_get(args, 'max_results')
+        max_n = if (max_raw == nil) { 5 } else { max_raw }
+        # Python script: read query from env var to avoid shell-quote hell.
+        py_script = ddg_python_script()
+        cmd = "SWC_WSQ=" ++ shell_quote(to_string(q)) ++
+              " SWC_WSN=" ++ to_string(max_n) ++
+              " python3 -c " ++ shell_quote(py_script)
+        result = shell(with_timeout(cmd, fetch_timeout_s()))
+        code = elem(result, 0)
+        out = elem(result, 1)
+        if (code == 142) {
+            "error: web_search timed out after " ++ to_string(fetch_timeout_s()) ++ "s"
+        } else { if (code != 0) {
+            "error: web_search failed (exit " ++ to_string(code) ++ "):\n" ++ out
+        } else {
+            decoded = json_decode(string_trim(out))
+            if (decoded == nil) {
+                "error: web_search returned unparseable output:\n" ++ truncate_output(out, 300)
+            } else {
+                format_search_results(decoded, 0, "")
+            }
+        }}
+    }
+}
+
+# The DDG HTML search script — embedded as a single sw string literal.
+#
+# As of April 2026, DuckDuckGo rejects POSTs to html.duckduckgo.com/html/
+# without a session (they return the homepage shell). GET with query params
+# + a full set of browser headers + gzip handling works reliably. We also
+# fall back to the Wikipedia REST search API if DDG ever returns zero
+# blocks, so the tool never silently returns "(no results)".
+fun ddg_python_script() {
+    "import os,sys,json,re,gzip\n" ++
+    "import urllib.request,urllib.parse\n" ++
+    "q=os.environ.get('SWC_WSQ','')\n" ++
+    "n=int(os.environ.get('SWC_WSN','5'))\n" ++
+    "if not q:\n" ++
+    "  print('[]'); sys.exit(0)\n" ++
+    "def fetch(url,headers=None,data=None,timeout=15):\n" ++
+    "  req=urllib.request.Request(url,headers=headers or {},data=data)\n" ++
+    "  resp=urllib.request.urlopen(req,timeout=timeout)\n" ++
+    "  raw=resp.read()\n" ++
+    "  if resp.headers.get('Content-Encoding')=='gzip':\n" ++
+    "    raw=gzip.decompress(raw)\n" ++
+    "  return raw.decode('utf-8',errors='ignore')\n" ++
+    "def ddg_search(query):\n" ++
+    "  url='https://html.duckduckgo.com/html/?'+urllib.parse.urlencode({'q':query,'kl':'us-en'})\n" ++
+    "  h={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',\n" ++
+    "     'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',\n" ++
+    "     'Accept-Language':'en-US,en;q=0.5',\n" ++
+    "     'Accept-Encoding':'gzip, deflate',\n" ++
+    "     'Referer':'https://duckduckgo.com/',\n" ++
+    "     'Connection':'keep-alive',\n" ++
+    "     'Upgrade-Insecure-Requests':'1'}\n" ++
+    "  html=fetch(url,headers=h)\n" ++
+    "  blocks=re.split(r'class=\"[^\"]*result[^\"]*results_links[^\"]*\"',html)[1:]\n" ++
+    "  if not blocks:\n" ++
+    "    blocks=re.split(r'class=\"[^\"]*web-result[^\"]*\"',html)[1:]\n" ++
+    "  out=[]\n" ++
+    "  for b in blocks[:n]:\n" ++
+    "    um=re.search(r'class=\"result__a\"[^>]*href=\"([^\"]*)\"',b)\n" ++
+    "    if not um: continue\n" ++
+    "    url2=um.group(1)\n" ++
+    "    if url2.startswith('//'): url2='https:'+url2\n" ++
+    "    try:\n" ++
+    "      p=urllib.parse.urlparse(url2)\n" ++
+    "      qs=urllib.parse.parse_qs(p.query)\n" ++
+    "      if 'uddg' in qs: url2=qs['uddg'][0]\n" ++
+    "    except: pass\n" ++
+    "    tm=re.search(r'class=\"result__a\"[^>]*>(.*?)</a>',b,re.S)\n" ++
+    "    sm=re.search(r'class=\"result__snippet\"[^>]*>(.*?)</a>',b,re.S)\n" ++
+    "    title=re.sub(r'<[^>]+>','',tm.group(1)).strip() if tm else 'No title'\n" ++
+    "    snip=re.sub(r'<[^>]+>','',sm.group(1)).strip()[:300] if sm else ''\n" ++
+    "    out.append({'title':title,'url':url2,'snippet':snip})\n" ++
+    "  return out\n" ++
+    "def wiki_search(query):\n" ++
+    "  url='https://en.wikipedia.org/w/api.php?'+urllib.parse.urlencode({'action':'query','list':'search','srsearch':query,'format':'json','srlimit':n,'utf8':'1'})\n" ++
+    "  html=fetch(url,headers={'User-Agent':'swarm-code/0.1 (https://swarm-code.local)'})\n" ++
+    "  data=json.loads(html)\n" ++
+    "  out=[]\n" ++
+    "  for r in data.get('query',{}).get('search',[])[:n]:\n" ++
+    "    title=r.get('title','')\n" ++
+    "    snip=re.sub(r'<[^>]+>','',r.get('snippet','')).strip()[:300]\n" ++
+    "    url2='https://en.wikipedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'))\n" ++
+    "    out.append({'title':title,'url':url2,'snippet':snip})\n" ++
+    "  return out\n" ++
+    "try:\n" ++
+    "  results=ddg_search(q)\n" ++
+    "except Exception as e:\n" ++
+    "  results=[]\n" ++
+    "  sys.stderr.write('ddg failed: '+str(e)+'\\n')\n" ++
+    "if not results:\n" ++
+    "  try:\n" ++
+    "    results=wiki_search(q)\n" ++
+    "  except Exception as e:\n" ++
+    "    sys.stderr.write('wiki failed: '+str(e)+'\\n')\n" ++
+    "print(json.dumps(results))\n"
+}
+
+# ------------------------------------------------------------
+# git_status — porcelain status of the current repo  (30s timeout)
+# ------------------------------------------------------------
+fun do_git_status(args) {
+    cwd_arg = map_get(args, 'cwd')
+    cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ shell_quote(to_string(cwd_arg)) ++ " " }
+    cmd = "git " ++ cwd_part ++ "status --porcelain --branch 2>&1 | head -n 100"
+    r = shell(with_timeout(cmd, git_timeout_s()))
+    code = elem(r, 0)
+    out = elem(r, 1)
+    if (code == 142) {
+        "[timed out after " ++ to_string(git_timeout_s()) ++ "s]\n" ++ out
+    } else {
+        if (string_length(out) == 0) { "(clean)" } else { out }
+    }
+}
+
+# ------------------------------------------------------------
+# git_diff — staged + unstaged changes (truncated, 30s timeout)
+# ------------------------------------------------------------
+fun do_git_diff(args) {
+    cwd_arg = map_get(args, 'cwd')
+    staged = map_get(args, 'staged')
+    cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ shell_quote(to_string(cwd_arg)) ++ " " }
+    flag = if (staged == 'true') { "--staged " } else { "" }
+    cmd = "git " ++ cwd_part ++ "diff " ++ flag ++ "--no-color 2>&1"
+    r = shell(with_timeout(cmd, git_timeout_s()))
+    code = elem(r, 0)
+    out = elem(r, 1)
+    if (code == 142) {
+        "[timed out after " ++ to_string(git_timeout_s()) ++ "s]\n" ++ out
+    } else {
+        truncated = truncate_output(out, max_output_bytes())
+        if (string_length(truncated) == 0) { "(no changes)" } else { truncated }
+    }
+}
+
+# ------------------------------------------------------------
+# git_commit — stage files + commit + return hash  (30s timeout)
+# ------------------------------------------------------------
+# args: {"files": ["path1", "path2"] (optional, default "."),
+#        "message": "commit message",
+#        "cwd": "/path/to/repo" (optional)}
+fun do_git_commit(args) {
+    msg = map_get(args, 'message')
+    files = map_get(args, 'files')
+    cwd_arg = map_get(args, 'cwd')
+    if (msg == nil) { "error: git_commit needs 'message'" }
+    else {
+        stage_list = if (files == nil) { "." } else { join_files(files, "") }
+        cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ shell_quote(to_string(cwd_arg)) ++ " " }
+        cmd =
+            "git " ++ cwd_part ++ "add " ++ stage_list ++
+            " && git " ++ cwd_part ++ "commit -m " ++ shell_quote(to_string(msg)) ++
+            " 2>&1 && git " ++ cwd_part ++ "rev-parse --short HEAD"
+        r = shell(with_timeout(cmd, git_timeout_s()))
+        code = elem(r, 0)
+        out = elem(r, 1)
+        if (code == 0) {
+            "ok: committed\n" ++ out
+        } else { if (code == 142) {
+            "error: git commit timed out after " ++ to_string(git_timeout_s()) ++ "s\n" ++ out
+        } else {
+            "error: git commit failed\n" ++ out
+        }}
+    }
+}
+
+# Join a list of file path strings into shell-quoted args.
+fun join_files(files, acc) {
+    if (length(files) == 0) { acc }
+    else {
+        f = hd(files)
+        quoted = shell_quote(to_string(f))
+        new_acc = if (string_length(acc) == 0) { quoted } else { acc ++ " " ++ quoted }
+        join_files(tl(files), new_acc)
+    }
+}
+
+# ------------------------------------------------------------
+# code_search — ripgrep-backed symbol search
+# ------------------------------------------------------------
+# args: {"pattern": "symbolName",
+#        "kind": "def|ref|type" (optional, default ref),
+#        "path": "/path" (optional, default .),
+#        "lang": "rust|swift|python|go|..." (optional)}
+fun do_code_search(args) {
+    pat = map_get(args, 'pattern')
+    if (pat == nil) { "error: code_search needs 'pattern'" }
+    else {
+        kind = map_get(args, 'kind')
+        path = map_get(args, 'path')
+        lang = map_get(args, 'lang')
+        k = if (kind == nil) { "ref" } else { to_string(kind) }
+        base = if (path == nil) { "." } else { to_string(path) }
+        p = to_string(pat)
+
+        # Build a regex that matches the kind:
+        #   def: look for definition-style patterns (fn/def/function/class/struct/let/var)
+        #   ref: word-boundary match
+        #   type: class/struct/type/interface/enum
+        rgx = if (k == "def") {
+            "\\b(fn|def|function|func|class|struct|impl|type|let|var|pub\\s+fn)\\s+" ++ p ++ "\\b"
+        } else { if (k == "type") {
+            "\\b(class|struct|type|interface|enum|typealias)\\s+" ++ p ++ "\\b"
+        } else {
+            "\\b" ++ p ++ "\\b"
+        }}
+
+        # Lang flag is constrained to ripgrep's known set; allow only
+        # [a-z]+ characters before injecting. Anything else is dropped.
+        lang_flag = if (lang == nil) { "" }
+                    else {
+                        ls = to_string(lang)
+                        if (is_simple_word(ls) == 'true') { "--type " ++ ls ++ " " }
+                        else { "" }
+                    }
+        base_q = shell_quote(base)
+        # Prefer rg (ripgrep) for speed. Fall back to grep -rn if not installed.
+        cmd =
+            "(command -v rg >/dev/null && rg -n --no-heading --color=never " ++ lang_flag ++
+            shell_quote(rgx) ++ " " ++ base_q ++
+            " || grep -rn --color=never -E " ++ shell_quote(rgx) ++ " " ++ base_q ++
+            ") 2>&1 | head -n 80"
+        r = shell(with_timeout(cmd, search_timeout_s()))
+        code = elem(r, 0)
+        out = elem(r, 1)
+        if (code == 142) {
+            "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
+        } else {
+            truncated = truncate_output(out, max_output_bytes())
+            if (string_length(truncated) == 0) { "(no matches)" } else { truncated }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# log_wait — block until a pattern appears in a log file
+# ------------------------------------------------------------
+# args: {"task_id": "bg-0" OR "path": "/tmp/x.log",
+#        "pattern": "server ready",
+#        "timeout_sec": 60 (optional, default 60)}
+# Returns as soon as the pattern is found, or "timeout" after timeout_sec.
+fun do_log_wait(args, opts) {
+    pat = map_get(args, 'pattern')
+    if (pat == nil) { "error: log_wait needs 'pattern'" }
+    else {
+        task_id = map_get(args, 'task_id')
+        path_arg = map_get(args, 'path')
+        timeout = map_get(args, 'timeout_sec')
+        timeout_n = if (timeout == nil) { 60 } else { timeout }
+
+        # Resolve log path: explicit path, or task_id's log file
+        log_path = if (path_arg != nil) { to_string(path_arg) }
+                   else {
+                       if (task_id == nil) { "" }
+                       else { "/tmp/swarm-code-" ++ to_string(task_id) ++ ".log" }
+                   }
+        if (string_length(log_path) == 0) {
+            "error: log_wait needs either 'task_id' or 'path'"
+        } else {
+            # Shell loop with grep -q, wrapped in our perl alarm guard
+            # instead of GNU `timeout` (which isn't on base macOS).
+            # Quote BOTH the pattern and the log path — both reach us
+            # from the model.
+            inner = "until grep -q " ++ shell_quote(to_string(pat)) ++
+                    " " ++ shell_quote(log_path) ++ " 2>/dev/null; do sleep 0.5; done"
+            r = shell(with_timeout(inner, timeout_n))
+            code = elem(r, 0)
+            if (code == 0) {
+                "ok: pattern found in " ++ log_path
+            } else { if (code == 142) {
+                "timeout: pattern not found within " ++ to_string(timeout_n) ++ "s"
+            } else {
+                "error: log_wait failed (exit " ++ to_string(code) ++ ")"
+            }}
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# file_watch — block until a file changes (mtime) or appears
+# ------------------------------------------------------------
+# args: {"path": "/path/to/file", "timeout_sec": 60}
+# Returns when the file's mtime changes or it appears, or on timeout.
+fun do_file_watch(args) {
+    path_arg = map_get(args, 'path')
+    if (path_arg == nil) { "error: file_watch needs 'path'" }
+    else {
+        path = to_string(path_arg)
+        timeout = map_get(args, 'timeout_sec')
+        timeout_n = if (timeout == nil) { 60 } else { timeout }
+
+        # Capture initial mtime, then poll every 0.5s until it changes.
+        # Timeout via perl alarm (with_timeout) so we don't depend on GNU
+        # coreutils `timeout` which isn't on base macOS.
+        inner =
+            "p=" ++ shell_inner_quote(path) ++ "; " ++
+            "initial=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
+            "while true; do " ++
+            "  current=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
+            "  [ \"$current\" != \"$initial\" ] && echo \"changed: $initial -> $current\" && exit 0; " ++
+            "  sleep 0.5; " ++
+            "done"
+        r = shell(with_timeout(inner, timeout_n))
+        code = elem(r, 0)
+        out = string_trim(elem(r, 1))
+        if (code == 0) { "ok: " ++ out }
+        else { if (code == 142) {
+            "timeout: no change to " ++ path ++ " in " ++ to_string(timeout_n) ++ "s"
+        } else {
+            "error: file_watch failed (exit " ++ to_string(code) ++ "): " ++ out
+        }}
+    }
+}
+
+# Escape for use INSIDE a double-quoted shell string (bash).
+fun shell_inner_quote(s) {
+    no_dq = string_replace(s, "\"", "\\\"")
+    "\"" ++ no_dq ++ "\""
+}
+
+# Format the parsed results list as a readable string for the model.
+fun format_search_results(results, i, acc) {
+    if (length(results) == 0) {
+        if (string_length(acc) == 0) { "(no results)" } else { acc }
+    } else {
+        entry = hd(results)
+        title = to_string(map_get(entry, 'title'))
+        url = to_string(map_get(entry, 'url'))
+        snip = to_string(map_get(entry, 'snippet'))
+        block = "[" ++ to_string(i + 1) ++ "] " ++ title ++ "\n" ++
+                "    " ++ url ++ "\n" ++
+                "    " ++ snip ++ "\n\n"
+        format_search_results(tl(results), i + 1, acc ++ block)
+    }
+}
+
+# ------------------------------------------------------------
+# multi_edit — apply a sequence of edits atomically to one file
+# ------------------------------------------------------------
+# args: {"path": "...", "edits": [{"old_string": ..., "new_string": ...}, ...]}
+# Semantics: load file once, apply edits in order, write result once.
+# Each edit's old_string must match exactly once in the current buffer
+# (checked via string_contains before/after replace). If any edit fails
+# the whole operation aborts and the file is not modified.
+fun do_multi_edit(args) {
+    path = resolve_path_arg(args)
+    edits = map_get(args, 'edits')
+    if (path == nil) { "error: missing path" }
+    else {
+        if (edits == nil) { "error: missing edits list" }
+        else {
+            original = file_read(path)
+            if (original == nil) {
+                "error: could not read " ++ path
+            } else {
+                apply_edits(path, original, edits, 0)
+            }
+        }
+    }
+}
+
+fun apply_edits(path, buffer, edits, count) {
+    if (length(edits) == 0) {
+        rc = file_write(path, buffer)
+        if (rc == 'ok') {
+            "ok: applied " ++ to_string(count) ++ " edits to " ++ path
+        } else {
+            "error: could not write " ++ path
+        }
+    } else {
+        edit_map = hd(edits)
+        old_s = map_get(edit_map, 'old_string')
+        new_s = map_get(edit_map, 'new_string')
+        if (old_s == nil) { "error: edit " ++ to_string(count) ++ " missing old_string" }
+        else {
+            if (new_s == nil) { "error: edit " ++ to_string(count) ++ " missing new_string" }
+            else {
+                if (string_contains(buffer, old_s) == 'false') {
+                    "error: edit " ++ to_string(count) ++ " old_string not found in " ++ path
+                } else {
+                    replaced = string_replace(buffer, old_s, new_s)
+                    if (string_contains(replaced, old_s) == 'true') {
+                        "error: edit " ++ to_string(count) ++ " old_string appears multiple times — make it more specific"
+                    } else {
+                        apply_edits(path, replaced, tl(edits), count + 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# todo_write — manage the session todo list
+# ------------------------------------------------------------
+# args: {"todos": [{"content": "...", "status": "pending|in_progress|completed", "id": "..."}, ...]}
+# We store the list as a JSON string in an ETS entry keyed by 'todos_list'.
+# The ETS table id lives in opts['todos_table'].
+fun do_todo_write(args, opts) {
+    todos = map_get(args, 'todos')
+    table = map_get(opts, 'todos_table')
+    if (todos == nil) { "error: missing 'todos' argument" }
+    else {
+        if (table == nil) { "error: todo state not initialised" }
+        else {
+            # Re-encode the list to preserve as a JSON string.
+            encoded = json_encode(todos)
+            ets_put(table, 'todos_list', encoded)
+            # Render the checklist to the terminal and return a
+            # compact confirmation to the model.
+            print("")
+            print(UI.todo_list_render(todos))
+            print("")
+            "ok: " ++ UI.todo_summary(todos)
+        }
+    }
+}
+
+# Read current todo list as raw JSON (for system prompt injection).
+fun todo_read_json(opts) {
+    table = map_get(opts, 'todos_table')
+    if (table == nil) {
+        "[]"
+    } else {
+        stored = ets_get(table, 'todos_list')
+        if (stored == nil) { "[]" } else { stored }
+    }
+}
+
+# Read and render the todo list for /todos display.
+fun todo_read(opts) {
+    table = map_get(opts, 'todos_table')
+    if (table == nil) { nil }
+    else {
+        stored = ets_get(table, 'todos_list')
+        if (stored == nil) { nil }
+        else {
+            parsed = json_decode(stored)
+            if (parsed == nil) { nil }
+            else { parsed }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# web_fetch — http_get a URL and return plain text
+# ------------------------------------------------------------
+# args: {"url": "...", "prompt": "optional, instruction for summarization"}
+# v1 strips HTML tags via a sed-backed shell command and caps output.
+# When prompt is provided we append an instruction block to the body —
+# the model can then summarize on its next turn.
+fun do_web_fetch(args) {
+    url = map_get(args, 'url')
+    if (url == nil) { "error: missing 'url'" }
+    else {
+        # http_get(url, headers) → response body string, or nil on failure
+        body = http_get(url, [])
+        if (body == nil) {
+            "error: fetch failed for " ++ url
+        } else {
+            # Strip HTML by writing to a tmp file and running a shell pipeline.
+            # This avoids needing a native HTML parser in .sw.
+            tmp_path = "/tmp/swarm_code_fetch.html"
+            file_write(tmp_path, body)
+            strip_cmd = "cat " ++ tmp_path ++
+                        " | sed -e 's/<script[^>]*>[^<]*<\\/script>//g'" ++
+                        " -e 's/<style[^>]*>[^<]*<\\/style>//g'" ++
+                        " -e 's/<[^>]*>//g'" ++
+                        " -e 's/&nbsp;/ /g' -e 's/&amp;/\\&/g'" ++
+                        " -e 's/&lt;/</g' -e 's/&gt;/>/g'" ++
+                        " -e 's/&quot;/\"/g' | tr -s ' \\n' | head -c 30000"
+            result = shell(strip_cmd)
+            text = elem(result, 1)
+            file_delete(tmp_path)
+            "fetched " ++ url ++ " (" ++ to_string(string_length(text)) ++
+                " chars after strip)\n\n" ++ text
+        }
+    }
+}

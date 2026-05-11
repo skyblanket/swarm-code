@@ -1,0 +1,16 @@
+# Allowlist mode: this directory accumulated unrelated research
+# artifacts over time, so we ignore everything at root by default
+# and explicitly opt in the swarm-code project files.
+/*
+!/.gitignore
+!/Makefile
+!/README.md
+!/src/
+
+# Inside src/, ignore generated C output from `swc build`.
+src/*.gen.c
+src/*.gen.h
+
+# Editor / OS noise (anywhere)
+.DS_Store
+*.swp
