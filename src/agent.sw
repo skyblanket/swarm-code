@@ -43,7 +43,8 @@ fun compact_threshold() { 120 }
 # model sees internally.
 #
 # Model context window: set via SWARM_CODE_MAX_TOKENS env var. Default
-# 128000, which matches Gemma-4-31B on sushi's typical config.
+# 262144 (256K), matching Kimi K2.6's published context window. Override
+# via env var when running against smaller models (Gemma 4 31B = 128000).
 #
 # Compaction trigger: prompt_tokens > (max_tokens - output_reserve -
 # buffer). Claude Code uses a 20k output reserve + 13k buffer, so
@@ -51,16 +52,15 @@ fun compact_threshold() { 120 }
 # mirror that with configurable reserves.
 #
 # Env vars:
-#   SWARM_CODE_MAX_TOKENS       — the model's context window (default 128000)
-#   SWARM_CODE_OUTPUT_RESERVE   — tokens reserved for the response (default 16000)
+#   SWARM_CODE_MAX_TOKENS       — the model's context window (default 262144 = Kimi K2.6)
+#   SWARM_CODE_OUTPUT_RESERVE   — tokens reserved for the response (default 16384 = K2.6 max output)
 #   SWARM_CODE_COMPACT_BUFFER   — extra safety buffer (default 52000)
 #
-# Resulting default trigger: 128000 - 16000 - 52000 = 60000 tokens.
-# Gemma 4 31B starts losing precise retrieval (API keys, paths, exact values)
-# around 80K chars (~20K tokens). Compacting at 60K keeps quality high.
-# The model has 128K capacity but retrieval fidelity matters more than raw length.
-fun max_tokens_env()      { parse_env_int("SWARM_CODE_MAX_TOKENS",      128000) }
-fun output_reserve_env()  { parse_env_int("SWARM_CODE_OUTPUT_RESERVE",   16000) }
+# Resulting default trigger: 262144 - 16384 - 52000 = 193760 tokens.
+# Compaction kicks in at ~74% of K2.6's window — leaves headroom for
+# the response plus safety margin against retrieval drift on long runs.
+fun max_tokens_env()      { parse_env_int("SWARM_CODE_MAX_TOKENS",      262144) }
+fun output_reserve_env()  { parse_env_int("SWARM_CODE_OUTPUT_RESERVE",   16384) }
 fun compact_buffer_env()  { parse_env_int("SWARM_CODE_COMPACT_BUFFER",   52000) }
 
 # Effective token budget — compact when prompt_tokens exceeds this.
@@ -1013,7 +1013,70 @@ fun format_tool_args(name, args_map, args_raw) {
         t_s = if (t_type == nil) { "general" } else { to_string(t_type) }
         t_d ++ " [" ++ t_s ++ "]"
     }
-    else { preview_string(args_raw, 100) }}}}}}}}}}
+    else { if (name == 'web_search') {
+        ws_q = map_get(args_map, 'query')
+        if (ws_q == nil) { preview_string(args_raw, 100) } else { to_string(ws_q) }
+    }
+    else { if (name == 'code_search') {
+        cs_q = map_get(args_map, 'query')
+        cs_p = map_get(args_map, 'pattern')
+        cs = if (cs_q != nil) { cs_q } else { cs_p }
+        if (cs == nil) { preview_string(args_raw, 100) } else { to_string(cs) }
+    }
+    else { if (name == 'git_commit') {
+        gc_msg = map_get(args_map, 'message')
+        if (gc_msg == nil) { "" } else { preview_string(to_string(gc_msg), 80) }
+    }
+    else { if (name == 'git_status') { "" }
+    else { if (name == 'git_diff') {
+        gd_path = resolve_path_key(args_map)
+        if (gd_path == nil) { "" } else { to_string(gd_path) }
+    }
+    else { if (name == 'background') {
+        bg_cmd = map_get(args_map, 'command')
+        bg_lbl = map_get(args_map, 'label')
+        bg_main = if (bg_lbl != nil) { bg_lbl } else { bg_cmd }
+        if (bg_main == nil) { preview_string(args_raw, 100) } else { preview_string(to_string(bg_main), 100) }
+    }
+    else { if (name == 'bg_status') {
+        bs_id = map_get(args_map, 'task_id')
+        if (bs_id == nil) { "" } else { to_string(bs_id) }
+    }
+    else { if (name == 'bg_result') {
+        br_id = map_get(args_map, 'task_id')
+        if (br_id == nil) { "" } else { to_string(br_id) }
+    }
+    else { if (name == 'bg_tail') {
+        bt_id = map_get(args_map, 'task_id')
+        if (bt_id == nil) { "" } else { to_string(bt_id) }
+    }
+    else { if (name == 'bg_kill') {
+        bk_id = map_get(args_map, 'task_id')
+        if (bk_id == nil) { "" } else { to_string(bk_id) }
+    }
+    else { if (name == 'remember') {
+        rm_n = map_get(args_map, 'name')
+        rm_k = if (rm_n != nil) { rm_n } else { map_get(args_map, 'key') }
+        if (rm_k == nil) { preview_string(args_raw, 80) } else { to_string(rm_k) }
+    }
+    else { if (name == 'recall') {
+        rc_n = map_get(args_map, 'name')
+        rc_k = if (rc_n != nil) { rc_n } else { map_get(args_map, 'key') }
+        if (rc_k == nil) { preview_string(args_raw, 80) } else { to_string(rc_k) }
+    }
+    else { if (name == 'forget') {
+        fg_n = map_get(args_map, 'name')
+        fg_k = if (fg_n != nil) { fg_n } else { map_get(args_map, 'key') }
+        if (fg_k == nil) { preview_string(args_raw, 80) } else { to_string(fg_k) }
+    }
+    else { if (name == 'memory_list') { "" }
+    else { if (name == 'heartbeat_status') { "" }
+    else { if (name == 'sys_stats') { "" }
+    else { if (name == 'file_watch') {
+        fw_path = resolve_path_key(args_map)
+        if (fw_path == nil) { preview_string(args_raw, 100) } else { to_string(fw_path) }
+    }
+    else { preview_string(args_raw, 100) }}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # Helper used by format_tool_args to accept either 'path' or 'file_path'

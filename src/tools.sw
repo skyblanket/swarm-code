@@ -212,20 +212,21 @@ fun bash_max_lines() { 100 }
 # read
 # ------------------------------------------------------------
 fun do_read(args) {
-    path = map_get(args, 'path')
-    if (path == nil) {
-        path2 = map_get(args, 'file_path')
-        if (path2 == nil) {
-            "error: missing 'path' argument"
-        } else {
-            read_file_capped(path2)
-        }
+    p = resolve_path_arg(args)
+    # offset is 1-based line number to start at (Claude Code semantics).
+    # limit is max lines to return. Both optional; defaults match CC.
+    offset_raw = map_get(args, 'offset')
+    limit_raw = map_get(args, 'limit')
+    offset = if (offset_raw == nil) { 1 } else { to_int(offset_raw) }
+    limit = if (limit_raw == nil) { 2000 } else { to_int(limit_raw) }
+    if (p == nil) {
+        "error: missing 'path' argument"
     } else {
-        read_file_capped(path)
+        read_file_capped(p, offset, limit)
     }
 }
 
-fun read_file_capped(path) {
+fun read_file_capped(path, offset, limit) {
     # Check if file is binary before reading — binary content poisons the
     # model's context and causes empty responses.
     file_type = elem(shell("file --brief --mime-type " ++ shell_quote(to_string(path))), 1)
@@ -237,11 +238,54 @@ fun read_file_capped(path) {
         if (content == nil) {
             "error: could not read " ++ path
         } else {
-            truncate_output(content, max_output_bytes())
+            sliced = slice_lines(content, offset, limit)
+            truncate_output(sliced, max_output_bytes())
         }
     } else {
         "error: binary file (" ++ string_trim(file_type) ++ ") — " ++ to_string(path) ++
         "\nUse bash with hexdump, xxd, strings, or file to inspect binary files."
+    }
+}
+
+# Slice [offset, offset+limit) lines from content (1-based offset).
+# When offset=1 and limit covers the whole file, returns content as-is
+# so callers reading small files see no behavior change.
+fun slice_lines(content, offset, limit) {
+    if (offset <= 1 && limit >= 1000000) {
+        content
+    } else {
+        lines = string_split(content, "\n")
+        total = length(lines)
+        start = if (offset < 1) { 0 } else { offset - 1 }
+        if (start >= total) {
+            ""
+        } else {
+            window = take_first_lines(drop_first_n(lines, start), limit, [])
+            join_lines(window, "")
+        }
+    }
+}
+
+fun drop_first_n(lst, n) {
+    if (n <= 0) { lst }
+    else { if (length(lst) == 0) { lst }
+    else { drop_first_n(tl(lst), n - 1) }}
+}
+
+fun to_int(v) {
+    s = to_string(v)
+    parse_int_safe(s, 0)
+}
+
+# Count non-overlapping occurrences of `sub` in `s`. Used by edit /
+# multi_edit to enforce "old_string must be unique in the file" without
+# the false-positive bug of post-replace inspection (which fires when
+# new_string itself contains old_string, e.g. "foo" → "foobar").
+fun count_substrings(s, sub) {
+    if (string_length(sub) == 0) { 0 }
+    else {
+        parts = string_split(s, sub)
+        length(parts) - 1
     }
 }
 
@@ -315,21 +359,23 @@ fun do_edit_impl(path, old_s, new_s) {
                     "ok: appended " ++ to_string(string_length(new_s)) ++ " bytes to " ++ path
                 } else { "error: could not write " ++ path }
             } else {
-                if (string_contains(original, old_s) == 'false') {
+                # Count occurrences in the ORIGINAL — checking the
+                # post-replace buffer would falsely fire whenever
+                # new_string contains old_string as a substring.
+                occ = count_substrings(original, old_s)
+                if (occ == 0) {
                     "error: old_string not found in " ++ path ++ ". Read the file first, then retry with an exact substring."
+                } else { if (occ > 1) {
+                    "error: old_string appears " ++ to_string(occ) ++ " times in " ++ path ++ " — add more context to make it unique"
                 } else {
-                    first_replaced = string_replace(original, old_s, new_s)
-                    if (string_contains(first_replaced, old_s) == 'true') {
-                        "error: old_string appears multiple times in " ++ path ++ " — add more context to make it unique"
+                    edited = string_replace(original, old_s, new_s)
+                    rc_r = file_write(path, edited)
+                    if (rc_r == 'ok') {
+                        "ok: edited " ++ path
                     } else {
-                        rc_r = file_write(path, first_replaced)
-                        if (rc_r == 'ok') {
-                            "ok: edited " ++ path
-                        } else {
-                            "error: could not write " ++ path
-                        }
+                        "error: could not write " ++ path
                     }
-                }
+                }}
             }
         }
     }
@@ -1056,16 +1102,18 @@ fun apply_edits(path, buffer, edits, count) {
         else {
             if (new_s == nil) { "error: edit " ++ to_string(count) ++ " missing new_string" }
             else {
-                if (string_contains(buffer, old_s) == 'false') {
+                # Count in the CURRENT buffer (pre-replace) — using
+                # the post-replace check produced false positives when
+                # new_string contained old_string as a substring.
+                occ = count_substrings(buffer, old_s)
+                if (occ == 0) {
                     "error: edit " ++ to_string(count) ++ " old_string not found in " ++ path
+                } else { if (occ > 1) {
+                    "error: edit " ++ to_string(count) ++ " old_string appears " ++ to_string(occ) ++ " times — make it more specific"
                 } else {
                     replaced = string_replace(buffer, old_s, new_s)
-                    if (string_contains(replaced, old_s) == 'true') {
-                        "error: edit " ++ to_string(count) ++ " old_string appears multiple times — make it more specific"
-                    } else {
-                        apply_edits(path, replaced, tl(edits), count + 1)
-                    }
-                }
+                    apply_edits(path, replaced, tl(edits), count + 1)
+                }}
             }
         }
     }

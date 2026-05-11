@@ -166,6 +166,15 @@ fun messages_to_maps_native(messages, idx, pending_ids, acc) {
 # Build a native assistant message map from an in-band content string.
 # Returns {msg_map, [tool_call_id, ...]} — the id list is what we expect
 # matching tool_result messages to pop in order.
+#
+# Kimi K2 quirk: when `thinking` mode is enabled (the default), any
+# assistant message that includes `tool_calls` MUST carry a
+# `reasoning_content` field or the server 400s with
+# "reasoning_content is missing in assistant tool call message". We
+# don't yet round-trip the original reasoning_content across turns (it
+# isn't stored in the history tuple), so we emit a short placeholder.
+# Real reasoning preservation is a follow-up — see notes in
+# record_reasoning / last_reasoning.
 fun build_assistant_native(content, idx) {
     if (string_contains(content, "\ncall:") == 'false') {
         {%{role: "assistant", content: content}, []}
@@ -176,9 +185,18 @@ fun build_assistant_native(content, idx) {
         parsed = parse_call_segments(rest, idx, 0, [], [])
         calls = elem(parsed, 0)
         ids = elem(parsed, 1)
+        # See the comment block above this function: Kimi K2 in
+        # thinking mode requires `reasoning_content` to be present on
+        # any assistant message that carries tool_calls, or the API
+        # 400s. We don't roundtrip per-message reasoning across turns
+        # yet (history is a flat {role, content} tuple), so we emit a
+        # short placeholder. The 💭 emoji that used to render this in
+        # the UI was removed — only the streaming response's real
+        # reasoning gets displayed now, so this placeholder is API-only.
         msg = %{
             role: "assistant",
             content: string_trim(prose),
+            reasoning_content: "Executing tool call.",
             tool_calls: calls
         }
         {msg, ids}
@@ -387,9 +405,10 @@ fun chat_native(messages, opts) {
                     raw_content = map_get(msg_obj, 'content')
                     tool_calls_list = map_get(msg_obj, 'tool_calls')
 
-                    # Show reasoning (if any) then visible prose.
+                    # Show reasoning (if any) then visible prose. Dim
+                    # italic, no emoji prefix — keep the channel quiet.
                     if (reason_text != nil) {
-                        print("  \e[38;5;240m\e[3m💭 " ++ to_string(reason_text) ++ "\e[0m")
+                        print("  \e[38;5;240m\e[3m" ++ to_string(reason_text) ++ "\e[0m")
                         print("")
                     }
                     prose = if (raw_content == nil) { "" } else { to_string(raw_content) }

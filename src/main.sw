@@ -13,7 +13,8 @@ module Main
 #                          use the /v1/ path).
 #   SWARM_CODE_MODEL       default: google/gemma-4-31B-it
 #   SWARM_CODE_API_KEY     default: (none)
-#   SWARM_CODE_MAX_TOKENS  default: 4096
+#   SWARM_CODE_MAX_TOKENS  default: 262144 (Kimi K2.6 context window)
+#   SWARM_CODE_OUTPUT_RESERVE  default: 16384 (Kimi K2.6 max output)
 #   SWARM_CODE_TEMP        default: "0.2" (string — parsed to float)
 #   SWARM_CODE_CWD         default: "." (used in system prompt)
 #
