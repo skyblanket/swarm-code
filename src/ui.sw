@@ -35,7 +35,9 @@ export [
     enter_alt_screen, leave_alt_screen,
     term_width,
     todo_list_render, todo_summary,
-    green, grey_text, grey_border
+    green, grey_text, grey_border,
+    agent_color, agent_tool_header, agent_emit_render,
+    agent_reply_render, agents_table
 ]
 
 # ------------------------------------------------------------
@@ -461,4 +463,155 @@ fun join_with(parts, sep) {
 fun join_with_loop(parts, sep, acc) {
     if (length(parts) == 0) { acc }
     else { join_with_loop(tl(parts), sep, acc ++ sep ++ hd(parts)) }
+}
+
+# ============================================================
+# Swarm — multi-agent rendering
+# ============================================================
+#
+# When the main agent has spawned subagents, their activity needs to
+# appear in the same single TUI as main's own work. We give each agent
+# a deterministic color (hashed from name) and prefix every line with
+# its name in that color, like a chat-app username column.
+#
+# Three render functions:
+#   agent_tool_header(name, tool, args_raw)
+#       [name] ⏺ Tool(args)            — agent did a tool call
+#   agent_emit_render(name, content)
+#       [name] │ content                — async push from agent
+#   agent_reply_render(name, content)
+#       [name] ⎿ content                — final reply from an `ask`
+#   agents_table(reg, names)
+#       └── pretty list_agents output
+
+# Deterministic ANSI color from name. 8 vivid 256-color palette
+# entries, picked to be readable on dark backgrounds and distinct
+# from the brand red. Hash is djb2-style summed over UTF-8 bytes.
+fun agent_color(name) {
+    h = djb2_hash(name, 5381)
+    # sw has no `%` modulo operator; do it the long way.
+    palette_idx = h - (h / 8) * 8
+    pick_palette(palette_idx)
+}
+
+fun djb2_hash(s, h) {
+    if (string_length(s) == 0) { h }
+    else {
+        ch = string_sub(s, 0, 1)
+        rest = string_sub(s, 1, string_length(s) - 1)
+        # ((h << 5) + h) + ord(ch)  ==  h * 33 + ord(ch)
+        new_h = h * 33 + char_ord(ch)
+        djb2_hash(rest, new_h)
+    }
+}
+
+fun char_ord(ch) {
+    # Approximate ord via comparison ladder for ASCII letters/digits;
+    # other chars fold to 0. Good enough for color hashing.
+    if (ch == "a") { 97 } else { if (ch == "b") { 98 } else { if (ch == "c") { 99 }
+    else { if (ch == "d") { 100 } else { if (ch == "e") { 101 } else { if (ch == "f") { 102 }
+    else { if (ch == "g") { 103 } else { if (ch == "h") { 104 } else { if (ch == "i") { 105 }
+    else { if (ch == "j") { 106 } else { if (ch == "k") { 107 } else { if (ch == "l") { 108 }
+    else { if (ch == "m") { 109 } else { if (ch == "n") { 110 } else { if (ch == "o") { 111 }
+    else { if (ch == "p") { 112 } else { if (ch == "q") { 113 } else { if (ch == "r") { 114 }
+    else { if (ch == "s") { 115 } else { if (ch == "t") { 116 } else { if (ch == "u") { 117 }
+    else { if (ch == "v") { 118 } else { if (ch == "w") { 119 } else { if (ch == "x") { 120 }
+    else { if (ch == "y") { 121 } else { if (ch == "z") { 122 }
+    else { if (ch == "-") { 45 } else { if (ch == "_") { 95 }
+    else { if (ch == "0") { 48 } else { if (ch == "1") { 49 } else { if (ch == "2") { 50 }
+    else { if (ch == "3") { 51 } else { if (ch == "4") { 52 } else { if (ch == "5") { 53 }
+    else { if (ch == "6") { 54 } else { if (ch == "7") { 55 } else { if (ch == "8") { 56 }
+    else { if (ch == "9") { 57 } else { 0 }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+}
+
+fun pick_palette(i) {
+    if (i == 0) { "\e[38;5;39m"  }   # bright blue
+    else { if (i == 1) { "\e[38;5;208m" }   # orange
+    else { if (i == 2) { "\e[38;5;141m" }   # purple
+    else { if (i == 3) { "\e[38;5;43m"  }   # teal
+    else { if (i == 4) { "\e[38;5;220m" }   # gold
+    else { if (i == 5) { "\e[38;5;205m" }   # pink
+    else { if (i == 6) { "\e[38;5;82m"  }   # green
+    else { "\e[38;5;33m"  }}}}}}}            # cyan
+}
+
+fun agent_prefix(name) {
+    agent_color(name) ++ "[" ++ name ++ "]" ++ reset()
+}
+
+# Tool header for a subagent's call. Same shape as tool_header but
+# with the agent's name in its color before the bullet.
+fun agent_tool_header(name, tool, args_preview) {
+    cap_name = capitalize_first(to_string(tool))
+    print("")
+    print("  " ++ agent_prefix(name) ++ " " ++ brand_color() ++ "⏺" ++ reset() ++
+          " \e[1m" ++ cap_name ++ "\e[0m(" ++ to_string(args_preview) ++ ")")
+}
+
+# Async push from a subagent — appears inline with a continuation gutter.
+fun agent_emit_render(name, content) {
+    print("")
+    print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
+}
+
+# Final reply from an agent (resolves an `ask`).
+fun agent_reply_render(name, content) {
+    print("")
+    print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "⎿" ++ reset() ++ " " ++ to_string(content))
+}
+
+# Render the registry as a table. `names` is the list to show in order.
+# Columns: name (colored), role, status, tokens, age.
+fun agents_table(reg, names) {
+    header = "  " ++ grey_text() ++ "name              role            status   tokens     age" ++ reset()
+    rows = render_agent_rows(reg, names, "")
+    if (string_length(rows) == 0) { header ++ "\n  " ++ grey_text() ++ "(no agents)" ++ reset() }
+    else { header ++ "\n" ++ rows }
+}
+
+fun render_agent_rows(reg, names, acc) {
+    if (length(names) == 0) { acc }
+    else {
+        n = hd(names)
+        e = ets_get(reg, n)
+        line = if (e == nil) { "" } else { format_agent_row(n, e) }
+        new_acc = if (string_length(acc) == 0) { line } else { acc ++ "\n" ++ line }
+        render_agent_rows(reg, tl(names), new_acc)
+    }
+}
+
+fun format_agent_row(name, entry) {
+    role = to_string(map_get(entry, 'role'))
+    status_v = map_get(entry, 'status')
+    status = if (status_v == nil) { "?" } else { to_string(status_v) }
+    tokens_v = map_get(entry, 'tokens_used')
+    tokens = if (tokens_v == nil) { "0" } else { to_string(tokens_v) }
+    spawned_v = map_get(entry, 'spawned_at')
+    age_ms = if (spawned_v == nil) { 0 } else { timestamp() - spawned_v }
+    age_s = age_ms / 1000
+    age_str = to_string(age_s) ++ "s"
+    "  " ++ agent_prefix(name) ++ pad_right(name, 18 - string_length(name)) ++
+        pad_right(role, 16 - string_length(role)) ++
+        status_color(status) ++ pad_right(status, 9 - string_length(status)) ++ reset() ++
+        pad_right(tokens, 11 - string_length(tokens)) ++
+        grey_text() ++ age_str ++ reset()
+}
+
+# Truncates if longer than width, otherwise pads with spaces.
+fun pad_right(s, padding) {
+    if (padding <= 0) { " " }
+    else { s_pad(padding, "") }
+}
+
+fun s_pad(n, acc) {
+    if (n <= 0) { acc }
+    else { s_pad(n - 1, acc ++ " ") }
+}
+
+fun status_color(status) {
+    if (status == "working") { brand_color() }
+    else { if (status == "idle") { green() }
+    else { if (status == "spawning") { teal_info() }
+    else { if (status == "dying") { grey_text() }
+    else { grey_text() }}}}
 }

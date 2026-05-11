@@ -118,7 +118,87 @@ fun tool_descriptions() {
     git_commit_desc() ++ "\n" ++
     code_search_desc() ++ "\n" ++
     log_wait_desc() ++ "\n" ++
-    file_watch_desc()
+    file_watch_desc() ++ "\n" ++
+    spawn_agent_desc() ++ "\n" ++
+    ask_desc() ++ "\n" ++
+    tell_desc() ++ "\n" ++
+    list_agents_desc() ++ "\n" ++
+    kill_desc() ++ "\n" ++
+    parallel_desc() ++ "\n" ++
+    swarm_section()
+}
+
+# ------------------------------------------------------------
+# Studio / multi-agent tools
+# ------------------------------------------------------------
+# These let YOU (the main agent) build an org of specialised
+# subagents to work toward a goal. Each spawned agent runs as its own
+# sw process with its own LLM session, history, and full tool access.
+
+fun spawn_agent_desc() {
+    "- spawn_agent: Create a new long-lived subagent process. Returns " ++
+    "immediately; the agent registers itself and is then addressable by " ++
+    "name via ask/tell/kill. Each subagent has its own LLM session and " ++
+    "full tool set (bash, read, write, edit, grep, etc.). Use when a task " ++
+    "benefits from a focused worker with a distinct role and goal — bug " ++
+    "hunters, doc writers, test runners, code reviewers. The agent stays " ++
+    "alive across multiple ask calls so you can have a stateful conversation.\n" ++
+    "  schema: {\"name\":\"string (kebab-case, unique)\",\"role\":\"short title (e.g. 'bug-hunter')\",\"goal\":\"one-sentence objective the agent works toward\",\"system_prompt\":\"optional extra context appended to the role+goal frame\",\"model\":\"optional override (defaults to main's model)\",\"max_tokens\":\"optional context cap (default 65000)\"}"
+}
+
+fun ask_desc() {
+    "- ask: Send a prompt to a named agent and BLOCK until it replies. " ++
+    "The agent runs its own LLM-tools loop (up to 25 steps) and returns a " ++
+    "concise final answer. Use this when you need the answer to proceed. " ++
+    "While you wait, emits from OTHER agents are queued and drain when you " ++
+    "return to your normal loop.\n" ++
+    "  schema: {\"name\":\"string\",\"prompt\":\"the request to the agent\"}"
+}
+
+fun tell_desc() {
+    "- tell: Send a prompt to a named agent fire-and-forget. The agent " ++
+    "starts working; its reply will surface in your stream later as an " ++
+    "[agent_reply] notice without blocking you. Use when you want to " ++
+    "fan-out work and keep moving on your own thread.\n" ++
+    "  schema: {\"name\":\"string\",\"msg\":\"the request\"}"
+}
+
+fun list_agents_desc() {
+    "- list_agents: Print the swarm registry — one row per live agent " ++
+    "showing name, role, current status (spawning/idle/working/dying), " ++
+    "tokens used, and age in seconds. Use to check who's alive before " ++
+    "you spawn another or kill stragglers.\n" ++
+    "  schema: {}"
+}
+
+fun kill_desc() {
+    "- kill: Terminate an agent. Default sends a graceful stop — the agent " ++
+    "finishes its current LLM turn and exits. Pass hard:'true' to clear " ++
+    "the registry slot immediately (the process exits on its next receive).\n" ++
+    "  schema: {\"name\":\"string\",\"hard\":\"optional 'true' for immediate slot release\"}"
+}
+
+fun parallel_desc() {
+    "- parallel: Sugar over spawn+ask+kill for fan-out. Spawns N ephemeral " ++
+    "agents, sends each its own prompt, waits for all replies in order, " ++
+    "then graceful-kills them. Use for embarrassingly parallel jobs (3 " ++
+    "subagents grep different paths; 4 reviewers each take one file). Each " ++
+    "task in the list needs name + role + goal + prompt.\n" ++
+    "  schema: {\"tasks\":[{\"name\":\"string\",\"role\":\"string\",\"goal\":\"string\",\"prompt\":\"string\"}]}"
+}
+
+fun swarm_section() {
+    "\n" ++
+    "=== STUDIO / MULTI-AGENT NOTES ===\n" ++
+    "You are the main agent. The user only sees YOU. Subagents you spawn " ++
+    "are headless workers — their tool calls and replies appear inline in " ++
+    "your stream prefixed [name] in their own color. Each subagent has " ++
+    "the same tool set as you EXCEPT it cannot itself call task / " ++
+    "spawn_agent / ask / parallel (no recursive forking in v1). Spawn " ++
+    "specialists when a sub-problem deserves its own context window or " ++
+    "role identity; otherwise just do the work yourself. Always kill " ++
+    "agents when their goal is met — they consume context budget while " ++
+    "alive."
 }
 
 fun remember_desc() {

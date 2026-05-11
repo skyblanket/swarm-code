@@ -37,6 +37,7 @@ import Heartbeat
 import Background
 import Telemetry
 import Log
+import Agents
 
 fun main() {
     base_opts = load_opts()
@@ -78,6 +79,7 @@ fun main() {
     todos_table = ets_new()
     perms_table = ets_new()
     llm_stats_table = ets_new()
+    swarm_registry = Agents.init()
 
     # Phase E features: memory, heartbeat, background tasks
     memory_table = Memory.load()
@@ -104,6 +106,7 @@ fun main() {
     opts3b = map_put(opts3a, 'heartbeat_table', heartbeat_table)
     opts3c_stats = map_put(opts3b, 'llm_stats_table', llm_stats_table)
     opts3c = map_put(opts3c_stats, 'bg_table', bg_table)
+    opts3c = map_put(opts3c, 'swarm_registry', swarm_registry)
     # Autonomy: wake the LLM on bg_done events so the model can react to
     # background activity without a user prompt. Default ON. Disable with
     # SWARM_CODE_AUTONOMY=0.

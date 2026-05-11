@@ -23,6 +23,7 @@ import UI
 import Arthopod
 import Reader
 import Log
+import Agents
 
 export [run]
 
@@ -154,6 +155,14 @@ fun main_loop(history, opts) {
             on_heartbeat_tick(count, history, opts)
         {'bg_done', task_id, exit_code, label} ->
             on_bg_done(task_id, exit_code, label, history, opts)
+        {'agent_spawned', name} ->
+            on_agent_spawned(name, history, opts)
+        {'agent_emit', name, content} ->
+            on_agent_emit(name, content, history, opts)
+        {'agent_reply', name, content} ->
+            on_agent_reply(name, content, history, opts)
+        {'agent_died', name, reason} ->
+            on_agent_died(name, reason, history, opts)
         {'eof'} ->
             handle_eof(history, opts)
         _other ->
@@ -163,6 +172,40 @@ fun main_loop(history, opts) {
         }
     }
     main_loop(next_state, opts)
+}
+
+# ------------------------------------------------------------
+# Swarm event handlers
+# ------------------------------------------------------------
+# These fire when a subagent says something main wasn't blocking on
+# (the blocking case is handled inside Agents.ask_tool's selective
+# receive). Each renders a one-line notice and returns history
+# unchanged — the main agent's session isn't on the hook to respond.
+# Subagent activity becomes visible in the user's stream alongside
+# main's own output.
+
+fun on_agent_spawned(name, history, opts) {
+    UI.agent_emit_render(to_string(name), "spawned")
+    history
+}
+
+fun on_agent_emit(name, content, history, opts) {
+    UI.agent_emit_render(to_string(name), to_string(content))
+    history
+}
+
+# A reply that arrives unprompted (i.e. main wasn't in ask_tool's
+# selective receive) means an agent finished a `tell`'d task. Surface
+# it the same way as an emit, with a subtle "[done]" prefix so the user
+# sees it landed.
+fun on_agent_reply(name, content, history, opts) {
+    UI.agent_reply_render(to_string(name), to_string(content))
+    history
+}
+
+fun on_agent_died(name, reason, history, opts) {
+    UI.agent_emit_render(to_string(name), "died (" ++ to_string(reason) ++ ")")
+    history
 }
 
 # Handle a user_input message: run the turn, return the new history.
@@ -1085,14 +1128,21 @@ fun resolve_path_key(args_map) {
     if (rp != nil) { rp } else { map_get(args_map, 'file_path') }
 }
 
-# Dispatch a tool call, routing 'task' to the in-module subagent runner
-# and everything else to Tools.exec.
+# Dispatch a tool call. Five paths:
+#   - 'task'                                 → in-module synchronous subagent (legacy)
+#   - 'spawn_agent' / 'ask' / 'tell' /       → studio model (Agents module):
+#     'list_agents' / 'kill' / 'parallel'      long-lived addressable subagents
+#                                              with own LLM session
+#   - everything else                        → Tools.exec
 fun dispatch_tool(name, args, opts) {
-    if (name == 'task') {
-        handle_task_tool(args, opts)
-    } else {
-        Tools.exec(name, args, opts)
-    }
+    if (name == 'task')         { handle_task_tool(args, opts) }
+    else { if (name == 'spawn_agent')  { Agents.spawn_tool(args, opts) }
+    else { if (name == 'ask')          { Agents.ask_tool(args, opts) }
+    else { if (name == 'tell')         { Agents.tell_tool(args, opts) }
+    else { if (name == 'list_agents')  { Agents.list_tool(args, opts) }
+    else { if (name == 'kill')         { Agents.kill_tool(args, opts) }
+    else { if (name == 'parallel')     { Agents.parallel_tool(args, opts) }
+    else { Tools.exec(name, args, opts) }}}}}}}
 }
 
 # ------------------------------------------------------------

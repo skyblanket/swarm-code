@@ -22,7 +22,8 @@ export [all_schemas, all_schemas_json]
 fun all_schemas() {
     [bash_s(), read_s(), write_s(), edit_s(), multi_edit_s(),
      glob_s(), grep_s(), todo_write_s(), web_search_s(), web_fetch_s(),
-     remember_s(), recall_s(), memory_list_s()]
+     remember_s(), recall_s(), memory_list_s(),
+     spawn_agent_s(), ask_s(), tell_s(), list_agents_s(), kill_s(), parallel_s()]
 }
 
 # Return the schemas as JSON array string, ready for embedding in a
@@ -200,4 +201,76 @@ fun memory_list_s() {
         "List all stored memories with their slug, title, and one-line " ++
         "description. Cheap to call at the start of a session.",
         obj(%{}, []))
+}
+
+# ---------- studio / multi-agent ----------
+
+fun spawn_agent_s() {
+    tool("spawn_agent",
+        "Create a new long-lived subagent process with its own LLM session " ++
+        "and full tool set. Returns immediately. Use ask/tell to drive it.",
+        obj(%{
+            name: s("Unique kebab-case name (e.g. bug-hunter)"),
+            role: s("Short role title shown in list_agents"),
+            goal: s("One-sentence objective the agent works toward"),
+            system_prompt: s("Optional extra context appended to the role+goal frame"),
+            model: s("Optional model override; defaults to main agent's model"),
+            max_tokens: i("Optional context cap; defaults to 65000")
+        }, ["name", "role", "goal"]))
+}
+
+fun ask_s() {
+    tool("ask",
+        "Send a prompt to a named agent and BLOCK until it replies. The " ++
+        "agent runs its own LLM-tools loop and returns a concise answer. " ++
+        "Emits from other agents queue while you wait.",
+        obj(%{
+            name: s("Name of the spawned agent"),
+            prompt: s("The request to send")
+        }, ["name", "prompt"]))
+}
+
+fun tell_s() {
+    tool("tell",
+        "Send a prompt to a named agent fire-and-forget. The reply will " ++
+        "surface as an agent_reply notice later without blocking you. Use " ++
+        "to fan-out work and keep moving.",
+        obj(%{
+            name: s("Name of the spawned agent"),
+            msg: s("The request")
+        }, ["name", "msg"]))
+}
+
+fun list_agents_s() {
+    tool("list_agents",
+        "Print the swarm registry — one row per live agent: name, role, " ++
+        "status, tokens used, age. Cheap to call.",
+        obj(%{}, []))
+}
+
+fun kill_s() {
+    tool("kill",
+        "Terminate a subagent. Default is graceful (agent finishes current " ++
+        "turn). hard:'true' clears the registry slot immediately.",
+        obj(%{
+            name: s("Name of the agent to kill"),
+            hard: s("Optional 'true' for immediate slot release")
+        }, ["name"]))
+}
+
+fun parallel_s() {
+    tool("parallel",
+        "Sugar over spawn+ask+kill for fan-out. Spawns N ephemeral " ++
+        "subagents, sends each its prompt, waits for all replies, then " ++
+        "graceful-kills them. Use for embarrassingly-parallel work.",
+        obj(%{
+            tasks: arr(
+                obj(%{
+                    name: s("Unique kebab-case name"),
+                    role: s("Short role title"),
+                    goal: s("Per-agent objective"),
+                    prompt: s("Per-agent first task")
+                }, ["name", "role", "goal", "prompt"]),
+                "List of agent specs to spawn and ask in parallel")
+        }, ["tasks"]))
 }
