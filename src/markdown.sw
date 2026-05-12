@@ -101,6 +101,19 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
                 walk_blocks(rest, [], 'false', list_append(blocks, {'bullet', bullet_text(line)}))
             } else { if (is_quote(line) == 'true') {
                 walk_blocks(rest, [], 'false', list_append(blocks, {'quote', quote_text(line)}))
+            } else { if (is_table_row(line) == 'true') {
+                # Collect this and any consecutive table rows into a
+                # single 'table' block. Without this they fell through
+                # to the paragraph branch and got space-joined into
+                # one mangled line.
+                tbl_last = if (length(blocks) == 0) { nil } else { list_last(blocks) }
+                if (tbl_last != nil && elem(tbl_last, 0) == 'table') {
+                    tbl_rows = elem(tbl_last, 1)
+                    tbl_blocks = list_set_last(blocks, {'table', list_append(tbl_rows, string_trim(line))})
+                    walk_blocks(rest, [], 'false', tbl_blocks)
+                } else {
+                    walk_blocks(rest, [], 'false', list_append(blocks, {'table', [string_trim(line)]}))
+                }
             } else {
                 # Paragraph — extend or start. We keep paragraphs as
                 # single blocks so the soft-wrap can re-flow them.
@@ -113,7 +126,7 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
                 } else {
                     walk_blocks(rest, [], 'false', list_append(blocks, {'para', string_trim(line)}))
                 }
-            }}}}}}
+            }}}}}}}
         }
     }
 }
@@ -148,6 +161,39 @@ fun is_bullet(line) {
 fun bullet_text(line) {
     t = string_trim(line)
     string_sub(t, 2, string_length(t) - 2)
+}
+
+fun is_table_row(line) {
+    t = string_trim(line)
+    if (string_length(t) == 0) { 'false' }
+    else { if (string_sub(t, 0, 1) == "|") { 'true' } else { 'false' }}
+}
+
+# Detect the alignment row: cells are all dashes (with optional :).
+# e.g. |---|---|, |:---|---:|, |:--:|. Used to skip these in render.
+fun is_table_align_row(line) {
+    cells = parse_table_row(line)
+    if (length(cells) == 0) { 'false' }
+    else { all_dashes(cells) }
+}
+
+fun all_dashes(cells) {
+    if (length(cells) == 0) { 'true' }
+    else {
+        c = string_trim(hd(cells))
+        if (string_length(c) == 0) { all_dashes(tl(cells)) }
+        else { if (only_dash_chars(c, 0) == 'true') { all_dashes(tl(cells)) }
+        else { 'false' }}
+    }
+}
+
+fun only_dash_chars(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else {
+        ch = string_sub(s, i, 1)
+        if (ch == "-" || ch == ":" || ch == " ") { only_dash_chars(s, i + 1) }
+        else { 'false' }
+    }
 }
 
 fun is_quote(line) {
@@ -250,7 +296,8 @@ fun render_block(kind, payload, width) {
     else { if (kind == 'code')     { render_code(payload, width) }
     else { if (kind == 'hr')       { render_hr(width) }
     else { if (kind == 'blank')    { "" }
-    else { render_para(payload, width) }}}}}}
+    else { if (kind == 'table')    { render_table(payload, width) }
+    else { render_para(payload, width) }}}}}}}
 }
 
 # Headers: bold. h1 also underlined. Prepend nothing — no `### ` text.
@@ -298,6 +345,160 @@ fun code_indent_loop(lines, color, acc) {
 fun render_hr(width) {
     bar = make_dashes(width - 2, "")
     "  " ++ UI.grey_border() ++ bar ++ UI.reset()
+}
+
+# ------------------------------------------------------------
+# Table rendering
+# ------------------------------------------------------------
+# rows: list of raw "| a | b | c |" lines (alignment row included).
+# Strategy: parse each row into trimmed cells, drop the alignment-only
+# row, compute max width per column, then re-render padded with a │
+# separator. Header row gets a dim ─── divider beneath.
+fun render_table(rows, width) {
+    # Parse rows into [cells]. Skip alignment-only rows.
+    parsed = parse_rows(rows, [])
+    if (length(parsed) == 0) { "" }
+    else {
+        widths = compute_col_widths(parsed, [])
+        # First parsed row is the header. Render it, then the divider,
+        # then the body rows.
+        head = hd(parsed)
+        body = tl(parsed)
+        head_line = render_row(head, widths)
+        div_line = render_divider(widths)
+        body_lines = render_body_rows(body, widths, "")
+        if (string_length(body_lines) == 0) {
+            head_line ++ "\n" ++ div_line
+        } else {
+            head_line ++ "\n" ++ div_line ++ "\n" ++ body_lines
+        }
+    }
+}
+
+fun parse_rows(rows, acc) {
+    if (length(rows) == 0) { acc }
+    else {
+        r = hd(rows)
+        if (is_table_align_row(r) == 'true') { parse_rows(tl(rows), acc) }
+        else { parse_rows(tl(rows), list_append(acc, parse_table_row(r))) }
+    }
+}
+
+# Parse "| a | b | c |" → ["a", "b", "c"]. Drops the leading and
+# trailing empty cells produced by surrounding `|` characters.
+fun parse_table_row(line) {
+    t = string_trim(line)
+    parts = string_split(t, "|")
+    trimmed = trim_cells(parts, [])
+    drop_edge_empties(trimmed)
+}
+
+fun trim_cells(items, acc) {
+    if (length(items) == 0) { acc }
+    else { trim_cells(tl(items), list_append(acc, string_trim(hd(items)))) }
+}
+
+# Drop a leading "" and a trailing "" if present (artifacts of the
+# bordering `|` chars). Keep internal empties — they're real empty cells.
+fun drop_edge_empties(cells) {
+    after_lead = if (length(cells) == 0) { cells }
+                 else { if (string_length(hd(cells)) == 0) { tl(cells) }
+                 else { cells }}
+    drop_trail_empty(after_lead)
+}
+
+fun drop_trail_empty(cells) {
+    n = length(cells)
+    if (n == 0) { cells }
+    else {
+        last_v = list_last(cells)
+        if (string_length(last_v) == 0) { take_n(cells, n - 1, []) }
+        else { cells }
+    }
+}
+
+fun take_n(lst, n, acc) {
+    if (n <= 0) { acc }
+    else { if (length(lst) == 0) { acc }
+    else { take_n(tl(lst), n - 1, list_append(acc, hd(lst))) }}
+}
+
+# Compute max display width per column across all rows.
+fun compute_col_widths(rows, acc) {
+    if (length(rows) == 0) { acc }
+    else {
+        row_widths = row_to_widths(hd(rows), [])
+        merged = merge_widths(acc, row_widths, [])
+        compute_col_widths(tl(rows), merged)
+    }
+}
+
+fun row_to_widths(cells, acc) {
+    if (length(cells) == 0) { acc }
+    else {
+        rendered = render_inline(hd(cells))
+        row_to_widths(tl(cells), list_append(acc, display_width(rendered)))
+    }
+}
+
+# Element-wise max of two width lists, padding the shorter with 0.
+fun merge_widths(a, b, acc) {
+    if (length(a) == 0 && length(b) == 0) { acc }
+    else { if (length(a) == 0) { merge_widths(a, tl(b), list_append(acc, hd(b))) }
+    else { if (length(b) == 0) { merge_widths(tl(a), b, list_append(acc, hd(a))) }
+    else {
+        ah = hd(a)
+        bh = hd(b)
+        m = if (ah > bh) { ah } else { bh }
+        merge_widths(tl(a), tl(b), list_append(acc, m))
+    }}}
+}
+
+# Render one row as "  cell1 │ cell2 │ cell3" with each cell padded.
+fun render_row(cells, widths) {
+    "  " ++ row_cells_loop(cells, widths, "")
+}
+
+fun row_cells_loop(cells, widths, acc) {
+    if (length(cells) == 0) { acc }
+    else {
+        cell = hd(cells)
+        col_width = if (length(widths) == 0) { display_width(cell) } else { hd(widths) }
+        rendered = render_inline(cell)
+        padded = rendered ++ pad_chars(col_width - display_width(rendered), "")
+        sep = if (string_length(acc) == 0) { "" } else { " " ++ UI.grey_border() ++ "│" ++ UI.reset() ++ " " }
+        next_widths = if (length(widths) == 0) { [] } else { tl(widths) }
+        row_cells_loop(tl(cells), next_widths, acc ++ sep ++ padded)
+    }
+}
+
+fun pad_chars(n, acc) {
+    if (n <= 0) { acc }
+    else { pad_chars(n - 1, acc ++ " ") }
+}
+
+# Divider beneath the header row: ──── per column joined with ┼.
+fun render_divider(widths) {
+    "  " ++ UI.grey_border() ++ divider_loop(widths, "") ++ UI.reset()
+}
+
+fun divider_loop(widths, acc) {
+    if (length(widths) == 0) { acc }
+    else {
+        w = hd(widths)
+        bar = make_dashes(w, "")
+        sep = if (string_length(acc) == 0) { "" } else { "─┼─" }
+        divider_loop(tl(widths), acc ++ sep ++ bar)
+    }
+}
+
+fun render_body_rows(rows, widths, acc) {
+    if (length(rows) == 0) { acc }
+    else {
+        line = render_row(hd(rows), widths)
+        next_acc = if (string_length(acc) == 0) { line } else { acc ++ "\n" ++ line }
+        render_body_rows(tl(rows), widths, next_acc)
+    }
 }
 
 fun make_dashes(n, acc) {
