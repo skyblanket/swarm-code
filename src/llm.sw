@@ -379,6 +379,12 @@ fun chat_native(messages, opts) {
     if (resp == nil) {
         Log.llm_error("http_post returned nil (native)", "")
         nil
+    } else { if (resp == "__INTERRUPTED__") {
+        # User hit ESC / Ctrl-C during the call. http_post already
+        # printed an "⏸ interrupted by user" line. Return nil so the
+        # agent loop just resets to the prompt without adding to history.
+        Log.llm_error("interrupted by user", "")
+        nil
     } else {
         decoded = json_decode(resp)
         if (decoded == nil) {
@@ -434,7 +440,7 @@ fun chat_native(messages, opts) {
                 }
             }
         }
-    }
+    }}
 }
 
 fun transcode_native_calls(tool_calls, prose) {
