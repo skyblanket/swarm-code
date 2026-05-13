@@ -125,7 +125,78 @@ fun tool_descriptions() {
     list_agents_desc() ++ "\n" ++
     kill_desc() ++ "\n" ++
     parallel_desc() ++ "\n" ++
+    browser_launch_desc() ++ "\n" ++
+    browser_navigate_desc() ++ "\n" ++
+    browser_click_desc() ++ "\n" ++
+    browser_type_desc() ++ "\n" ++
+    browser_screenshot_desc() ++ "\n" ++
+    browser_get_text_desc() ++ "\n" ++
+    browser_get_html_desc() ++ "\n" ++
+    browser_evaluate_desc() ++ "\n" ++
+    browser_close_desc() ++ "\n" ++
     swarm_section()
+}
+
+# ------------------------------------------------------------
+# Browser tools — CDP control of a real Chrome via swarmrt's
+# wsc_* / chrome_launch builtins. Zero foreign-runtime deps: no
+# Node, no Python, just Chrome (or any Chromium-based browser).
+# ------------------------------------------------------------
+
+fun browser_launch_desc() {
+    "- browser_launch: Start (or attach to) a Chromium-based browser " ++
+    "with remote debugging enabled. Lazy — first call spawns chrome on " ++
+    "port 9222 with an isolated profile; subsequent calls re-use the " ++
+    "session. Pass headless:'false' to see the window.\n" ++
+    "  schema: {\"headless\":\"optional 'true' (default) | 'false'\"}"
+}
+
+fun browser_navigate_desc() {
+    "- browser_navigate: Load a URL in the current page. Waits ~800ms " ++
+    "after Page.navigate for the page to settle.\n" ++
+    "  schema: {\"url\":\"string\"}"
+}
+
+fun browser_click_desc() {
+    "- browser_click: Click an element by CSS selector. Implemented via " ++
+    "JS .click() so works for buttons, links, custom widgets.\n" ++
+    "  schema: {\"selector\":\"CSS selector string\"}"
+}
+
+fun browser_type_desc() {
+    "- browser_type: Set an input/textarea's value by CSS selector and " ++
+    "fire input + change events so frameworks (React/Vue) see the change.\n" ++
+    "  schema: {\"selector\":\"CSS selector\",\"text\":\"text to enter\"}"
+}
+
+fun browser_screenshot_desc() {
+    "- browser_screenshot: Capture the current viewport as PNG. Default " ++
+    "path /tmp/swc-page.png. Use this to verify what the user sees.\n" ++
+    "  schema: {\"path\":\"optional output file path\"}"
+}
+
+fun browser_get_text_desc() {
+    "- browser_get_text: Extract text from the page. With selector, " ++
+    "returns that element's innerText; without, the whole document.body.\n" ++
+    "  schema: {\"selector\":\"optional CSS selector\"}"
+}
+
+fun browser_get_html_desc() {
+    "- browser_get_html: Return the current document.documentElement.outerHTML " ++
+    "(the full live DOM serialised, post-script execution).\n" ++
+    "  schema: {}"
+}
+
+fun browser_evaluate_desc() {
+    "- browser_evaluate: Run a JS expression in the page and return its " ++
+    "value as a string. Useful for inspecting state the DOM doesn't expose.\n" ++
+    "  schema: {\"expression\":\"JavaScript expression\"}"
+}
+
+fun browser_close_desc() {
+    "- browser_close: Close the WS session. Chrome stays running so the " ++
+    "next browser_launch is instant. Kill chrome via bash if needed.\n" ++
+    "  schema: {}"
 }
 
 # ------------------------------------------------------------

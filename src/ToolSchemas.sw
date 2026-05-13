@@ -23,7 +23,10 @@ fun all_schemas() {
     [bash_s(), read_s(), write_s(), edit_s(), multi_edit_s(),
      glob_s(), grep_s(), todo_write_s(), web_search_s(), web_fetch_s(),
      remember_s(), recall_s(), memory_list_s(),
-     spawn_agent_s(), ask_s(), tell_s(), list_agents_s(), kill_s(), parallel_s()]
+     spawn_agent_s(), ask_s(), tell_s(), list_agents_s(), kill_s(), parallel_s(),
+     browser_launch_s(), browser_navigate_s(), browser_click_s(),
+     browser_type_s(), browser_screenshot_s(), browser_get_text_s(),
+     browser_get_html_s(), browser_evaluate_s(), browser_close_s()]
 }
 
 # Return the schemas as JSON array string, ready for embedding in a
@@ -273,4 +276,65 @@ fun parallel_s() {
                 }, ["name", "role", "goal", "prompt"]),
                 "List of agent specs to spawn and ask in parallel")
         }, ["tasks"]))
+}
+
+# ---------- browser (CDP via swarmrt) ----------
+
+fun browser_launch_s() {
+    tool("browser_launch",
+        "Start (or attach to) a Chromium browser with remote debugging. " ++
+        "Lazy: first call spawns; later calls reuse.",
+        obj(%{headless: s("Optional 'true' (default) or 'false'")}, []))
+}
+
+fun browser_navigate_s() {
+    tool("browser_navigate",
+        "Load a URL in the current page.",
+        obj(%{url: s("Absolute URL")}, ["url"]))
+}
+
+fun browser_click_s() {
+    tool("browser_click",
+        "Click an element by CSS selector via JS .click().",
+        obj(%{selector: s("CSS selector")}, ["selector"]))
+}
+
+fun browser_type_s() {
+    tool("browser_type",
+        "Set an input/textarea value and fire input + change events.",
+        obj(%{
+            selector: s("CSS selector"),
+            text: s("Text to enter")
+        }, ["selector", "text"]))
+}
+
+fun browser_screenshot_s() {
+    tool("browser_screenshot",
+        "Capture viewport as PNG. Default path /tmp/swc-page.png.",
+        obj(%{path: s("Optional output path")}, []))
+}
+
+fun browser_get_text_s() {
+    tool("browser_get_text",
+        "Extract innerText. With selector, that element only; without, " ++
+        "the whole document.body.",
+        obj(%{selector: s("Optional CSS selector")}, []))
+}
+
+fun browser_get_html_s() {
+    tool("browser_get_html",
+        "Return document.documentElement.outerHTML — full live DOM.",
+        obj(%{}, []))
+}
+
+fun browser_evaluate_s() {
+    tool("browser_evaluate",
+        "Run a JS expression and return its value as a string.",
+        obj(%{expression: s("JavaScript expression")}, ["expression"]))
+}
+
+fun browser_close_s() {
+    tool("browser_close",
+        "Close the WS session. Chrome stays running for fast re-launch.",
+        obj(%{}, []))
 }

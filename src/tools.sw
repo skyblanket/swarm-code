@@ -22,6 +22,7 @@ import Memory
 import Background
 import Heartbeat
 import Telemetry
+import Browser
 
 export [exec, max_output_bytes]
 
@@ -59,8 +60,17 @@ fun exec(name, args, opts) {
     else { if (name == 'code_search') { do_code_search(args) }
     else { if (name == 'log_wait') { do_log_wait(args, opts) }
     else { if (name == 'file_watch') { do_file_watch(args) }
+    else { if (name == 'browser_launch')     { do_browser_launch(args, opts) }
+    else { if (name == 'browser_navigate')   { do_browser_navigate(args, opts) }
+    else { if (name == 'browser_click')      { do_browser_click(args, opts) }
+    else { if (name == 'browser_type')       { do_browser_type(args, opts) }
+    else { if (name == 'browser_screenshot') { do_browser_screenshot(args, opts) }
+    else { if (name == 'browser_get_text')   { do_browser_get_text(args, opts) }
+    else { if (name == 'browser_get_html')   { do_browser_get_html(args, opts) }
+    else { if (name == 'browser_evaluate')   { do_browser_evaluate(args, opts) }
+    else { if (name == 'browser_close')      { do_browser_close(args, opts) }
     else { "error: unknown tool '" ++ to_string(name) ++ "'"
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # ------------------------------------------------------------
@@ -1203,6 +1213,113 @@ fun do_web_fetch(args) {
             file_delete(tmp_path)
             "fetched " ++ url ++ " (" ++ to_string(string_length(text)) ++
                 " chars after strip)\n\n" ++ text
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# browser_* — CDP browser control via swarmrt's wsc_* / chrome_launch
+# ------------------------------------------------------------
+# A single session is held in opts['browser_table'] (an ETS table).
+# First call to browser_launch lazy-creates it. Subsequent calls
+# reuse — chrome stays warm across the whole REPL session.
+
+fun ensure_browser(opts) {
+    table = map_get(opts, 'browser_table')
+    if (table == nil) { nil }
+    else {
+        sess = ets_get(table, 'session')
+        if (sess != nil) { sess }
+        else { nil }
+    }
+}
+
+fun do_browser_launch(args, opts) {
+    table = map_get(opts, 'browser_table')
+    if (table == nil) { "error: browser table not initialised in opts" }
+    else {
+        existing = ets_get(table, 'session')
+        if (existing != nil) {
+            "ok: browser already launched (reusing session)"
+        } else {
+            headless_v = map_get(args, 'headless')
+            headless = if (headless_v == 'false' || headless_v == "false") { 'false' } else { 'true' }
+            sess = Browser.init(headless)
+            if (sess == nil) {
+                "error: chrome_launch failed — is Chrome / Chromium installed? checked /Applications and /usr/bin"
+            } else {
+                ets_put(table, 'session', sess)
+                "ok: browser launched (headless=" ++ to_string(headless) ++ ")"
+            }
+        }
+    }
+}
+
+fun do_browser_navigate(args, opts) {
+    sess = ensure_browser(opts)
+    url = map_get(args, 'url')
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { if (url == nil) { "error: navigate requires 'url'" }
+    else { Browser.navigate(sess, url) }}
+}
+
+fun do_browser_click(args, opts) {
+    sess = ensure_browser(opts)
+    sel = map_get(args, 'selector')
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { if (sel == nil) { "error: click requires 'selector'" }
+    else { Browser.click(sess, sel) }}
+}
+
+fun do_browser_type(args, opts) {
+    sess = ensure_browser(opts)
+    sel = map_get(args, 'selector')
+    text = map_get(args, 'text')
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { if (sel == nil) { "error: type requires 'selector'" }
+    else { if (text == nil) { "error: type requires 'text'" }
+    else { Browser.type_text(sess, sel, text) }}}
+}
+
+fun do_browser_screenshot(args, opts) {
+    sess = ensure_browser(opts)
+    path_v = map_get(args, 'path')
+    path = if (path_v == nil) { "/tmp/swc-page.png" } else { to_string(path_v) }
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { Browser.screenshot(sess, path) }
+}
+
+fun do_browser_get_text(args, opts) {
+    sess = ensure_browser(opts)
+    sel = map_get(args, 'selector')
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { Browser.get_text(sess, sel) }
+}
+
+fun do_browser_get_html(args, opts) {
+    sess = ensure_browser(opts)
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { Browser.get_html(sess) }
+}
+
+fun do_browser_evaluate(args, opts) {
+    sess = ensure_browser(opts)
+    expr = map_get(args, 'expression')
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else { if (expr == nil) { "error: evaluate requires 'expression'" }
+    else { Browser.evaluate(sess, expr) }}
+}
+
+fun do_browser_close(args, opts) {
+    table = map_get(opts, 'browser_table')
+    if (table == nil) { "ok: no browser to close" }
+    else {
+        sess = ets_get(table, 'session')
+        if (sess == nil) { "ok: no browser session to close" }
+        else {
+            Browser.close(sess)
+            ets_delete(table, 'session')
+            "ok: browser session closed (chrome still running for fast re-launch)"
         }
     }
 }
