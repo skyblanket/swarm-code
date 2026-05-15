@@ -163,6 +163,15 @@ fun main_loop(history, opts) {
             on_agent_reply(name, content, history, opts)
         {'agent_died', name, reason} ->
             on_agent_died(name, reason, history, opts)
+        {'stream_chunk', name, content} ->
+            UI.stream_chunk_render(to_string(name), to_string(content), opts)
+            history
+        {'stream_reason', name, content} ->
+            UI.stream_reason_render(to_string(name), to_string(content), opts)
+            history
+        {'stream_done', name} ->
+            UI.stream_done_render(to_string(name), opts)
+            history
         {'eof'} ->
             handle_eof(history, opts)
         _other ->

@@ -37,7 +37,8 @@ export [
     todo_list_render, todo_summary,
     green, grey_text, grey_border,
     agent_color, agent_tool_header, agent_emit_render,
-    agent_reply_render, agents_table
+    agent_reply_render, agents_table,
+    stream_chunk_render, stream_reason_render, stream_done_render
 ]
 
 # ------------------------------------------------------------
@@ -552,6 +553,62 @@ fun agent_tool_header(name, tool, args_preview) {
 fun agent_emit_render(name, content) {
     print("")
     print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
+}
+
+# ------------------------------------------------------------
+# Streaming render — handles {'stream_chunk'} from a subagent.
+#
+# State machine: the stream_state ETS table holds the name of the agent
+# currently mid-stream. When a chunk arrives:
+#   - same agent → just print text inline (no new prefix)
+#   - different agent → close previous line + start new prefix
+#   - first chunk → start fresh prefix
+# A {'stream_done'} clears the state so the next chunk re-prints prefix.
+# ------------------------------------------------------------
+fun stream_chunk_render(name, content, opts) {
+    tbl = map_get(opts, 'stream_state_table')
+    if (tbl == nil) {
+        # Fallback: just print with a prefix on every chunk if no state table.
+        print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
+    } else {
+        cur = ets_get(tbl, 'current')
+        if (cur == nil) {
+            print("")
+            print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " ")
+            print_inline(to_string(content))
+            ets_put(tbl, 'current', name)
+        } else {
+            if (cur == name) {
+                print_inline(to_string(content))
+            } else {
+                print("")
+                print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
+                ets_put(tbl, 'current', name)
+            }
+        }
+    }
+}
+
+# Reasoning chunks render dim+italic with the agent prefix. v1: each chunk
+# gets its own line with a 'reason' arrow so users see thinking arrive but
+# it's visually separated from prose.
+fun stream_reason_render(name, content, opts) {
+    tbl = map_get(opts, 'stream_state_table')
+    # Reasoning bypasses the inline-stream state (it's a different channel).
+    if (tbl != nil) { ets_put(tbl, 'current', nil) }
+    print("")
+    print("  " ++ agent_prefix(name) ++ " \e[38;5;240m\e[3m" ++ to_string(content) ++ "\e[0m")
+}
+
+fun stream_done_render(name, opts) {
+    tbl = map_get(opts, 'stream_state_table')
+    if (tbl != nil) {
+        cur = ets_get(tbl, 'current')
+        if (cur == name) {
+            print("")
+            ets_put(tbl, 'current', nil)
+        }
+    }
 }
 
 # Final reply from an agent (resolves an `ask`).

@@ -26,7 +26,8 @@ import UI
 # Auto-detected in main.sw from endpoint (z.ai, openai.com, groq, etc →
 # native; local/private → inband). Override with SWARM_CODE_TOOL_FORMAT.
 
-export [chat, chat_silent, build_request_body, extract_content, extract_reasoning,
+export [chat, chat_silent, chat_for_subagent,
+        build_request_body, extract_content, extract_reasoning,
         extract_usage, last_prompt_tokens, record_usage, chat_completions_url,
         record_reasoning, last_reasoning]
 
@@ -564,6 +565,64 @@ fun chat_once(messages, opts) {
                       " Try restarting vllm on the host.)\e[0m")
                 print("")
             }
+            content
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# Subagent chat — streaming, but every content chunk is sent as a
+# {'stream_chunk', name, text} message to target_pid instead of being
+# printed to stdout. The parent agent multiplexes them and renders with
+# its own per-agent prefix so 3 parallel subagents don't interleave on
+# the shared TTY.
+#
+# Returns the full accumulated content (same shape as chat_once) so the
+# subagent's run_agent_turn loop is unchanged. Reasoning + truncation
+# markers also come through as separate message tags.
+# ------------------------------------------------------------
+fun chat_for_subagent(messages, opts, target_pid, name) {
+    endpoint = map_get(opts, 'endpoint')
+    api_key = map_get(opts, 'api_key')
+    model = map_get(opts, 'model')
+    url = chat_completions_url(endpoint)
+
+    body = build_request_body(messages, opts)
+    body_chars = string_length(body)
+
+    Log.llm_request(to_string(model), length(messages), body_chars)
+    start_ms = timestamp()
+
+    base_hdrs = [{"Content-Type", "application/json"}]
+    hdrs = if (api_key == nil) {
+        base_hdrs
+    } else {
+        list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key})
+    }
+
+    # Subagent-mode call: pass parent pid + name as 4th/5th args so the
+    # C builtin routes every chunk as a tagged message instead of stdout.
+    resp = http_post_stream(url, hdrs, body, target_pid, name)
+    latency = timestamp() - start_ms
+
+    if (resp == nil) {
+        Log.llm_error("http_post returned nil (subagent " ++ name ++ ")", "")
+        nil
+    } else {
+        content = extract_content(resp)
+        if (content == nil) {
+            Log.llm_error("extract_content returned nil (subagent)", resp)
+            nil
+        } else {
+            usage = extract_usage(resp)
+            record_usage(opts, usage)
+            reason_text = extract_reasoning(resp)
+            record_reasoning(opts, reason_text)
+            has_xml = string_contains(content, "<tool_call>") == 'true'
+            has_native = string_contains(content, "call:") == 'true'
+            had_tools = if (has_xml == 'true') { 'true' }
+                        else { if (has_native == 'true') { 'true' } else { 'false' } }
+            Log.llm_response(latency, string_length(content), had_tools)
             content
         }
     }

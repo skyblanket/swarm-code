@@ -81,6 +81,10 @@ fun main() {
     llm_stats_table = ets_new()
     swarm_registry = Agents.init()
     browser_table = ets_new()
+    # Tracks "which subagent is currently streaming" so chunks from the
+    # same agent merge inline and prefix lines only print on agent
+    # transitions. Single key 'current' → name | nil.
+    stream_state = ets_new()
 
     # Phase E features: memory, heartbeat, background tasks
     memory_table = Memory.load()
@@ -109,6 +113,7 @@ fun main() {
     opts3c = map_put(opts3c_stats, 'bg_table', bg_table)
     opts3c = map_put(opts3c, 'swarm_registry', swarm_registry)
     opts3c = map_put(opts3c, 'browser_table', browser_table)
+    opts3c = map_put(opts3c, 'stream_state_table', stream_state)
     # Autonomy: wake the LLM on bg_done events so the model can react to
     # background activity without a user prompt. Default ON. Disable with
     # SWARM_CODE_AUTONOMY=0.

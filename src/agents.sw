@@ -257,19 +257,25 @@ fun build_agent_opts(reg, name, parent_opts) {
 # run_agent_turn — minimal LLM-tools loop for the subagent
 # ------------------------------------------------------------
 # Mirrors agent.sw run_subagent_loop but standalone (no Agent import).
-# Caps at agent_max_steps() to prevent runaway. No streaming, no
-# reasoning display — those happen inside LLM.chat which prints to
-# stdout. We pipe that output into main via {'agent_emit'} messages
-# rather than letting the subagent print directly. To keep v1 simple
-# we live with subagents printing through LLM's existing stdout writes
-# — they'll appear in main's stream interleaved. Cleaning that up is a
-# follow-up (see ROADMAP at bottom).
+# Caps at agent_max_steps() to prevent runaway. Subagents never write to
+# stdout directly — every content/reasoning chunk is sent to main as
+# {'stream_chunk', name, text} / {'stream_reason', name, text} via the
+# subagent-mode variant of http_post_stream. Main's main loop (and
+# wait_for_reply) drain those and render with a per-agent prefix, so
+# parallel subagents don't interleave on the shared TTY.
 fun run_agent_turn(reg, name, history, opts, step) {
     if (step >= agent_max_steps()) {
         emit_to_main(name, "[hit max steps without final answer]")
         "[hit max steps without final answer]"
     } else {
-        content = LLM.chat(history, opts)
+        # Route streaming through main if main is registered; otherwise
+        # fall back to direct stdout (e.g. unit-test harness).
+        main_pid = whereis('main_agent')
+        content = if (main_pid == nil) {
+            LLM.chat(history, opts)
+        } else {
+            LLM.chat_for_subagent(history, opts, main_pid, name)
+        }
         if (content == nil) {
             emit_to_main(name, "[llm call failed]")
             "[llm call failed]"
@@ -394,7 +400,7 @@ fun ask_tool(args, opts) {
                 "error: agent '" ++ name ++ "' is still spawning, retry in a moment"
             } else {
                 send(pid, {'task', to_string(prompt_v), self()})
-                wait_for_reply(name)
+                wait_for_reply_with(name, opts)
             }
         }
     }}}
@@ -405,6 +411,13 @@ fun ask_tool(args, opts) {
 # inline so the user sees progress; emits from OTHER agents queue
 # until the main loop drains them.
 fun wait_for_reply(name) {
+    wait_for_reply_with(name, nil)
+}
+
+# wait_for_reply variant that knows about opts (so it can render stream
+# chunks via UI helpers that need the stream_state_table). Both
+# ask_tool and parallel_tool flow into this.
+fun wait_for_reply_with(name, opts) {
     receive {
         {'agent_reply', n, content} ->
             if (n == name) { to_string(content) }
@@ -412,22 +425,31 @@ fun wait_for_reply(name) {
                 # Re-send to self so main can pick it up later. Cheap
                 # alternative to a true mailbox-stay primitive.
                 send(self(), {'agent_reply', n, content})
-                wait_for_reply(name)
+                wait_for_reply_with(name, opts)
             }
         {'agent_emit', n, content} ->
             if (n == name) {
                 UI.agent_emit_render(n, to_string(content))
-                wait_for_reply(name)
+                wait_for_reply_with(name, opts)
             } else {
                 send(self(), {'agent_emit', n, content})
-                wait_for_reply(name)
+                wait_for_reply_with(name, opts)
             }
+        {'stream_chunk', n, content} ->
+            UI.stream_chunk_render(to_string(n), to_string(content), opts)
+            wait_for_reply_with(name, opts)
+        {'stream_reason', n, content} ->
+            UI.stream_reason_render(to_string(n), to_string(content), opts)
+            wait_for_reply_with(name, opts)
+        {'stream_done', n} ->
+            UI.stream_done_render(to_string(n), opts)
+            wait_for_reply_with(name, opts)
         {'agent_died', n, reason} ->
             if (n == name) {
                 "error: agent '" ++ n ++ "' died before replying (" ++ to_string(reason) ++ ")"
             } else {
                 send(self(), {'agent_died', n, reason})
-                wait_for_reply(name)
+                wait_for_reply_with(name, opts)
             }
     }
 }
@@ -522,7 +544,7 @@ fun parallel_tool(args, opts) {
         send_results = parallel_send_each(tasks_v, opts, [])
         # Phase 3: collect N replies.
         names = parallel_extract_names(tasks_v, [])
-        replies = parallel_collect(names, [])
+        replies = parallel_collect_with(names, [], opts)
         # Phase 4: cleanup — graceful kill each.
         parallel_kill_each(names, opts)
         # Render combined.
@@ -593,6 +615,10 @@ fun parallel_extract_names(tasks, acc) {
 # Block until all named agents have replied. Uses the same selective-
 # receive pattern as ask_tool but for a SET of expected names.
 fun parallel_collect(names_remaining, acc) {
+    parallel_collect_with(names_remaining, acc, nil)
+}
+
+fun parallel_collect_with(names_remaining, acc, opts) {
     if (length(names_remaining) == 0) { acc }
     else {
         receive {
@@ -600,22 +626,31 @@ fun parallel_collect(names_remaining, acc) {
                 if (list_contains(names_remaining, n) == 'true') {
                     new_remaining = list_remove(names_remaining, n)
                     new_acc = list_append(acc, {n, to_string(content)})
-                    parallel_collect(new_remaining, new_acc)
+                    parallel_collect_with(new_remaining, new_acc, opts)
                 } else {
                     send(self(), {'agent_reply', n, content})
-                    parallel_collect(names_remaining, acc)
+                    parallel_collect_with(names_remaining, acc, opts)
                 }
             {'agent_emit', n, content} ->
                 UI.agent_emit_render(n, to_string(content))
-                parallel_collect(names_remaining, acc)
+                parallel_collect_with(names_remaining, acc, opts)
+            {'stream_chunk', n, content} ->
+                UI.stream_chunk_render(to_string(n), to_string(content), opts)
+                parallel_collect_with(names_remaining, acc, opts)
+            {'stream_reason', n, content} ->
+                UI.stream_reason_render(to_string(n), to_string(content), opts)
+                parallel_collect_with(names_remaining, acc, opts)
+            {'stream_done', n} ->
+                UI.stream_done_render(to_string(n), opts)
+                parallel_collect_with(names_remaining, acc, opts)
             {'agent_died', n, reason} ->
                 if (list_contains(names_remaining, n) == 'true') {
                     new_remaining = list_remove(names_remaining, n)
                     new_acc = list_append(acc, {n, "[died before reply: " ++ to_string(reason) ++ "]"})
-                    parallel_collect(new_remaining, new_acc)
+                    parallel_collect_with(new_remaining, new_acc, opts)
                 } else {
                     send(self(), {'agent_died', n, reason})
-                    parallel_collect(names_remaining, acc)
+                    parallel_collect_with(names_remaining, acc, opts)
                 }
         }
     }

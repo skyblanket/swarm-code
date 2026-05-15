@@ -209,10 +209,9 @@ fun interpret_eval_result(result, label) {
 }
 
 # ------------------------------------------------------------
-# screenshot — Page.captureScreenshot returns base64 PNG. We pipe it
-# through `base64 -d` via shell into the requested path. Keeps us out
-# of the business of decoding 300 KB images in sw (and avoids needing
-# a base64_decode builtin in swarmrt).
+# screenshot — Page.captureScreenshot returns base64 PNG. We decode
+# in-process via the base64_decode builtin (added 2026-05-15) and
+# write binary directly. No tmp file, no shell pipe, no `rm -f`.
 # ------------------------------------------------------------
 fun screenshot(session, path) {
     p = to_string(path)
@@ -223,11 +222,12 @@ fun screenshot(session, path) {
         b64 = map_get(result, 'data')
         if (b64 == nil) { "error: no data in screenshot result" }
         else {
-            tmp = "/tmp/swc-screenshot-" ++ to_string(timestamp()) ++ ".b64"
-            file_write(tmp, to_string(b64))
-            cmd = "base64 -d -i " ++ tmp ++ " > " ++ shell_quote_local(p) ++ " && rm -f " ++ tmp
-            shell(cmd)
-            "ok: wrote screenshot to " ++ p
+            png = base64_decode(to_string(b64))
+            if (png == nil) { "error: base64_decode failed" }
+            else {
+                file_write(p, png)
+                "ok: wrote screenshot to " ++ p
+            }
         }
     }}
 }
