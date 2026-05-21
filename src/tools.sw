@@ -237,14 +237,28 @@ fun do_read(args) {
 }
 
 fun read_file_capped(path, offset, limit) {
+    pq = shell_quote(to_string(path))
     # Check if file is binary before reading — binary content poisons the
     # model's context and causes empty responses.
-    file_type = elem(shell("file --brief --mime-type " ++ shell_quote(to_string(path))), 1)
+    file_type = elem(shell("file --brief --mime-type " ++ pq), 1)
     is_text = string_starts_with(string_trim(file_type), "text") == 'true'
     is_json = string_contains(file_type, "json") == 'true'
     is_xml = string_contains(file_type, "xml") == 'true'
     if (is_text == 'true' || is_json == 'true' || is_xml == 'true') {
-        content = file_read(path)
+        # Size guard: file_read() pulls the WHOLE file into memory, so a
+        # multi-GB file would OOM the VM before truncate_output ever runs.
+        # Stat first; for anything large, read only a capped head via
+        # `head -c` instead of slurping the whole thing.
+        size_str = string_trim(elem(shell("wc -c < " ++ pq ++ " 2>/dev/null"), 1))
+        size = parse_int_safe(size_str, 0)
+        read_ceiling = max_output_bytes() * 8
+        content = if (size > read_ceiling) {
+            head = elem(shell("head -c " ++ to_string(read_ceiling) ++ " " ++ pq), 1)
+            head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
+            to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
+        } else {
+            file_read(path)
+        }
         if (content == nil) {
             "error: could not read " ++ path
         } else {
@@ -401,17 +415,49 @@ fun do_glob(args) {
         "error: missing 'pattern'"
     } else {
         base = if (path == nil) { "." } else { to_string(path) }
-        # Both path and pattern come from the model — quote them so a
-        # malicious or accidental quote can't break out of the command.
-        cmd = "find " ++ shell_quote(base) ++ " -type f -name " ++
-              shell_quote(to_string(pattern)) ++ " 2>/dev/null | head -n 80"
+        pat = to_string(pattern)
+        pat_q = shell_quote(pat)
+        # When base is ".", DON'T pass it to rg — `rg --files . ` emits
+        # `./`-prefixed paths, and an anchored glob like `src/**/*.sw`
+        # never matches `./src/...`. With no path arg rg emits clean
+        # relative paths and anchored globs work.
+        base_part = if (base == "." || string_length(string_trim(base)) == 0) {
+            ""
+        } else { " " ++ shell_quote(base) }
+        base_q = shell_quote(base)
+        # ripgrep `--files -g` gives real glob semantics, but rg is
+        # often unavailable to a plain /bin/sh (e.g. when it's only a
+        # shell function, not a real binary). So the `find` fallback
+        # below MUST be correct on its own.
+        #
+        # Glob → find conversion:
+        #   `**/`  collapses to nothing — find's `-path` treats `*` as
+        #          matching across `/`, and `**` means "zero or more"
+        #          dirs, so `src/**/*.sw` must also match `src/x.sw`.
+        #          Replacing `**/`→`*/` would have forced ≥1 dir.
+        #   `**`   (leftover, no slash) → `*`.
+        #   slash present → `-path '*<pat>'` (whole-path match).
+        #   no slash      → `-name '<pat>'` (basename, any depth).
+        pat_nogs = string_replace(pat, "**/", "")
+        pat_find = string_replace(pat_nogs, "**", "*")
+        find_expr = if (string_contains(pat_find, "/") == 'true') {
+            "-path " ++ shell_quote("*" ++ pat_find)
+        } else {
+            "-name " ++ shell_quote(pat_find)
+        }
+        # Pipe through `sed s|^\./||` to strip the `./` prefix `find`
+        # adds when invoked with `.` — matches ripgrep's clean output
+        # so downstream tools (Read) get the same path either way.
+        cmd = "if command -v rg >/dev/null 2>&1; then " ++
+              "rg --files --hidden --no-messages -g " ++ pat_q ++ base_part ++ "; " ++
+              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null | sed 's|^\\./||'; fi | head -n 100"
         result = shell(with_timeout(cmd, search_timeout_s()))
         code = elem(result, 0)
         out = elem(result, 1)
         if (code == 142) {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            if (string_length(out) == 0) { "(no matches)" } else { out }
+            if (string_length(string_trim(out)) == 0) { "(no matches)" } else { out }
         }
     }
 }
@@ -421,23 +467,65 @@ fun do_glob(args) {
 # ------------------------------------------------------------
 fun do_grep(args) {
     pattern = map_get(args, 'pattern')
-    path = map_get(args, 'path')
-    if (pattern == nil) {
-        "error: missing 'pattern'"
-    } else {
+    if (pattern == nil) { "error: missing 'pattern'" }
+    else {
+        path = map_get(args, 'path')
+        glob_arg = map_get(args, 'glob')
+        mode = map_get(args, 'output_mode')
+        hl = map_get(args, 'head_limit')
         base = if (path == nil) { "." } else { to_string(path) }
+        pat_q = shell_quote(to_string(pattern))
+        # Omit a "." path so rg emits clean (non-`./`-prefixed) paths.
+        base_part = if (base == "." || string_length(string_trim(base)) == 0) {
+            ""
+        } else { " " ++ shell_quote(base) }
         base_q = shell_quote(base)
-        cmd = "(command -v rg >/dev/null && rg -n --no-heading --color=never -e " ++
-              shell_quote(to_string(pattern)) ++ " " ++ base_q ++
-              " || grep -rn --color=never -e " ++ shell_quote(to_string(pattern)) ++
-              " " ++ base_q ++ ") 2>&1 | head -n 80"
+
+        # Optional glob filter (rg --glob / mirrors Claude Code's Grep).
+        glob_flag = if (glob_arg == nil) { "" }
+                    else { " -g " ++ shell_quote(to_string(glob_arg)) }
+
+        # output_mode: 'content' (default — file:line:text), 'count'
+        # (-c), 'files_with_matches' (-l). Earlier do_grep ignored this
+        # arg entirely even though the schema advertised it.
+        rg_mode = if (mode == "files_with_matches") { " -l" }
+                  else { if (mode == "count") { " -c" }
+                  else { " -n --no-heading" }}
+        grep_mode = if (mode == "files_with_matches") { " -rl" }
+                    else { if (mode == "count") { " -rc" }
+                    else { " -rn" }}
+
+        # head_limit caps the result lines (digit-validated; default 100).
+        head_n = if (hl == nil) { 100 }
+                 else {
+                     hs = to_string(hl)
+                     if (is_digits_only(hs) == 'true') { parse_int_safe(hs, 100) }
+                     else { 100 }
+                 }
+
+        # `if/then/else` (not `rg || grep`) so an rg run that finds
+        # nothing doesn't fall through and re-run grep over the whole
+        # tree. --hidden so dotfiles aren't skipped; -e so a pattern
+        # starting with `-` isn't read as a flag.
+        grep_base = if (base == "." || string_length(string_trim(base)) == 0) {
+            " ."
+        } else { " " ++ base_q }
+        # Strip leading `./` so grep's `path:line:text` matches rg's
+        # `path:line:text` exactly — the model often hands those paths
+        # back to Read, which doesn't need (and shouldn't see) a `./`.
+        cmd = "if command -v rg >/dev/null 2>&1; then " ++
+              "rg --color=never --hidden --no-messages" ++ rg_mode ++ glob_flag ++
+              " -e " ++ pat_q ++ base_part ++ "; " ++
+              "else grep" ++ grep_mode ++ " --color=never -e " ++ pat_q ++ grep_base ++ " 2>/dev/null | sed 's|^\\./||'; fi" ++
+              " | head -n " ++ to_string(head_n)
         result = shell(with_timeout(cmd, search_timeout_s()))
         code = elem(result, 0)
         out = elem(result, 1)
         if (code == 142) {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            if (string_length(out) == 0) { "(no matches)" } else { out }
+            trimmed = truncate_output(out, max_output_bytes())
+            if (string_length(string_trim(trimmed)) == 0) { "(no matches)" } else { trimmed }
         }
     }
 }

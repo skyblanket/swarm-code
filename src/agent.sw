@@ -110,6 +110,113 @@ fun parse_budget_env(s, i, acc, saw_digit) {
 # Session file path (for persistence).
 fun session_dir() { getenv("HOME") ++ "/.swarm-code/sessions" }
 
+# ============================================================
+# Crash-recovery journal
+# ============================================================
+# swarm-code panics are exit(1) — uncatchable — and a C-level fault
+# kills the whole VM. No in-process supervisor can save a crashed
+# turn. The ONLY thing that survives is on-disk state, so we journal
+# every message the instant history changes.
+#
+# Layout (~/.swarm-code/sessions/):
+#   journal-<ts>.jsonl  — one ["role","content"] JSON array per line
+#   .active             — pointer file holding the live session's
+#                         journal path. Deleted on a clean /quit.
+#                         If it still exists at startup, the last
+#                         session crashed → we replay and resume.
+#
+# The system prompt is NOT journaled (rebuilt fresh every boot).
+# The bin/swc-run supervisor relaunches the binary on abnormal exit;
+# this journal is what lets the relaunched process pick up the thread.
+fun journal_active_ptr() { session_dir() ++ "/.active" }
+
+# Serialize history (minus the system message) to JSONL text.
+fun encode_journal(history) {
+    encode_journal_loop(history, "")
+}
+
+fun encode_journal_loop(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        entry = hd(msgs)
+        role = elem(entry, 0)
+        content = elem(entry, 1)
+        if (role == 'system') {
+            encode_journal_loop(tl(msgs), acc)
+        } else {
+            line = json_encode([to_string(role), content]) ++ "\n"
+            encode_journal_loop(tl(msgs), acc ++ line)
+        }
+    }
+}
+
+# Atomically rewrite the journal to match the current in-memory
+# history. Rewrite (not append) so /reset and /compact keep the
+# journal in sync. temp + rename means a crash mid-write can never
+# truncate the real journal — it's all-or-nothing.
+fun journal_sync(opts, history) {
+    jp = map_get(opts, 'journal_path')
+    if (jp == nil) { 'ok' }
+    else {
+        tmp = jp ++ ".tmp"
+        file_write(tmp, encode_journal(history))
+        shell("mv " ++ tmp ++ " " ++ jp)
+        'ok'
+    }
+}
+
+# Replay a journal file into a message list (no system message).
+fun replay_journal(path) {
+    content = file_read(path)
+    if (content == nil) { [] }
+    else { replay_lines(string_split(content, "\n"), []) }
+}
+
+fun replay_lines(lines, acc) {
+    if (length(lines) == 0) { acc }
+    else {
+        ln = string_trim(hd(lines))
+        if (string_length(ln) == 0) {
+            replay_lines(tl(lines), acc)
+        } else {
+            pair = json_decode(ln)
+            if (pair == nil) {
+                replay_lines(tl(lines), acc)
+            } else { if (length(pair) < 2) {
+                replay_lines(tl(lines), acc)
+            } else {
+                role = string_to_role(to_string(hd(pair)))
+                body = hd(tl(pair))
+                replay_lines(tl(lines), list_append(acc, {role, body}))
+            }}
+        }
+    }
+}
+
+# Drop a trailing assistant message that still carries unexecuted
+# `call:` markers — the turn crashed before the tools ran, so the
+# tool_calls have no matching results. Leaving it would desync the
+# native-mode protocol on the next request.
+fun trim_incomplete(msgs) {
+    if (length(msgs) == 0) { msgs }
+    else {
+        last = hd(take_last(msgs, 1))
+        role = elem(last, 0)
+        content = to_string(elem(last, 1))
+        if (role == 'assistant' && string_contains(content, "\ncall:") == 'true') {
+            drop_last(msgs, 1)
+        } else { msgs }
+    }
+}
+
+# Mark the session cleanly ended — drop the .active pointer so the
+# next launch doesn't think we crashed.
+fun journal_clean(opts) {
+    ap = journal_active_ptr()
+    if (file_exists(ap) == 'true') { file_delete(ap) }
+    'ok'
+}
+
 # ------------------------------------------------------------
 # Entry point — called from Main.main once config is ready.
 #
@@ -125,15 +232,51 @@ fun session_dir() { getenv("HOME") ++ "/.swarm-code/sessions" }
 # ------------------------------------------------------------
 fun run(opts, system_prompt_text) {
     register('main_agent', self())
+
+    # --- Crash-recovery journal: set up / resume ---
+    jdir = session_dir()
+    shell("mkdir -p " ++ jdir)
+    ap = journal_active_ptr()
+    prev_ptr = if (file_exists(ap) == 'true') { file_read(ap) } else { nil }
+    resumed_raw = if (prev_ptr == nil) { [] }
+                  else {
+                      prev_path = string_trim(prev_ptr)
+                      if (string_length(prev_path) > 0 && file_exists(prev_path) == 'true') {
+                          replay_journal(prev_path)
+                      } else { [] }
+                  }
+    resumed = trim_incomplete(resumed_raw)
+
+    journal_path = if (length(resumed) > 0) {
+        # Crashed last run — keep appending to the same journal.
+        string_trim(prev_ptr)
+    } else {
+        jp_new = jdir ++ "/journal-" ++ to_string(timestamp()) ++ ".jsonl"
+        file_write(jp_new, "")
+        jp_new
+    }
+    file_write(ap, journal_path)
+    opts_journal = map_put(opts, 'journal_path', journal_path)
+
+    history = if (length(resumed) > 0) {
+        print("")
+        print(UI.grey_text() ++ "  ⏺ resumed crashed session — " ++
+              to_string(length(resumed)) ++ " messages recovered" ++ UI.reset())
+        prepend([{'system', system_prompt_text}], resumed)
+    } else {
+        [{'system', system_prompt_text}]
+    }
+    # Normalize the journal to the (possibly trimmed) resumed state.
+    journal_sync(opts_journal, history)
+
     reader_pid = Reader.start()
-    history = [{'system', system_prompt_text}]
     print("")
     # Kick off the first prompt — tells reader to draw the box and read.
     # Messages sent before the target runs `receive` queue in its mailbox.
     if (reader_pid != nil) {
         send(reader_pid, {'draw_and_read'})
     }
-    opts_with_reader = map_put(opts, 'reader_pid', reader_pid)
+    opts_with_reader = map_put(opts_journal, 'reader_pid', reader_pid)
     main_loop(history, opts_with_reader)
 }
 
@@ -180,6 +323,14 @@ fun main_loop(history, opts) {
             on_idle(history, opts)
         }
     }
+    # Journal backstop: persist whenever the event changed history.
+    # A length delta covers appends, compaction, and /reset. Idle
+    # heartbeat ticks leave history untouched and skip the write.
+    # Mid-turn durability is handled by run_turn / execute_all, which
+    # journal after every assistant message and tool result.
+    if (length(next_state) != length(history)) {
+        journal_sync(opts, next_state)
+    }
     main_loop(next_state, opts)
 }
 
@@ -213,7 +364,17 @@ fun on_agent_reply(name, content, history, opts) {
 }
 
 fun on_agent_died(name, reason, history, opts) {
-    UI.agent_emit_render(to_string(name), "died (" ++ to_string(reason) ++ ")")
+    rs = to_string(reason)
+    # `stopped` is the normal end-of-fanout teardown — parallel_tool
+    # spawns N agents, gathers replies, then explicitly stops them.
+    # Rendering that as "died (stopped)" reads like a crash. Show it
+    # as completion. Any other reason (panic, killed, error) stays
+    # loud so a real anomaly is visible.
+    if (rs == "stopped" || rs == "normal" || rs == "ok") {
+        UI.agent_emit_render(to_string(name), UI.green() ++ "✓ done" ++ UI.reset())
+    } else {
+        UI.agent_emit_render(to_string(name), "\e[31mdied\e[0m (" ++ rs ++ ")")
+    }
     history
 }
 
@@ -440,6 +601,9 @@ fun handle_eof(history, opts) {
     }
     Log.session_end("user_exit")
     Config.run_hooks("Stop", 'session', "{}", opts)
+    # Clean exit — drop the .active pointer so the next launch doesn't
+    # mistake this for a crash and replay the journal.
+    journal_clean(opts)
     sys_exit(0)
     history
 }
@@ -582,10 +746,14 @@ fun slash_dispatch(cmd, history, opts) {
         }
         history
     }
+    else { if (cmd == "/agents") {
+        print(Agents.list_tool(map_new(), opts))
+        history
+    }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -594,10 +762,13 @@ fun show_help() {
     print("  /status               session info")
     print("  /tools                list available tools")
     print("  /todos                show todo list")
+    print("  /agents               list live subagents (swarm)")
     print("  /model                show active model")
     print("  /history              print recent messages")
     print("  /tokens               approximate token count")
     print("  /cost                 session cost (local = $0)")
+    print("  /telemetry            last 30 events (LLM, tools, errors)")
+    print("  /stats                today's session summary")
     print("  /clear                clear screen")
     print("  /reset                clear conversation history")
     print("  /compact              summarize history to save context")
@@ -975,6 +1146,7 @@ fun run_turn(history, opts, step) {
             working_hist
         } else {
             with_assistant = list_append(working_hist, {'assistant', content})
+            journal_sync(opts, with_assistant)
             tool_calls = extract_tool_calls(content)
             if (length(tool_calls) == 0) {
                 visible = string_trim(content)
@@ -1265,6 +1437,7 @@ fun execute_all(tool_calls, history, opts) {
             denial = "error: permission denied for tool '" ++ to_string(name) ++ "'"
             print("\e[31m" ++ denial ++ "\e[0m")
             hist_denied = list_append(history, {'user', "<tool_result>\n" ++ denial ++ "\n</tool_result>"})
+            journal_sync(opts, hist_denied)
             execute_all(tl(tool_calls), hist_denied, opts)
         } else {
             # PreToolUse hooks.
@@ -1273,6 +1446,7 @@ fun execute_all(tool_calls, history, opts) {
                 blocked = "error: tool '" ++ to_string(name) ++ "' blocked by PreToolUse hook"
                 print("\e[31m" ++ blocked ++ "\e[0m")
                 hist_blocked = list_append(history, {'user', "<tool_result>\n" ++ blocked ++ "\n</tool_result>"})
+                journal_sync(opts, hist_blocked)
                 execute_all(tl(tool_calls), hist_blocked, opts)
             } else {
                 result = dispatch_tool(name, args_map, opts)
@@ -1284,6 +1458,7 @@ fun execute_all(tool_calls, history, opts) {
 
                 wrapped = "<tool_result>\n" ++ result ++ "\n</tool_result>"
                 hist_ok = list_append(history, {'user', wrapped})
+                journal_sync(opts, hist_ok)
                 execute_all(tl(tool_calls), hist_ok, opts)
             }
         }

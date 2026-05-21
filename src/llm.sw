@@ -334,9 +334,60 @@ fun messages_to_maps(messages, acc) {
 fun chat(messages, opts) {
     tool_format = map_get(opts, 'tool_format')
     if (tool_format == 'native') {
-        chat_native(messages, opts)
+        chat_native_retry(messages, opts, 0)
     } else {
         chat_attempt(messages, opts, 0)
+    }
+}
+
+# ------------------------------------------------------------
+# Retry — transient LLM failures should not end a turn
+# ------------------------------------------------------------
+# A dropped connection, a 5xx, a rate-limit, a half-decoded body —
+# all transient. The native path previously gave up on the first
+# nil and the turn just died ("[error] llm call failed"). Now we
+# back off and try again. The ONE failure we never retry is a user
+# interrupt (ESC) — they asked to stop. chat_native records the
+# reason via record_fail; chat_native_retry reads it here.
+fun record_fail(opts, reason) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'ok' }
+    else { ets_put(table, 'fail_reason', reason) }
+}
+
+fun last_fail(opts) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { nil } else { ets_get(table, 'fail_reason') }
+}
+
+# Backoff in milliseconds (sw `sleep` takes ms).
+fun retry_delay_ms(attempt) {
+    if (attempt == 0) { 1000 }
+    else { if (attempt == 1) { 2000 }
+    else { 4000 }}
+}
+
+fun chat_native_retry(messages, opts, attempt) {
+    content = chat_native(messages, opts)
+    if (content != nil) { content }
+    else {
+        reason = last_fail(opts)
+        if (reason == "interrupted") {
+            # User pressed ESC — honour it, don't retry.
+            nil
+        } else { if (attempt >= max_chat_retries()) {
+            print("  \e[38;5;208m✗ llm call failed after " ++
+                  to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
+            nil
+        } else {
+            d = retry_delay_ms(attempt)
+            print("  \e[38;5;208m↻ llm call failed — retrying in " ++
+                  to_string(d / 1000) ++ "s (attempt " ++
+                  to_string(attempt + 2) ++ "/" ++
+                  to_string(max_chat_retries() + 1) ++ ")\e[0m")
+            sleep(d)
+            chat_native_retry(messages, opts, attempt + 1)
+        }}
     }
 }
 
@@ -365,17 +416,29 @@ fun chat_native(messages, opts) {
     Log.llm_request(to_string(model), length(messages), body_chars)
     start_ms = timestamp()
 
-    print("  \e[38;5;240m⋯ thinking (" ++ to_string(model) ++ ")...\e[0m")
-
     base_hdrs = [{"Content-Type", "application/json"}]
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = http_post(url, hdrs, body)
+    # Pessimistic default: assume failure. Cleared on success below,
+    # overridden to "interrupted" on a user ESC. chat_native_retry
+    # reads this to decide whether a nil result is worth retrying.
+    record_fail(opts, "fail")
+
+    # Run http_post in a worker so the main process can tick an
+    # elapsed-seconds display while waiting. Without this the user
+    # sees a static "⋯ thinking" line and has no signal whether the
+    # call is alive — leading to the "forever" feeling on big
+    # contexts (Kimi K2.6 thinking + tools can legitimately take
+    # 30–90s; curl's hard ceiling is 5min). Worker sends the result
+    # back as {'http_resp', r}.
+    print_inline("  \e[38;5;240m⋯ thinking 0s (" ++ to_string(model) ++ ")...\e[0m")
+    spawn(http_post_worker(self(), url, hdrs, body))
+    resp = wait_with_progress(0, to_string(model))
     latency = timestamp() - start_ms
 
-    # Erase the "thinking..." line so final output is clean.
-    print("\e[1A\e[K")
+    # Clear the in-place progress line so subsequent output is clean.
+    print_inline("\r\e[K")
 
     if (resp == nil) {
         Log.llm_error("http_post returned nil (native)", "")
@@ -384,6 +447,7 @@ fun chat_native(messages, opts) {
         # User hit ESC / Ctrl-C during the call. http_post already
         # printed an "⏸ interrupted by user" line. Return nil so the
         # agent loop just resets to the prompt without adding to history.
+        record_fail(opts, "interrupted")
         Log.llm_error("interrupted by user", "")
         nil
     } else {
@@ -409,6 +473,8 @@ fun chat_native(messages, opts) {
                     Log.llm_error("no choices (native)", resp)
                     nil
                 } else {
+                    # Got a real response — clear the failure flag.
+                    record_fail(opts, nil)
                     choice0 = hd(choices)
                     msg_obj = map_get(choice0, 'message')
                     raw_content = map_get(msg_obj, 'content')
@@ -465,20 +531,55 @@ fun transcode_loop(tool_calls, acc) {
     }
 }
 
-fun max_chat_retries() { 2 }
+# ------------------------------------------------------------
+# Live progress while the model thinks
+# ------------------------------------------------------------
+# http_post is a synchronous blocking call (up to curl's --max-time
+# 300s ceiling). Without a progress indicator the user has no signal
+# whether the call is alive or wedged. We sidestep that by running
+# the request in a worker process and using `receive ... after 1000`
+# in the parent to tick the displayed elapsed-seconds every second.
+# The user can still ESC to interrupt — the interrupted flag is
+# checked C-side regardless of which sw process issued http_post.
+fun http_post_worker(parent, url, hdrs, body) {
+    r = http_post(url, hdrs, body)
+    send(parent, {'http_resp', r})
+    'ok'
+}
+
+fun wait_with_progress(elapsed, model) {
+    receive {
+        {'http_resp', r} -> r
+        after 1000 { tick_progress(elapsed, model) }
+    }
+}
+
+# The receive parser's after-body accepts a single expression, not a
+# statement block — so the per-tick work lives in its own function.
+fun tick_progress(elapsed, model) {
+    new_e = elapsed + 1
+    print_inline("\r\e[K  \e[38;5;240m⋯ thinking " ++
+                 to_string(new_e) ++ "s (" ++ model ++ ")...\e[0m")
+    wait_with_progress(new_e, model)
+}
+
+# 3 retries = 4 total attempts. Spans a ~7s transient outage.
+fun max_chat_retries() { 3 }
 
 fun chat_attempt(messages, opts, attempt) {
     content = chat_once(messages, opts)
     needs_retry = if (content == nil) { 'true' }
                   else { is_transport_truncated(content) }
     if (needs_retry == 'true' && attempt < max_chat_retries()) {
-        delay_s = if (attempt == 0) { 2 } else { 5 }
+        delay_ms = retry_delay_ms(attempt)
         print("")
         print("  \e[38;5;208m↻ transport failure — retrying in " ++
-              to_string(delay_s) ++ "s (attempt " ++
+              to_string(delay_ms / 1000) ++ "s (attempt " ++
               to_string(attempt + 2) ++ "/" ++
               to_string(max_chat_retries() + 1) ++ ")\e[0m")
-        sleep(delay_s)
+        # sw `sleep` takes milliseconds — the old `sleep(2)` was a
+        # 2ms no-op, so retries effectively had no backoff at all.
+        sleep(delay_ms)
         chat_attempt(messages, opts, attempt + 1)
     } else {
         content

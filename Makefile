@@ -10,7 +10,9 @@ BIN     := bin/swarm-code
 # maintaining this list by hand every time we add a module.
 SOURCES := $(wildcard $(SRC_DIR)/*.sw)
 
-.PHONY: all clean run
+TESTBIN := bin/swarm-code-test
+
+.PHONY: all clean run test
 
 all: $(BIN)
 
@@ -18,6 +20,15 @@ $(BIN): $(SOURCES)
 	@mkdir -p bin
 	$(SWC) build $(SRC_DIR)/main.sw -o $(BIN)
 	@echo "swarm-code: built $(BIN)"
+
+# Test suite — builds and runs bin/swarm-code-test. Exits non-zero
+# if any check fails, so `make test` works in CI / pre-commit.
+test: $(TESTBIN)
+	@./$(TESTBIN)
+
+$(TESTBIN): $(SOURCES)
+	@mkdir -p bin
+	@$(SWC) build $(SRC_DIR)/test_runner.sw -o $(TESTBIN)
 
 clean:
 	rm -rf bin
