@@ -1,0 +1,168 @@
+name: Release
+
+# Builds swarm-code for macOS (arm64 + x86_64) and Linux (x86_64 + arm64),
+# uploads the binaries as GitHub release assets so `scripts/install.sh` can
+# fetch the right one. Triggered by pushing a `v*` tag (e.g. `v0.1.0`).
+#
+# Windows isn't built natively — swarmrt isn't fully ported yet. WSL2 users
+# get the linux-x86_64 binary via the same installer.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+          - os: macos-13
+            target: darwin-x86_64
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout swarm-code
+        uses: actions/checkout@v4
+        with:
+          path: swarm-code
+
+      - name: Checkout swarmrt (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: skyblanket/swarmrt
+          path: swarmrt
+
+      - name: Install dependencies (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Install dependencies (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          # sqlite3 is in macOS by default but Homebrew's is newer and
+          # matches the Makefile's preferred include path.
+          brew install sqlite3 || true
+
+      - name: Build swarmrt (swc + libswarmrt)
+        working-directory: swarmrt
+        run: make swc libswarmrt
+
+      - name: Build swarm-code
+        working-directory: swarm-code
+        run: |
+          export SWARMRT="$GITHUB_WORKSPACE/swarmrt"
+          make
+
+      - name: Smoke-test the binary
+        working-directory: swarm-code
+        run: |
+          # Don't launch the REPL — it'd block on stdin. `file` + size
+          # check is enough to catch a completely-broken build.
+          file bin/swarm-code
+          test -s bin/swarm-code
+          ls -lh bin/swarm-code
+
+      - name: Package
+        working-directory: swarm-code
+        run: |
+          mkdir -p dist
+          cp bin/swarm-code dist/swarm-${{ matrix.target }}
+
+          # Strip on Linux — macOS strip already runs as part of cc.
+          if [[ "${{ matrix.target }}" == linux-* ]]; then
+            strip dist/swarm-${{ matrix.target }}
+          fi
+
+          ls -lh dist/swarm-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarm-${{ matrix.target }}
+          path: swarm-code/dist/swarm-${{ matrix.target }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: dist
+        run: |
+          shasum -a 256 swarm-* > checksums.txt
+          cat checksums.txt
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "swarm-code v${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## swarm-code v${{ steps.version.outputs.VERSION }}
+
+            Terminal coding agent on the swarmrt runtime.
+
+            ### Install (one line, any Unix)
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/skyblanket/swarm-code/main/scripts/install.sh | sh
+            ```
+
+            That drops `swarm` into `~/.local/bin` and writes a config stub to
+            `~/.swarm-code/settings.json`. Edit it to add your API key, then run:
+
+            ```bash
+            swarm
+            ```
+
+            ### Windows
+
+            Native Windows isn't supported yet (swarmrt still has POSIX
+            dependencies). Use WSL2:
+
+            ```powershell
+            wsl --install
+            # then, inside WSL:
+            curl -fsSL https://raw.githubusercontent.com/skyblanket/swarm-code/main/scripts/install.sh | sh
+            ```
+
+            ### Platforms
+
+            | File | Platform |
+            |------|----------|
+            | `swarm-darwin-arm64` | macOS Apple Silicon |
+            | `swarm-darwin-x86_64` | macOS Intel |
+            | `swarm-linux-x86_64` | Linux x86_64 (also WSL2) |
+            | `swarm-linux-arm64` | Linux ARM64 |
+          files: |
+            dist/swarm-*
+            dist/checksums.txt
+          draft: false
+          prerelease: false

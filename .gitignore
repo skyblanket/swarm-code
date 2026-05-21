@@ -3,9 +3,17 @@
 # and explicitly opt in the swarm-code project files.
 /*
 !/.gitignore
+!/.github/
 !/Makefile
 !/README.md
+!/scripts/
 !/src/
+
+# Inside scripts/, only install.* belongs to swarm-code; the rest is
+# noise from earlier sessions and stays untracked.
+scripts/*
+!scripts/install.sh
+!scripts/install.ps1
 
 # Inside src/, ignore generated C output from `swc build`.
 src/*.gen.c
