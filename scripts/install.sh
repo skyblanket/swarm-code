@@ -85,6 +85,24 @@ EOF
         *)              die "unsupported architecture: $arch" ;;
     esac
 
+    # Intel Mac binaries aren't prebuilt — Apple Silicon dominates and
+    # the GitHub Intel runner queue is unusable. Point the user at the
+    # build-from-source path so they're not stuck.
+    if [ "$os_tag" = "darwin" ] && [ "$arch_tag" = "x86_64" ]; then
+        cat <<EOF
+${RED}No prebuilt binary for Intel Mac yet.${RESET}
+
+Build from source instead (~30s, needs Xcode CLT + brew):
+
+  ${BOLD}git clone https://github.com/skyblanket/swarmrt   ../swarmrt${RESET}
+  ${BOLD}git clone https://github.com/$REPO${RESET}
+  cd ../swarmrt   && make swc libswarmrt
+  cd ../swarm-code && make
+  cp bin/swarm-code "$BINDIR/swarm"
+EOF
+        exit 1
+    fi
+
     printf '%s-%s\n' "$os_tag" "$arch_tag"
 }
 

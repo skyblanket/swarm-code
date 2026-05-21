@@ -24,12 +24,15 @@ jobs:
         include:
           - os: macos-14
             target: darwin-arm64
-          - os: macos-13
-            target: darwin-x86_64
           - os: ubuntu-latest
             target: linux-x86_64
           - os: ubuntu-24.04-arm
             target: linux-arm64
+          # darwin-x86_64 (Intel Mac) isn't built — GitHub's macos-13
+          # runners are deprecated and queue for hours, and cross-
+          # compiling through swc + libswarmrt is messier than it's
+          # worth for a shrinking platform. Intel Mac users get the
+          # build-from-source path in README.
 
     runs-on: ${{ matrix.os }}
 
@@ -158,9 +161,11 @@ jobs:
             | File | Platform |
             |------|----------|
             | `swarm-darwin-arm64` | macOS Apple Silicon |
-            | `swarm-darwin-x86_64` | macOS Intel |
             | `swarm-linux-x86_64` | Linux x86_64 (also WSL2) |
             | `swarm-linux-arm64` | Linux ARM64 |
+
+            macOS Intel and native Windows aren't prebuilt — see the
+            README for the build-from-source / WSL2 paths.
           files: |
             dist/swarm-*
             dist/checksums.txt

@@ -25,9 +25,9 @@ edit `endpoint` + `model` in `settings.json`.
 | Platform | Binary | Notes |
 |----------|--------|-------|
 | macOS Apple Silicon | `swarm-darwin-arm64` | |
-| macOS Intel | `swarm-darwin-x86_64` | |
 | Linux x86_64 | `swarm-linux-x86_64` | also covers WSL2 |
 | Linux ARM64 | `swarm-linux-arm64` | |
+| macOS Intel | — | build from source (see below) |
 | Windows | — | use WSL2, run the install above |
 
 ### Windows (WSL2)
