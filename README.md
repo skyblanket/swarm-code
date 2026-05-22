@@ -11,6 +11,10 @@ runtime. Single ~3 MB native binary — no Node, no Python, no Electron.
   you opt in. No telemetry, no analytics, no auto-updater, no phone-home.
 - **Multi-agent.** Spawns subagents on the swarmrt scheduler for parallel
   work, with a real process model underneath (mailboxes, links, monitors).
+- **Scriptable.** `swarm -p "<task>"` runs headless to completion — pipe a
+  prompt in, get the work out. A drop-in worker for any orchestrator.
+- **MCP client.** Connect external Model Context Protocol servers; their
+  tools fold straight into swarm-code's own tool surface.
 
 ## Install
 
@@ -32,7 +36,8 @@ version with `--tag`, or change the install dir with `--bindir`.
 ## Usage
 
 ```
-swarm                  start the interactive agent
+swarm                  start the interactive agent (REPL)
+swarm -p "<prompt>"    headless: run one task to completion, then exit
 swarm --help, -h       show usage and exit
 swarm --version, -V    print the version and exit
 swarm --print-config   show the resolved endpoint / model / config and exit
@@ -41,6 +46,25 @@ swarm --print-config   show the resolved endpoint / model / config and exit
 Inside the agent, type `/help` for the full slash-command list — `/model`,
 `/tools`, `/status`, `/compact`, `/resume`, `/agents`, and more. `/quit`
 exits.
+
+### Headless mode
+
+`swarm -p "<prompt>"` (or `--print`) runs a single task to completion with
+no TUI — it streams the work, then exits. It's a real agentic run: the
+agent loops through every tool step until the task is done, not just one
+turn.
+
+```bash
+swarm -p "fix the failing test in src/parser.sw"
+echo "summarize the last commit" | swarm -p          # prompt from stdin
+swarm -p "audit deps for CVEs" --json                # final {"status","summary"} line
+```
+
+With no argument after `-p` (or `-p -`), the prompt is read from stdin —
+so an orchestrator can pipe a multi-line prompt without shell-quoting it.
+Headless runs auto-accept tool permissions (there is no human to prompt;
+invoking `-p` *is* the opt-in to autonomous execution), and the session
+journal still carries over between invocations.
 
 ## Configuration
 
@@ -82,6 +106,30 @@ Common environment variables (full behaviour documented at the top of
 | `SW_QUIET` | Set to `1` to silence the swarmrt startup banner |
 
 Run `swarm --print-config` to see exactly what these resolve to.
+
+### MCP servers
+
+swarm-code is an [MCP](https://modelcontextprotocol.io) client — it can
+connect to external Model Context Protocol servers and fold their tools
+into its own. Add an `mcpServers` block to `settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_..." }
+    }
+  }
+}
+```
+
+Each server is a long-lived child process speaking JSON-RPC over stdio;
+swarm-code boots them in parallel at startup and discovers their tools as
+`mcp__<server>__<tool>`. MCP tools are external and unvetted, so they
+default to **ask** — one permission prompt on first use — while built-in
+tools default to allow. With no `mcpServers` block, MCP is entirely inert.
 
 ## Local by default
 
