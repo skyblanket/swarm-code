@@ -258,15 +258,16 @@ fun input_box_bottom_full(model_name, token_count, budget) {
     } else {
         format_tokens(token_count)
     }
-    # Color the token count based on usage ratio
+    # Token count tints toward warning/error as the budget fills.
     colored_tokens = if (budget > 0 && token_count > 0) {
         ratio = (token_count * 100) / budget
-        if (ratio > 85) { "\e[38;5;196m" ++ token_str ++ reset() }       # red — near limit
-        else { if (ratio > 60) { "\e[38;5;208m" ++ token_str ++ reset() } # orange — getting there
-        else { token_str }}
-    } else { token_str }
-    print("  " ++ grey_text() ++ "⏎ send  ·  /help  ·  /quit  ·  " ++
-          model_name ++ "  ·  " ++ colored_tokens ++ reset())
+        if (ratio > 85) { err_color() ++ token_str ++ reset() }
+        else { if (ratio > 60) { warn_color() ++ token_str ++ reset() }
+        else { grey_text() ++ token_str ++ reset() }}
+    } else { grey_text() ++ token_str ++ reset() }
+    # Footer: one calm muted line — slash-help hint · model · token meter.
+    print("  " ++ grey_text() ++ "/help  ·  " ++ model_name ++ "  ·  " ++
+          reset() ++ colored_tokens)
 }
 
 # Short format: "3.7k" (no " tokens" suffix) for the budget display
