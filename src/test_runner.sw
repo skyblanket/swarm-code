@@ -24,6 +24,7 @@ import LLM
 import Config
 import Memory
 import Tools
+import Agents
 
 fun main() {
     print("")
@@ -47,7 +48,8 @@ fun main() {
         t_dangerous_bash(),
         t_slugify(),
         t_glob(),
-        t_grep()
+        t_grep(),
+        t_registry_list_names()
     ]
 
     passed = sum_list(results, 0)
@@ -260,4 +262,17 @@ fun t_glob() {
 fun t_grep() {
     out = Tools.exec('grep', %{pattern: "module Tools", path: "src"}, %{})
     check("grep finds file content", string_contains(out, "tools.sw"))
+}
+
+# Agents.registry_list_names walked ets_list with elem(e, 0), treating
+# each key as a {k,v} tuple — but ets_list returns bare keys (strings),
+# so `list_agents` panicked "elem: not a tuple (got type 3)". Must
+# return the registered names without crashing.
+fun t_registry_list_names() {
+    reg = Agents.init()
+    ets_put(reg, "alpha-tester", %{role: "math whiz"})
+    ets_put(reg, "beta-tester", %{role: "poet"})
+    names = Agents.registry_list_names(reg)
+    check("registry_list_names returns agent names (list_agents crash)",
+          if (length(names) == 2) { 'true' } else { 'false' })
 }

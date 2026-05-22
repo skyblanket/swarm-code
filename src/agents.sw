@@ -68,9 +68,11 @@ fun registry_list_names(reg) {
 fun collect_names(entries, acc) {
     if (length(entries) == 0) { acc }
     else {
-        e = hd(entries)
-        k = elem(e, 0)
-        # Skip nil and internal keys (none today, but defensive).
+        # ets_list returns the table's keys directly — here, agent name
+        # strings. It is NOT a list of {key, value} tuples, so the entry
+        # IS the key. (The old elem(e, 0) panicked on a string.)
+        k = hd(entries)
+        # Skip internal keys (none today, but defensive).
         is_internal = string_starts_with(to_string(k), "_")
         next_acc = if (is_internal == 'true') { acc } else { list_append(acc, k) }
         collect_names(tl(entries), next_acc)
