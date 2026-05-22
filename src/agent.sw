@@ -23,7 +23,6 @@ import UI
 import Arthopod
 import Reader
 import Log
-import Agents
 import Mcp
 
 export [run, run_headless]
@@ -385,23 +384,6 @@ fun main_loop(history, opts) {
             on_heartbeat_tick(count, history, opts)
         {'bg_done', task_id, exit_code, label} ->
             on_bg_done(task_id, exit_code, label, history, opts)
-        {'agent_spawned', name} ->
-            on_agent_spawned(name, history, opts)
-        {'agent_emit', name, content} ->
-            on_agent_emit(name, content, history, opts)
-        {'agent_reply', name, content} ->
-            on_agent_reply(name, content, history, opts)
-        {'agent_died', name, reason} ->
-            on_agent_died(name, reason, history, opts)
-        {'stream_chunk', name, content} ->
-            UI.stream_chunk_render(opts, to_string(name), to_string(content))
-            history
-        {'stream_reason', name, content} ->
-            UI.stream_reason_render(opts, to_string(name), to_string(content))
-            history
-        {'stream_done', name} ->
-            UI.stream_done_render(opts, to_string(name))
-            history
         {'eof'} ->
             handle_eof(history, opts)
         _other ->
@@ -421,59 +403,10 @@ fun main_loop(history, opts) {
     main_loop(next_state, opts)
 }
 
-# ------------------------------------------------------------
-# Swarm event handlers
-# ------------------------------------------------------------
-# These fire when a subagent says something main wasn't blocking on
-# (the blocking case is handled inside Agents.ask_tool's selective
-# receive). Each renders a one-line notice and returns history
-# unchanged — the main agent's session isn't on the hook to respond.
-# Subagent activity becomes visible in the user's stream alongside
-# main's own output.
-
-fun on_agent_spawned(name, history, opts) {
-    UI.agent_emit_render(opts, to_string(name), "spawned")
-    history
-}
-
-fun on_agent_emit(name, content, history, opts) {
-    UI.agent_emit_render(opts, to_string(name), to_string(content))
-    history
-}
-
-# A reply that arrives unprompted (i.e. main wasn't in ask_tool's
-# selective receive) means an agent finished a `tell`'d task. Surface
-# it the same way as an emit, with a subtle "[done]" prefix so the user
-# sees it landed.
-fun on_agent_reply(name, content, history, opts) {
-    UI.agent_reply_render(opts, to_string(name), to_string(content))
-    history
-}
-
-fun on_agent_died(name, reason, history, opts) {
-    rs = to_string(reason)
-    # `stopped` is the normal end-of-fanout teardown — parallel_tool
-    # spawns N agents, gathers replies, then explicitly stops them.
-    # Rendering that as "died (stopped)" reads like a crash. Show it
-    # as completion. `killed` is a deliberate hard-kill — neutral, not
-    # alarming. Any other reason (panic, error) stays loud so a real
-    # anomaly is visible.
-    if (rs == "stopped" || rs == "normal" || rs == "ok") {
-        UI.agent_emit_render(opts, to_string(name), UI.green() ++ "✓ done" ++ UI.reset())
-    } else { if (rs == "killed") {
-        UI.agent_emit_render(opts, to_string(name), UI.grey_text() ++ "■ killed" ++ UI.reset())
-    } else {
-        UI.agent_emit_render(opts, to_string(name), UI.err_color() ++ "died" ++ UI.reset() ++ " (" ++ rs ++ ")")
-    }}
-    UI.agent_block_leave(opts)
-    history
-}
 
 # Handle a user_input message: run the turn, return the new history.
 fun handle_user_input_msg(line, history, opts) {
     Log.user_input(line)
-    # A new user turn — close any subagent block left open from before.
-    UI.agent_block_leave(opts)
     # Close the input box with the bottom border + footer, then run the turn.
     UI.input_box_bottom_full(to_string(map_get(opts, 'model')), display_tokens(history, opts), context_budget_tokens())
     post_input_history = route_input(line, history, opts)
@@ -845,10 +778,6 @@ fun slash_dispatch(cmd, history, opts) {
         }
         history
     }
-    else { if (cmd == "/agents") {
-        print(Agents.list_tool(map_new(), opts))
-        history
-    }
     else { if (cmd == "/mcp") {
         print(Mcp.list_servers(map_get(opts, 'mcp_table')))
         history
@@ -856,7 +785,7 @@ fun slash_dispatch(cmd, history, opts) {
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -1413,23 +1342,23 @@ fun resolve_path_key(args_map) {
     if (rp != nil) { rp } else { map_get(args_map, 'file_path') }
 }
 
-# Dispatch a tool call. Three families:
-#   - 'task'                                 → in-module synchronous subagent (legacy)
-#   - 'spawn_agent' / 'ask' / 'tell' /       → studio model (Agents module): long-lived
-#     'list_agents' / 'kill' / 'parallel'      addressable subagents. Run inline — they
-#                                              depend on running in this process for
-#                                              subagent message routing.
-#   - everything else                        → Tools.exec, run in an isolated worker
-#                                              process (see exec_tool_isolated) so a
-#                                              panicking tool can't take down the REPL.
+# Dispatch a tool call. Two families:
+#   - 'task'         → in-process synchronous subagent (Claude-Code style).
+#                      The single agent primitive. Model issues 2-3 task calls
+#                      in one message for parallel work; execute_all runs them
+#                      one at a time (sequential but correct — no orchestrator,
+#                      no message-storm crash). Subagents are ephemeral: they
+#                      run to completion, return the result, gone. Recursive
+#                      task-from-inside-subagent is banned to avoid fork-bombs.
+#   - everything else → Tools.exec, run in an isolated worker process
+#                       (see exec_tool_isolated) so a panicking tool can't
+#                       take down the REPL.
 fun dispatch_tool(name, args, opts) {
-    if (name == 'task')         { handle_task_tool(args, opts) }
-    else { if (name == 'spawn_agent')  { Agents.spawn_tool(args, opts) }
-    else { if (name == 'ask')          { Agents.ask_tool(args, opts) }
-    else { if (name == 'tell')         { Agents.tell_tool(args, opts) }
-    else { if (name == 'list_agents')  { Agents.list_tool(args, opts) }
-    else { if (name == 'kill')         { Agents.kill_tool(args, opts) }
-    else { if (name == 'parallel')     { Agents.parallel_tool(args, opts) }
+    if (name == 'task') {
+        if (map_get(opts, 'is_subagent') == 'true') {
+            "error: nested `task` is not allowed — a subagent can't spawn its own subagent"
+        } else { handle_task_tool(args, opts) }
+    }
     else {
         # Browser tools hold a persistent CDP/WebSocket connection in
         # browser_table; a throwaway worker process would orphan it, so
@@ -1439,7 +1368,7 @@ fun dispatch_tool(name, args, opts) {
         } else {
             exec_tool_isolated(name, args, opts)
         }
-    }}}}}}}
+    }
 }
 
 # ------------------------------------------------------------
@@ -1512,7 +1441,10 @@ fun handle_task_tool(args, opts) {
     } else {
         sub_sys = subagent_system_prompt(stype)
         sub_history = [{'system', sub_sys}, {'user', prompt}]
-        result = run_subagent_loop(sub_history, opts, 0)
+        # Mark the subagent's opts so dispatch_tool refuses any nested
+        # `task` call from inside this subagent — no fork-bombs.
+        sub_opts = map_put(opts, 'is_subagent', 'true')
+        result = run_subagent_loop(sub_history, sub_opts, 0)
         "[subagent:" ++ stype ++ "]\n" ++ result
     }
 }

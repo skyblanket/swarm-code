@@ -40,7 +40,6 @@ import Heartbeat
 import Background
 import Telemetry
 import Log
-import Agents
 import Mcp
 
 fun main() {
@@ -105,7 +104,6 @@ fun main() {
     todos_table = ets_new()
     perms_table = ets_new()
     llm_stats_table = ets_new()
-    swarm_registry = Agents.init()
     browser_table = ets_new()
     # Tracks "which subagent is currently streaming" so chunks from the
     # same agent merge inline and prefix lines only print on agent
@@ -145,7 +143,6 @@ fun main() {
     opts3b = map_put(opts3a, 'heartbeat_table', heartbeat_table)
     opts3c_stats = map_put(opts3b, 'llm_stats_table', llm_stats_table)
     opts3c = map_put(opts3c_stats, 'bg_table', bg_table)
-    opts3c = map_put(opts3c, 'swarm_registry', swarm_registry)
     opts3c = map_put(opts3c, 'browser_table', browser_table)
     opts3c = map_put(opts3c, 'stream_state_table', stream_state)
     opts3c = map_put(opts3c, 'mcp_table', mcp_table)
