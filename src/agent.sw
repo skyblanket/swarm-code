@@ -368,13 +368,16 @@ fun on_agent_died(name, reason, history, opts) {
     # `stopped` is the normal end-of-fanout teardown — parallel_tool
     # spawns N agents, gathers replies, then explicitly stops them.
     # Rendering that as "died (stopped)" reads like a crash. Show it
-    # as completion. Any other reason (panic, killed, error) stays
-    # loud so a real anomaly is visible.
+    # as completion. `killed` is a deliberate hard-kill — neutral, not
+    # alarming. Any other reason (panic, error) stays loud so a real
+    # anomaly is visible.
     if (rs == "stopped" || rs == "normal" || rs == "ok") {
         UI.agent_emit_render(to_string(name), UI.green() ++ "✓ done" ++ UI.reset())
+    } else { if (rs == "killed") {
+        UI.agent_emit_render(to_string(name), UI.grey_text() ++ "■ killed" ++ UI.reset())
     } else {
         UI.agent_emit_render(to_string(name), "\e[31mdied\e[0m (" ++ rs ++ ")")
-    }
+    }}
     history
 }
 

@@ -509,15 +509,16 @@ fun kill_tool(args, opts) {
         else {
             pid = map_get(entry, 'pid')
             if (hard == 'true' || hard == "true") {
-                # sw runtime doesn't expose process exit/2 from
-                # userland, so "hard" today is best-effort: send stop
-                # AND clear the registry entry so the agent name frees
-                # up immediately even if the process is mid-turn. The
-                # process will exit on its next receive. Real preempt
-                # needs a runtime builtin (planned).
-                if (pid != nil) { send(pid, {'stop'}) }
+                # Real preemption via exit_proc (swarmrt builtin since
+                # 2026-05-20) — terminates the process outright instead
+                # of waiting for it to reach its next receive. The
+                # killed process can't run its own {'stop'} handler, so
+                # we free the registry slot and tell main here in its
+                # place (graceful kill relies on that handler instead).
+                if (pid != nil) { exit_proc(pid, 'killed') }
                 ets_delete(reg, name)
-                "ok: hard-stop sent to '" ++ name ++ "' (registry cleared; process will exit on next receive)"
+                notify_main({'agent_died', name, "killed"})
+                "ok: hard-killed '" ++ name ++ "' (process terminated, slot freed)"
             } else {
                 if (pid != nil) { send(pid, {'stop'}) }
                 "ok: stop signal sent to '" ++ name ++ "' (will finish current turn first)"

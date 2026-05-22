@@ -160,11 +160,52 @@ fun navigate(session, url) {
     if (result == nil) { "error: navigate failed" }
     else { if (string_starts_with(to_string(result), "error:") == 'true') { result }
     else {
-        # Best-effort wait for network idle. We sleep a bit; a proper
-        # implementation would consume Page.loadEventFired events.
-        sleep(800)
-        "ok"
+        # Wait for the real Page.loadEventFired event rather than a blind
+        # sleep — fast pages proceed immediately, slow ones aren't raced.
+        # The Page domain was enabled in init() so the event fires.
+        # Page.navigate's own response lands before load, so the event
+        # is still in flight here, not already dropped by cdp_call.
+        ws = ets_get(session, 'ws')
+        waited = wait_for_event(ws, "Page.loadEventFired", nav_load_timeout_ms())
+        # Brief settle for post-load script / first paint regardless.
+        sleep(150)
+        if (waited == 'ok') {
+            "ok"
+        } else {
+            "ok (proceeded after " ++ to_string(nav_load_timeout_ms() / 1000) ++
+            "s — load event not seen; page may still be loading)"
+        }
     }}
+}
+
+# How long navigate waits for Page.loadEventFired before giving up.
+# A page that never fires load (long-poll apps, a hung sub-resource)
+# must not be able to wedge the agent.
+fun nav_load_timeout_ms() { 10000 }
+
+# Drain CDP frames off the WS until one carries method == `method`, or
+# the deadline passes. CDP events have no `id`, so cdp_call's response
+# waiter drops them — navigation waits on the event channel directly.
+fun wait_for_event(ws, method, timeout_ms) {
+    wait_for_event_loop(ws, method, timestamp() + timeout_ms)
+}
+
+fun wait_for_event_loop(ws, method, deadline) {
+    now = timestamp()
+    if (now >= deadline) { 'timeout' }
+    else {
+        remaining = deadline - now
+        slice = if (remaining > 2000) { 2000 } else { remaining }
+        raw = wsc_recv(ws, slice)
+        if (raw == nil) {
+            wait_for_event_loop(ws, method, deadline)
+        } else {
+            decoded = json_decode(raw)
+            m = if (decoded == nil) { nil } else { map_get(decoded, 'method') }
+            if (m == method) { 'ok' }
+            else { wait_for_event_loop(ws, method, deadline) }
+        }
+    }
 }
 
 # ------------------------------------------------------------
