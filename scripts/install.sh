@@ -66,12 +66,11 @@ detect_platform() {
         # for users who somehow run this from a native Windows shell.
         MINGW*|MSYS*|CYGWIN*)
             cat <<EOF
-${RED}Native Windows is not supported yet.${RESET}
+${RED}Native Windows is not supported.${RESET}
 
-swarmrt (the runtime swarm-code is built on) still relies on POSIX APIs
-that aren't ported to Windows. Use WSL2 instead:
+Like Claude Code, swarm-code's Windows path is WSL2:
 
-  ${BOLD}wsl --install${RESET}      # in PowerShell, then reboot
+  ${BOLD}wsl --install${RESET}      # in admin PowerShell, then reboot
   ${BOLD}wsl${RESET}                 # drop into Ubuntu
   curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | sh
 EOF

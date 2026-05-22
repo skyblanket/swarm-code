@@ -22,22 +22,36 @@ edit `endpoint` + `model` in `settings.json`.
 
 ### Supported platforms
 
+Same story as Claude Code: **macOS, Linux, and WSL2 are first-class.
+Native Windows is not supported** — there's no `swarm.exe`, no plan
+for one. Windows users run swarm-code inside WSL2.
+
 | Platform | Binary | Notes |
 |----------|--------|-------|
 | macOS Apple Silicon | `swarm-darwin-arm64` | |
-| Linux x86_64 | `swarm-linux-x86_64` | also covers WSL2 |
+| Linux x86_64 | `swarm-linux-x86_64` | covers WSL2 too |
 | Linux ARM64 | `swarm-linux-arm64` | |
 | macOS Intel | — | build from source (see below) |
-| Windows | — | use WSL2, run the install above |
+| Windows | — | install WSL2, then run the installer |
 
-### Windows (WSL2)
+### Windows users — set up WSL2 first
+
+In an admin PowerShell:
 
 ```powershell
-wsl --install      # one-time, in PowerShell as admin
+wsl --install      # one-time, ~2 min, may reboot
 ```
 
-Reboot if Windows asks. Open Ubuntu from the Start menu, then run the same
-`curl … | sh` command above.
+Then open Ubuntu from the Start menu and run the standard installer
+inside that Ubuntu session:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/skyblanket/swarm-code/main/scripts/install.sh | sh
+swarm
+```
+
+Your Windows drives are reachable from inside WSL at `/mnt/c`, `/mnt/d`,
+etc., so swarm can edit files anywhere on the machine.
 
 ## Build from source
 

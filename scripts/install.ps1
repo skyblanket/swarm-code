@@ -2,15 +2,15 @@
 #
 # Usage:   irm https://raw.githubusercontent.com/skyblanket/swarm-code/main/scripts/install.ps1 | iex
 #
-# swarmrt (the runtime swarm-code is built on) doesn't have a native
-# Windows port yet — it relies on POSIX APIs that don't map cleanly to
-# Win32. WSL2 runs the Linux binary natively and is the supported path.
+# Same shape as Claude Code's Windows story: native Windows isn't a
+# supported platform. swarm-code runs on macOS, Linux, and WSL2 — the
+# Windows path is "install WSL2, then run the regular installer."
 
 Write-Host ""
 Write-Host "swarm-code on Windows" -ForegroundColor Cyan
 Write-Host "─────────────────────"
 Write-Host ""
-Write-Host "Native Windows isn't supported yet. The fastest path is WSL2:" -ForegroundColor Yellow
+Write-Host "Native Windows isn't supported. WSL2 is the Windows path:" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  1. Install WSL2 (one-time, ~2 min):" -ForegroundColor White
 Write-Host "     wsl --install" -ForegroundColor Gray
