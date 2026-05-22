@@ -2,8 +2,6 @@ module LLM
 
 import Log
 import ToolSchemas
-import Markdown
-import UI
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -94,7 +92,13 @@ fun build_request_body(messages, opts) {
 fun native_req(base) {
     a = map_put(base, 'tools', ToolSchemas.all_schemas())
     b = map_put(a, 'tool_choice', "auto")
-    map_put(b, 'stream', 'false')
+    # Native used to be non-streaming (stream:false). It now streams:
+    # http_post_stream parses delta.tool_calls out of the SSE feed and
+    # reassembles them per-index, so the user sees tokens live instead
+    # of staring at a spinner for the whole turn. include_usage gives
+    # us real prompt_tokens on the terminal SSE chunk.
+    c = map_put(b, 'stream', 'true')
+    map_put(c, 'stream_options', %{include_usage: 'true'})
 }
 
 fun inband_req(base) {
@@ -392,18 +396,21 @@ fun chat_native_retry(messages, opts, attempt) {
 }
 
 # ============================================================
-# Native function-calling path
+# Native function-calling path — streaming
 # ============================================================
 #
-# Sends a non-streaming request with `tools` + `tool_choice:"auto"`,
-# parses `message.tool_calls[]` from the JSON response, and transcodes
-# them back into swarm-code's internal `call:NAME{JSON}` string format
-# so agent.sw's extract_tool_calls() works unchanged.
+# Sends a STREAMING request with `tools` + `tool_choice:"auto"`. The
+# swarmrt http_post_stream builtin prints content + reasoning to the
+# terminal as tokens arrive (with a TTFT spinner), and reassembles the
+# fragmented `delta.tool_calls` SSE frames — keyed by `index`, exactly
+# like TCP segment reassembly — into a `tool_calls` array on the
+# returned synthetic OpenAI response. We read that array and transcode
+# it back into swarm-code's internal `call:NAME{JSON}` text so
+# agent.sw's extract_tool_calls() keeps working unchanged.
 #
-# UX cost: no typewriter streaming. User sees a dim "⋯ thinking" line
-# until the full response arrives, then prose + reasoning render at
-# once. Tradeoff accepted for v1 — streaming native requires patching
-# SSE tool_calls accumulation in swarmrt's C stream builtin.
+# Native prose now streams raw, like the inband path — no markdown
+# render. Streaming and deferred markdown are mutually exclusive; live
+# feedback beats a tidy-but-late page.
 fun chat_native(messages, opts) {
     endpoint = map_get(opts, 'endpoint')
     api_key = map_get(opts, 'api_key')
@@ -420,35 +427,20 @@ fun chat_native(messages, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    # Pessimistic default: assume failure. Cleared on success below,
-    # overridden to "interrupted" on a user ESC. chat_native_retry
-    # reads this to decide whether a nil result is worth retrying.
+    # Pessimistic default: assume failure. Cleared on success below.
+    # chat_native_retry reads this to decide whether a nil is retryable.
+    # An ESC interrupt is NOT nil here — http_post_stream returns the
+    # partial response with an "[Request interrupted by user]" marker
+    # in content, so the turn ends cleanly without triggering a retry.
     record_fail(opts, "fail")
 
-    # Run http_post in a worker so the main process can tick an
-    # elapsed-seconds display while waiting. Without this the user
-    # sees a static "⋯ thinking" line and has no signal whether the
-    # call is alive — leading to the "forever" feeling on big
-    # contexts (Kimi K2.6 thinking + tools can legitimately take
-    # 30–90s; curl's hard ceiling is 5min). Worker sends the result
-    # back as {'http_resp', r}.
-    print_inline("  \e[38;5;240m⋯ thinking 0s (" ++ to_string(model) ++ ")...\e[0m")
-    spawn(http_post_worker(self(), url, hdrs, body))
-    resp = wait_with_progress(0, to_string(model))
+    # http_post_stream handles the TTFT spinner + live token display
+    # C-side, and folds delta.tool_calls into the response it returns.
+    resp = http_post_stream(url, hdrs, body)
     latency = timestamp() - start_ms
 
-    # Clear the in-place progress line so subsequent output is clean.
-    print_inline("\r\e[K")
-
     if (resp == nil) {
-        Log.llm_error("http_post returned nil (native)", "")
-        nil
-    } else { if (resp == "__INTERRUPTED__") {
-        # User hit ESC / Ctrl-C during the call. http_post already
-        # printed an "⏸ interrupted by user" line. Return nil so the
-        # agent loop just resets to the prompt without adding to history.
-        record_fail(opts, "interrupted")
-        Log.llm_error("interrupted by user", "")
+        Log.llm_error("http_post_stream returned nil (native)", "")
         nil
     } else {
         decoded = json_decode(resp)
@@ -469,7 +461,7 @@ fun chat_native(messages, opts) {
                 record_reasoning(opts, reason_text)
 
                 choices = map_get(decoded, 'choices')
-                if (length(choices) == 0) {
+                if (choices == nil || length(choices) == 0) {
                     Log.llm_error("no choices (native)", resp)
                     nil
                 } else {
@@ -479,35 +471,20 @@ fun chat_native(messages, opts) {
                     msg_obj = map_get(choice0, 'message')
                     raw_content = map_get(msg_obj, 'content')
                     tool_calls_list = map_get(msg_obj, 'tool_calls')
-
-                    # Show reasoning (if any) then visible prose. Dim
-                    # italic, no emoji prefix — keep the channel quiet.
-                    if (reason_text != nil) {
-                        print("  \e[38;5;240m\e[3m" ++ to_string(reason_text) ++ "\e[0m")
-                        print("")
-                    }
                     prose = if (raw_content == nil) { "" } else { to_string(raw_content) }
-                    if (string_length(string_trim(prose)) > 0) {
-                        # Run prose through markdown renderer: headers
-                        # become bold, **bold** / `code` get ANSI
-                        # styling, lines soft-wrap at word boundaries.
-                        # Without this, the model's `### Header` and
-                        # `**bold**` show literal markers and the
-                        # terminal hard-wraps mid-word.
-                        print(Markdown.render(prose, UI.term_width()))
-                        print("")
-                    }
 
+                    # content + reasoning already streamed to the
+                    # terminal C-side — do NOT reprint them here.
                     tc_count = if (tool_calls_list == nil) { 0 } else { length(tool_calls_list) }
                     had_tools = if (tc_count > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
 
-                    # Transcode → in-band string. Zero agent.sw changes.
+                    # Transcode tool_calls → in-band string. Zero agent.sw changes.
                     transcode_native_calls(tool_calls_list, prose)
                 }
             }
         }
-    }}
+    }
 }
 
 fun transcode_native_calls(tool_calls, prose) {
@@ -529,38 +506,6 @@ fun transcode_loop(tool_calls, acc) {
         line = "\ncall:" ++ to_string(name) ++ to_string(args_str)
         transcode_loop(tl(tool_calls), acc ++ line)
     }
-}
-
-# ------------------------------------------------------------
-# Live progress while the model thinks
-# ------------------------------------------------------------
-# http_post is a synchronous blocking call (up to curl's --max-time
-# 300s ceiling). Without a progress indicator the user has no signal
-# whether the call is alive or wedged. We sidestep that by running
-# the request in a worker process and using `receive ... after 1000`
-# in the parent to tick the displayed elapsed-seconds every second.
-# The user can still ESC to interrupt — the interrupted flag is
-# checked C-side regardless of which sw process issued http_post.
-fun http_post_worker(parent, url, hdrs, body) {
-    r = http_post(url, hdrs, body)
-    send(parent, {'http_resp', r})
-    'ok'
-}
-
-fun wait_with_progress(elapsed, model) {
-    receive {
-        {'http_resp', r} -> r
-        after 1000 { tick_progress(elapsed, model) }
-    }
-}
-
-# The receive parser's after-body accepts a single expression, not a
-# statement block — so the per-tick work lives in its own function.
-fun tick_progress(elapsed, model) {
-    new_e = elapsed + 1
-    print_inline("\r\e[K  \e[38;5;240m⋯ thinking " ++
-                 to_string(new_e) ++ "s (" ++ model ++ ")...\e[0m")
-    wait_with_progress(new_e, model)
 }
 
 # 3 retries = 4 total attempts. Spans a ~7s transient outage.
