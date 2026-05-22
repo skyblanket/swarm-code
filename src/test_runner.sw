@@ -51,7 +51,8 @@ fun main() {
         t_glob(),
         t_grep(),
         t_registry_list_names(),
-        t_mcp_unconfigured()
+        t_mcp_unconfigured(),
+        t_remember_body()
     ]
 
     passed = sum_list(results, 0)
@@ -290,4 +291,21 @@ fun t_mcp_unconfigured() {
         if (length(schemas) == 0) { 'true' } else { 'false' },
         if (section == "") { 'true' } else { 'false' })
     check("mcp: unconfigured -> no schemas, no prompt section", ok)
+}
+
+# remember saved frontmatter but an empty body: the schema named the
+# content field `body` while do_remember read `content`, so the
+# mismatch silently dropped every memory's content. Guard: a remember
+# call must persist the body to the .md file.
+fun t_remember_body() {
+    marker = "REMEMBER-BODY-GUARD-77"
+    Tools.exec('remember', %{name: "zz remember probe",
+                             description: "regression guard",
+                             type: "reference",
+                             body: marker}, %{})
+    path = getenv("HOME") ++ "/.swarm-code/memory/zz_remember_probe.md"
+    saved = file_read(path)
+    ok = if (saved == nil) { 'false' } else { string_contains(saved, marker) }
+    file_delete(path)
+    check("remember persists the body to the .md file", ok)
 }

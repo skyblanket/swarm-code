@@ -660,7 +660,11 @@ fun do_remember(args, opts) {
     name = map_get(args, 'name')
     desc = map_get(args, 'description')
     type_ = map_get(args, 'type')
+    # Canonical key is `content`; also accept `body` — an earlier schema
+    # named it that, and the mismatch silently saved empty memories
+    # (frontmatter only, no body).
     content = map_get(args, 'content')
+    body_alt = map_get(args, 'body')
     if (name == nil) {
         # Back-compat: accept the old {key, value} shape too.
         old_key = map_get(args, 'key')
@@ -676,7 +680,8 @@ fun do_remember(args, opts) {
     } else {
         d = if (desc == nil) { "(no description)" } else { to_string(desc) }
         t = if (type_ == nil) { "user" } else { to_string(type_) }
-        c = if (content == nil) { "" } else { to_string(content) }
+        c = if (content != nil) { to_string(content) }
+            else { if (body_alt != nil) { to_string(body_alt) } else { "" } }
         Memory.save(to_string(name), d, t, c)
     }
 }

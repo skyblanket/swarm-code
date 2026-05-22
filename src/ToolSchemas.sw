@@ -188,8 +188,8 @@ fun remember_s() {
             name: s("Short human name (becomes slug)"),
             description: s("One-line purpose for future recall"),
             type: s("'user' | 'feedback' | 'project' | 'reference'"),
-            body: s("Markdown content of the memory")
-        }, ["name", "description", "type", "body"]))
+            content: s("Markdown content of the memory — the actual fact to store")
+        }, ["name", "description", "type", "content"]))
 }
 
 fun recall_s() {
