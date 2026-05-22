@@ -638,10 +638,10 @@ fun cognitive_pulse(tick_count, history, opts) {
 fun on_bg_done(task_id, exit_code, label, history, opts) {
     Log.bg_done(task_id, exit_code, label)
     color = if (exit_code == 0) { UI.brand_color() } else { "\e[31m" }
-    print("")
-    print(color ++ "⏺" ++ UI.reset() ++ " \e[1mbg_done\e[0m " ++ task_id ++
+    print_above("")
+    print_above(color ++ "⏺" ++ UI.reset() ++ " \e[1mbg_done\e[0m " ++ task_id ++
           "  \e[2mexit " ++ to_string(exit_code) ++ " · " ++ label ++ "\e[0m")
-    print("")
+    print_above("")
 
     # If autonomy is enabled AND we're not already inside a wake-up chain,
     # inject the event as a synthetic user message and invoke the LLM so

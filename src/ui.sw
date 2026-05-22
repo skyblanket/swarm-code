@@ -240,10 +240,11 @@ fun answer_box(text) {
 # Reader calls input_box_top() then read_line(input_prompt()); after
 # submit, agent.handle_user_input_msg calls input_box_bottom(model, tokens).
 # ------------------------------------------------------------
+# Spacer line above the input prompt. The bordered box was dropped —
+# the input is a single ❯ line now, so print_above() can keep it
+# pinned to the bottom while async output streams in above it.
 fun input_box_top() {
-    w = term_width()
     print("")
-    print(grey_border() ++ "╭" ++ repeat_char("─", w - 2) ++ "╮" ++ reset())
 }
 
 fun input_box_bottom(model_name, token_count) {
@@ -251,8 +252,6 @@ fun input_box_bottom(model_name, token_count) {
 }
 
 fun input_box_bottom_full(model_name, token_count, budget) {
-    w = term_width()
-    print(grey_border() ++ "╰" ++ repeat_char("─", w - 2) ++ "╯" ++ reset())
     token_str = if (budget > 0) {
         format_tokens_short(token_count) ++ " / " ++ format_tokens_short(budget)
     } else {
@@ -606,8 +605,8 @@ fun agent_block_enter(opts, name) {
             role = agent_role(opts, name)
             role_str = if (string_length(role) == 0) { "" }
                        else { "  " ++ grey_text() ++ "· " ++ role ++ reset() }
-            print("")
-            print("  " ++ agent_color(name) ++ "▌ \e[1m" ++ name ++ "\e[0m" ++
+            print_above("")
+            print_above("  " ++ agent_color(name) ++ "▌ \e[1m" ++ name ++ "\e[0m" ++
                   reset() ++ role_str)
             ets_put(tbl, 'block', name)
             ets_put(tbl, 'sline', nil)
@@ -630,7 +629,7 @@ fun agent_tool_header(opts, name, tool, args_preview) {
     agent_block_enter(opts, name)
     agent_sline_close(map_get(opts, 'stream_state_table'))
     cap_name = capitalize_first(to_string(tool))
-    print(agent_gutter(name) ++ brand_color() ++ "⏺" ++ reset() ++
+    print_above(agent_gutter(name) ++ brand_color() ++ "⏺" ++ reset() ++
           " \e[1m" ++ cap_name ++ "\e[0m  " ++ grey_text() ++
           to_string(args_preview) ++ reset())
 }
@@ -639,7 +638,7 @@ fun agent_tool_header(opts, name, tool, args_preview) {
 fun agent_emit_render(opts, name, content) {
     agent_block_enter(opts, name)
     agent_sline_close(map_get(opts, 'stream_state_table'))
-    print(agent_gutter(name) ++ to_string(content))
+    print_above(agent_gutter(name) ++ to_string(content))
 }
 
 # Final reply from an agent (resolves an `ask`). Renders with an
@@ -647,7 +646,7 @@ fun agent_emit_render(opts, name, content) {
 fun agent_reply_render(opts, name, content) {
     agent_block_enter(opts, name)
     agent_sline_close(map_get(opts, 'stream_state_table'))
-    print(agent_gutter(name) ++ brand_color() ++ "⎿" ++ reset() ++ " " ++
+    print_above(agent_gutter(name) ++ brand_color() ++ "⎿" ++ reset() ++ " " ++
           to_string(content))
     agent_block_leave(opts)
 }
