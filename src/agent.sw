@@ -308,13 +308,13 @@ fun main_loop(history, opts) {
         {'agent_died', name, reason} ->
             on_agent_died(name, reason, history, opts)
         {'stream_chunk', name, content} ->
-            UI.stream_chunk_render(to_string(name), to_string(content), opts)
+            UI.stream_chunk_render(opts, to_string(name), to_string(content))
             history
         {'stream_reason', name, content} ->
-            UI.stream_reason_render(to_string(name), to_string(content), opts)
+            UI.stream_reason_render(opts, to_string(name), to_string(content))
             history
         {'stream_done', name} ->
-            UI.stream_done_render(to_string(name), opts)
+            UI.stream_done_render(opts, to_string(name))
             history
         {'eof'} ->
             handle_eof(history, opts)
@@ -346,12 +346,12 @@ fun main_loop(history, opts) {
 # main's own output.
 
 fun on_agent_spawned(name, history, opts) {
-    UI.agent_emit_render(to_string(name), "spawned")
+    UI.agent_emit_render(opts, to_string(name), "spawned")
     history
 }
 
 fun on_agent_emit(name, content, history, opts) {
-    UI.agent_emit_render(to_string(name), to_string(content))
+    UI.agent_emit_render(opts, to_string(name), to_string(content))
     history
 }
 
@@ -360,7 +360,7 @@ fun on_agent_emit(name, content, history, opts) {
 # it the same way as an emit, with a subtle "[done]" prefix so the user
 # sees it landed.
 fun on_agent_reply(name, content, history, opts) {
-    UI.agent_reply_render(to_string(name), to_string(content))
+    UI.agent_reply_render(opts, to_string(name), to_string(content))
     history
 }
 
@@ -373,18 +373,21 @@ fun on_agent_died(name, reason, history, opts) {
     # alarming. Any other reason (panic, error) stays loud so a real
     # anomaly is visible.
     if (rs == "stopped" || rs == "normal" || rs == "ok") {
-        UI.agent_emit_render(to_string(name), UI.green() ++ "✓ done" ++ UI.reset())
+        UI.agent_emit_render(opts, to_string(name), UI.green() ++ "✓ done" ++ UI.reset())
     } else { if (rs == "killed") {
-        UI.agent_emit_render(to_string(name), UI.grey_text() ++ "■ killed" ++ UI.reset())
+        UI.agent_emit_render(opts, to_string(name), UI.grey_text() ++ "■ killed" ++ UI.reset())
     } else {
-        UI.agent_emit_render(to_string(name), "\e[31mdied\e[0m (" ++ rs ++ ")")
+        UI.agent_emit_render(opts, to_string(name), UI.err_color() ++ "died" ++ UI.reset() ++ " (" ++ rs ++ ")")
     }}
+    UI.agent_block_leave(opts)
     history
 }
 
 # Handle a user_input message: run the turn, return the new history.
 fun handle_user_input_msg(line, history, opts) {
     Log.user_input(line)
+    # A new user turn — close any subagent block left open from before.
+    UI.agent_block_leave(opts)
     # Close the input box with the bottom border + footer, then run the turn.
     UI.input_box_bottom_full(to_string(map_get(opts, 'model')), display_tokens(history, opts), context_budget_tokens())
     post_input_history = route_input(line, history, opts)

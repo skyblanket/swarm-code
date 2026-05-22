@@ -347,7 +347,7 @@ fun exec_subagent_tools(tool_calls, history, opts, name) {
             denied_h = list_append(history, {'user', denied_w})
             exec_subagent_tools(tl(tool_calls), denied_h, opts, name)
         } else {
-            UI.agent_tool_header(name, tname, traw)
+            UI.agent_tool_header(opts, name, tname, traw)
             sub_result = Tools.exec(tname, targs, opts)
             ok_w = "<tool_result>\n" ++ sub_result ++ "\n</tool_result>"
             ok_h = list_append(history, {'user', ok_w})
@@ -431,20 +431,20 @@ fun wait_for_reply_with(name, opts) {
             }
         {'agent_emit', n, content} ->
             if (n == name) {
-                UI.agent_emit_render(n, to_string(content))
+                UI.agent_emit_render(opts, n, to_string(content))
                 wait_for_reply_with(name, opts)
             } else {
                 send(self(), {'agent_emit', n, content})
                 wait_for_reply_with(name, opts)
             }
         {'stream_chunk', n, content} ->
-            UI.stream_chunk_render(to_string(n), to_string(content), opts)
+            UI.stream_chunk_render(opts, to_string(n), to_string(content))
             wait_for_reply_with(name, opts)
         {'stream_reason', n, content} ->
-            UI.stream_reason_render(to_string(n), to_string(content), opts)
+            UI.stream_reason_render(opts, to_string(n), to_string(content))
             wait_for_reply_with(name, opts)
         {'stream_done', n} ->
-            UI.stream_done_render(to_string(n), opts)
+            UI.stream_done_render(opts, to_string(n))
             wait_for_reply_with(name, opts)
         {'agent_died', n, reason} ->
             if (n == name) {
@@ -635,16 +635,16 @@ fun parallel_collect_with(names_remaining, acc, opts) {
                     parallel_collect_with(names_remaining, acc, opts)
                 }
             {'agent_emit', n, content} ->
-                UI.agent_emit_render(n, to_string(content))
+                UI.agent_emit_render(opts, n, to_string(content))
                 parallel_collect_with(names_remaining, acc, opts)
             {'stream_chunk', n, content} ->
-                UI.stream_chunk_render(to_string(n), to_string(content), opts)
+                UI.stream_chunk_render(opts, to_string(n), to_string(content))
                 parallel_collect_with(names_remaining, acc, opts)
             {'stream_reason', n, content} ->
-                UI.stream_reason_render(to_string(n), to_string(content), opts)
+                UI.stream_reason_render(opts, to_string(n), to_string(content))
                 parallel_collect_with(names_remaining, acc, opts)
             {'stream_done', n} ->
-                UI.stream_done_render(to_string(n), opts)
+                UI.stream_done_render(opts, to_string(n))
                 parallel_collect_with(names_remaining, acc, opts)
             {'agent_died', n, reason} ->
                 if (list_contains(names_remaining, n) == 'true') {

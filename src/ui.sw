@@ -35,21 +35,31 @@ export [
     enter_alt_screen, leave_alt_screen,
     term_width,
     todo_list_render, todo_summary,
-    green, grey_text, grey_border,
+    green, grey_text, grey_border, ui_text, warn_color, err_color, accent_color,
     agent_color, agent_tool_header, agent_emit_render,
-    agent_reply_render, agents_table,
+    agent_reply_render, agent_block_leave, agents_table,
     stream_chunk_render, stream_reason_render, stream_done_render
 ]
 
 # ------------------------------------------------------------
-# Brand colors — deep red (Otonomy)
+# Palette — Otonomy deep-red brand + OpenCode-derived neutrals and
+# semantic colors (truecolor). The red is the brand identity;
+# everything around it is tuned to OpenCode's calm dark theme.
 # ------------------------------------------------------------
-fun brand_color() { "\e[38;5;124m" }   # 0xaf0000 — deep red
-fun brand_dark()  { "\e[38;5;88m"  }   # 0x870000 — darker red
-fun brand_dim()   { "\e[38;5;52m"  }   # 0x5f0000 — very dark red (borders)
-fun grey_border() { "\e[38;5;240m" }
-fun grey_text()   { "\e[38;5;244m" }
-fun teal_info()   { "\e[38;5;80m"  }
+fun brand_color() { "\e[38;2;175;0;0m" }     # #af0000 — deep red (brand/primary)
+fun brand_dark()  { "\e[38;2;135;0;0m" }     # #870000 — darker red
+fun brand_dim()   { "\e[38;2;95;0;0m"  }     # #5f0000 — very dark red
+
+# OpenCode dark-theme neutrals (step scale).
+fun grey_border() { "\e[38;2;72;72;72m"    } # #484848 — borders
+fun grey_text()   { "\e[38;2;128;128;128m" } # #808080 — muted / secondary text
+fun ui_text()     { "\e[38;2;238;238;238m" } # #eeeeee — primary text
+
+# OpenCode semantic colors.
+fun teal_info()   { "\e[38;2;86;182;194m"  } # #56b6c2 — info / cyan
+fun warn_color()  { "\e[38;2;245;167;66m"  } # #f5a742 — warning / orange
+fun err_color()   { "\e[38;2;224;108;117m" } # #e06c75 — error / red
+fun accent_color(){ "\e[38;2;157;124;216m" } # #9d7cd8 — accent / purple
 fun reset()       { "\e[0m" }
 
 # ------------------------------------------------------------
@@ -365,7 +375,7 @@ fun leave_alt_screen() {
 # In-progress items get bold.
 # Pending items are normal.
 
-fun green()      { "\e[38;5;78m" }
+fun green()      { "\e[38;2;127;216;143m" }   # #7fd88f — success (OpenCode)
 fun strikethrough() { "\e[9m" }
 fun dim()        { "\e[2m" }
 fun bold()       { "\e[1m" }
@@ -526,123 +536,160 @@ fun char_ord(ch) {
 }
 
 fun pick_palette(i) {
-    if (i == 0) { "\e[38;5;39m"  }   # bright blue
-    else { if (i == 1) { "\e[38;5;208m" }   # orange
-    else { if (i == 2) { "\e[38;5;141m" }   # purple
-    else { if (i == 3) { "\e[38;5;43m"  }   # teal
-    else { if (i == 4) { "\e[38;5;220m" }   # gold
-    else { if (i == 5) { "\e[38;5;205m" }   # pink
-    else { if (i == 6) { "\e[38;5;82m"  }   # green
-    else { "\e[38;5;33m"  }}}}}}}            # cyan
+    if (i == 0) { "\e[38;2;92;156;245m"  }          # blue    #5c9cf5
+    else { if (i == 1) { "\e[38;2;245;167;66m"  }   # orange  #f5a742
+    else { if (i == 2) { "\e[38;2;157;124;216m" }   # purple  #9d7cd8
+    else { if (i == 3) { "\e[38;2;86;182;194m"  }   # cyan    #56b6c2
+    else { if (i == 4) { "\e[38;2;229;192;123m" }   # yellow  #e5c07b
+    else { if (i == 5) { "\e[38;2;224;108;117m" }   # red     #e06c75
+    else { if (i == 6) { "\e[38;2;127;216;143m" }   # green   #7fd88f
+    else { "\e[38;2;255;192;159m"  }}}}}}}          # peach   #ffc09f
 }
 
 fun agent_prefix(name) {
     agent_color(name) ++ "[" ++ name ++ "]" ++ reset()
 }
 
-# Tool header for a subagent's call. Same shape as tool_header but
-# with the agent's name in its color before the bullet.
-fun agent_tool_header(name, tool, args_preview) {
-    cap_name = capitalize_first(to_string(tool))
-    print("")
-    print("  " ++ agent_prefix(name) ++ " " ++ brand_color() ++ "⏺" ++ reset() ++
-          " \e[1m" ++ cap_name ++ "\e[0m(" ++ to_string(args_preview) ++ ")")
+# ============================================================
+# Grouped agent blocks
+# ============================================================
+# A subagent's activity renders as a block: a header line
+# (▌ name · role) printed once, then every following line carried on
+# a colored ▌ gutter in the agent's hue. The block stays open while
+# the same agent keeps producing output; a different agent — or the
+# agent's final reply — closes it. State lives in the stream_state
+# ETS table, threaded through opts:
+#   'block' → name of the agent whose block is open (or nil)
+#   'sline' → 'prose' | 'reason' | nil — a streaming line is mid-flight
+# ------------------------------------------------------------
+
+# Role string for an agent, read from the registry handle in opts.
+# Empty when unknown — no hard dependency on the Agents module.
+fun agent_role(opts, name) {
+    reg = map_get(opts, 'swarm_registry')
+    if (reg == nil) { "" }
+    else {
+        e = ets_get(reg, name)
+        if (e == nil) { "" }
+        else {
+            r = map_get(e, 'role')
+            if (r == nil) { "" } else { to_string(r) }
+        }
+    }
 }
 
-# Async push from a subagent — appears inline with a continuation gutter.
-fun agent_emit_render(name, content) {
-    print("")
-    print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
+# Colored gutter prefix for a body line inside an agent's block.
+fun agent_gutter(name) {
+    "  " ++ agent_color(name) ++ "▌" ++ reset() ++ " "
+}
+
+# Close a mid-stream gutter line, if one is open.
+fun agent_sline_close(tbl) {
+    if (tbl != nil) {
+        if (ets_get(tbl, 'sline') != nil) {
+            print(reset())
+            ets_put(tbl, 'sline', nil)
+        }
+    }
+}
+
+# Ensure `name`'s block is the open one. If a different agent's block
+# (or none) is current, close it and print this agent's header.
+fun agent_block_enter(opts, name) {
+    tbl = map_get(opts, 'stream_state_table')
+    if (tbl == nil) { 'ok' }
+    else {
+        if (ets_get(tbl, 'block') == name) { 'ok' }
+        else {
+            agent_sline_close(tbl)
+            role = agent_role(opts, name)
+            role_str = if (string_length(role) == 0) { "" }
+                       else { "  " ++ grey_text() ++ "· " ++ role ++ reset() }
+            print("")
+            print("  " ++ agent_color(name) ++ "▌ \e[1m" ++ name ++ "\e[0m" ++
+                  reset() ++ role_str)
+            ets_put(tbl, 'block', name)
+            ets_put(tbl, 'sline', nil)
+        }
+    }
+}
+
+# Close the open agent block, if any — called when the main agent
+# takes over (a new user turn) or an agent's run ends.
+fun agent_block_leave(opts) {
+    tbl = map_get(opts, 'stream_state_table')
+    if (tbl != nil) {
+        agent_sline_close(tbl)
+        if (ets_get(tbl, 'block') != nil) { ets_put(tbl, 'block', nil) }
+    }
+}
+
+# A subagent's tool call — rendered on its block gutter.
+fun agent_tool_header(opts, name, tool, args_preview) {
+    agent_block_enter(opts, name)
+    agent_sline_close(map_get(opts, 'stream_state_table'))
+    cap_name = capitalize_first(to_string(tool))
+    print(agent_gutter(name) ++ brand_color() ++ "⏺" ++ reset() ++
+          " \e[1m" ++ cap_name ++ "\e[0m  " ++ grey_text() ++
+          to_string(args_preview) ++ reset())
+}
+
+# An async push from a subagent (status notices, mid-task discovery).
+fun agent_emit_render(opts, name, content) {
+    agent_block_enter(opts, name)
+    agent_sline_close(map_get(opts, 'stream_state_table'))
+    print(agent_gutter(name) ++ to_string(content))
+}
+
+# Final reply from an agent (resolves an `ask`). Renders with an
+# elbow on the gutter, then closes the block.
+fun agent_reply_render(opts, name, content) {
+    agent_block_enter(opts, name)
+    agent_sline_close(map_get(opts, 'stream_state_table'))
+    print(agent_gutter(name) ++ brand_color() ++ "⎿" ++ reset() ++ " " ++
+          to_string(content))
+    agent_block_leave(opts)
 }
 
 # ------------------------------------------------------------
 # Streaming render — {'stream_chunk'} (prose) and {'stream_reason'}
-# (thinking) chunks from a subagent.
-#
-# Chunks arrive token-by-token. The stream_state ETS table holds
-# {name, channel} for whatever is mid-stream — channel is 'prose' or
-# 'reason'. A chunk that matches the open stream appends inline (no new
-# prefix); anything else closes the open line and starts a fresh
-# prefixed one. {'stream_done'} closes the line. Without this, every
-# single token would land on its own [agent] line.
+# (thinking) chunks from a subagent. Token-by-token chunks merge onto
+# one gutter line; an agent switch or {'stream_done'} breaks it.
 # ------------------------------------------------------------
-
-# True when `cur` ({name, channel} tuple, or nil) is exactly this
-# agent streaming this channel.
-fun stream_is_current(cur, name, channel) {
-    if (cur == nil) { 'false' }
-    else { if (elem(cur, 0) == name && elem(cur, 1) == channel) { 'true' }
-    else { 'false' }}
-}
-
-# Close whatever stream line is open: emit an ANSI reset + newline and
-# clear the state. No-op when nothing is open.
-fun stream_close_open(tbl) {
-    if (tbl != nil) {
-        cur = ets_get(tbl, 'current')
-        if (cur != nil) {
-            print(reset())
-            ets_put(tbl, 'current', nil)
-        }
-    }
-}
-
-fun stream_chunk_render(name, content, opts) {
+fun stream_chunk_render(opts, name, content) {
+    agent_block_enter(opts, name)
     tbl = map_get(opts, 'stream_state_table')
-    if (tbl == nil) {
-        # No state table: degrade to a prefix on every chunk.
-        print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
-    } else {
-        cur = ets_get(tbl, 'current')
-        if (stream_is_current(cur, name, 'prose') == 'true') {
+    if (tbl == nil) { print_inline(to_string(content)) }
+    else {
+        if (ets_get(tbl, 'sline') == 'prose') {
             print_inline(to_string(content))
         } else {
-            stream_close_open(tbl)
-            print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " ")
-            print_inline(to_string(content))
-            ets_put(tbl, 'current', {name, 'prose'})
+            agent_sline_close(tbl)
+            print_inline(agent_gutter(name) ++ to_string(content))
+            ets_put(tbl, 'sline', 'prose')
         }
     }
 }
 
-# Reasoning chunks render dim + italic. Same inline-merge state machine
-# as prose, so a token-by-token thinking stream flows on one line
-# instead of one [agent] line per word.
-fun stream_reason_render(name, content, opts) {
+# Reasoning chunks render dim + italic on the gutter.
+fun stream_reason_render(opts, name, content) {
+    agent_block_enter(opts, name)
     tbl = map_get(opts, 'stream_state_table')
-    if (tbl == nil) {
-        print_inline("\e[38;5;240m\e[3m" ++ to_string(content) ++ reset())
-    } else {
-        cur = ets_get(tbl, 'current')
-        if (stream_is_current(cur, name, 'reason') == 'true') {
+    if (tbl == nil) { print_inline(to_string(content)) }
+    else {
+        if (ets_get(tbl, 'sline') == 'reason') {
             print_inline(to_string(content))
         } else {
-            stream_close_open(tbl)
-            print_inline("  " ++ agent_prefix(name) ++ " \e[38;5;240m\e[3m")
+            agent_sline_close(tbl)
+            print_inline(agent_gutter(name) ++ grey_text() ++ "\e[3m")
             print_inline(to_string(content))
-            ets_put(tbl, 'current', {name, 'reason'})
+            ets_put(tbl, 'sline', 'reason')
         }
     }
 }
 
-fun stream_done_render(name, opts) {
-    tbl = map_get(opts, 'stream_state_table')
-    if (tbl != nil) {
-        cur = ets_get(tbl, 'current')
-        # Only close the line if THIS agent owns the open stream.
-        if (cur != nil) {
-            if (elem(cur, 0) == name) {
-                print(reset())
-                ets_put(tbl, 'current', nil)
-            }
-        }
-    }
-}
-
-# Final reply from an agent (resolves an `ask`).
-fun agent_reply_render(name, content) {
-    print("")
-    print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "⎿" ++ reset() ++ " " ++ to_string(content))
+fun stream_done_render(opts, name) {
+    agent_sline_close(map_get(opts, 'stream_state_table'))
 }
 
 # Render the registry as a table. `names` is the list to show in order.
