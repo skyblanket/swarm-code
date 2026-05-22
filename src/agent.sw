@@ -1312,12 +1312,15 @@ fun resolve_path_key(args_map) {
     if (rp != nil) { rp } else { map_get(args_map, 'file_path') }
 }
 
-# Dispatch a tool call. Five paths:
+# Dispatch a tool call. Three families:
 #   - 'task'                                 → in-module synchronous subagent (legacy)
-#   - 'spawn_agent' / 'ask' / 'tell' /       → studio model (Agents module):
-#     'list_agents' / 'kill' / 'parallel'      long-lived addressable subagents
-#                                              with own LLM session
-#   - everything else                        → Tools.exec
+#   - 'spawn_agent' / 'ask' / 'tell' /       → studio model (Agents module): long-lived
+#     'list_agents' / 'kill' / 'parallel'      addressable subagents. Run inline — they
+#                                              depend on running in this process for
+#                                              subagent message routing.
+#   - everything else                        → Tools.exec, run in an isolated worker
+#                                              process (see exec_tool_isolated) so a
+#                                              panicking tool can't take down the REPL.
 fun dispatch_tool(name, args, opts) {
     if (name == 'task')         { handle_task_tool(args, opts) }
     else { if (name == 'spawn_agent')  { Agents.spawn_tool(args, opts) }
@@ -1326,7 +1329,64 @@ fun dispatch_tool(name, args, opts) {
     else { if (name == 'list_agents')  { Agents.list_tool(args, opts) }
     else { if (name == 'kill')         { Agents.kill_tool(args, opts) }
     else { if (name == 'parallel')     { Agents.parallel_tool(args, opts) }
-    else { Tools.exec(name, args, opts) }}}}}}}
+    else {
+        # Browser tools hold a persistent CDP/WebSocket connection in
+        # browser_table; a throwaway worker process would orphan it, so
+        # they run inline. Everything else runs isolated.
+        if (string_starts_with(to_string(name), "browser_") == 'true') {
+            Tools.exec(name, args, opts)
+        } else {
+            exec_tool_isolated(name, args, opts)
+        }
+    }}}}}}}
+}
+
+# ------------------------------------------------------------
+# Isolated tool execution
+# ------------------------------------------------------------
+# A tool is plain sw code, and a bug in it — or a builtin it calls on
+# bad data (elem on a non-tuple, hd of [], a divide by zero) — can
+# panic. panic is uncatchable in-process: run inside the main agent
+# process it unwinds all the way out and kills the whole REPL.
+#
+# So Tools.exec tools run in a short-lived linked worker process. If
+# the tool panics, only the worker dies; we trap the {'EXIT', ...}
+# signal and hand the model an error string it can react to — exactly
+# like any other failed tool call — instead of the session crashing.
+fun exec_tool_isolated(name, args, opts) {
+    trap_exit('true')
+    w = spawn(tool_worker(self(), name, args, opts))
+    link(w)
+    collect_tool_result(name, nil)
+}
+
+# Worker process body: run the tool, ship the result home, exit.
+fun tool_worker(parent, name, args, opts) {
+    result = Tools.exec(name, args, opts)
+    send(parent, {'tool_done', result})
+}
+
+# Collect from the worker. It emits at most one {'tool_done', result}
+# and then — being linked — always an {'EXIT', _, reason} when it
+# exits, normally or by panic. We loop until that EXIT (the last thing
+# it can ever send), so nothing is stranded in the mailbox.
+fun collect_tool_result(name, pending) {
+    receive {
+        {'tool_done', result} -> collect_tool_result(name, result)
+        {'EXIT', _, ex_reason} ->
+            # A tool_done means the tool produced a result — success,
+            # whatever the worker's exit reason turns out to be. Only
+            # an EXIT with no result behind it is a real crash; then
+            # ex_reason is the panic message (or a bare code if the
+            # worker died before we managed to link it).
+            if (pending == nil) { tool_crash_msg(name, ex_reason) }
+            else { pending }
+    }
+}
+
+fun tool_crash_msg(name, reason) {
+    "error: tool '" ++ to_string(name) ++ "' crashed: " ++ to_string(reason) ++
+    "\n(a bug in the tool itself, not your input — try a different approach)"
 }
 
 # ------------------------------------------------------------
