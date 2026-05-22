@@ -4,7 +4,10 @@ module Main
 # swarm-code — terminal coding agent in sw
 # ============================================================
 #
-# Config via environment variables (no argv parsing yet):
+# Flags:  swarm --help · swarm --version · swarm --print-config
+#         (everything else is configured by environment, below.)
+#
+# Config via environment variables:
 #   SWARM_CODE_ENDPOINT    default: http://sushi:8000
 #                          Accepts either a base URL (we append
 #                          /v1/chat/completions) or a full URL ending
@@ -40,6 +43,10 @@ import Log
 import Agents
 
 fun main() {
+    # CLI flags (--help / --version / --print-config) print and exit
+    # before any runtime setup. Returns "ok" when no flag was given.
+    handle_cli_flags(os_args())
+
     base_opts = load_opts()
     cwd = resolve_cwd()
 
@@ -182,6 +189,88 @@ fun main() {
         buddy_prompt
 
     Agent.run(opts5, system_prompt_text)
+}
+
+# ============================================================
+# CLI flags
+# ============================================================
+#
+# swarm-code is configured almost entirely through environment
+# variables (see load_opts/0). The only command-line flags are the
+# three every CLI is expected to answer; each prints and exits
+# without starting the agent.
+
+# Keep in sync with the release tag — see .github/workflows/release.yml.
+fun swarm_version() { "0.1.0" }
+
+# Presence test for a flag anywhere in argv. argv[0] is the binary
+# path; position and order of the rest don't matter.
+fun has_flag(args, flag) {
+    if (length(args) == 0) { 'false' }
+    else { if (hd(args) == flag) { 'true' }
+    else { has_flag(tl(args), flag) }}
+}
+
+fun handle_cli_flags(args) {
+    if (has_flag(args, "--help") == 'true' || has_flag(args, "-h") == 'true') {
+        print_usage()
+        sys_exit(0)
+    }
+    else { if (has_flag(args, "--version") == 'true' || has_flag(args, "-V") == 'true') {
+        print("swarm-code " ++ swarm_version())
+        sys_exit(0)
+    }
+    else { if (has_flag(args, "--print-config") == 'true') {
+        print_config()
+        sys_exit(0)
+    }
+    else { "ok" }}}
+}
+
+fun print_usage() {
+    print("swarm-code — a terminal coding agent on the swarmrt runtime")
+    print("")
+    print("USAGE")
+    print("  swarm                  start the interactive agent")
+    print("  swarm --help, -h       show this help and exit")
+    print("  swarm --version, -V    print the version and exit")
+    print("  swarm --print-config   show the resolved config and exit")
+    print("")
+    print("CONFIG")
+    print("  BYOM — bring your own model. Settings are read in priority")
+    print("  order: environment variables, then ~/.swarm-code/settings.json,")
+    print("  then built-in defaults.")
+    print("")
+    print("  SWARM_CODE_ENDPOINT      LLM endpoint (OpenAI-compatible)")
+    print("  SWARM_CODE_MODEL         model name (default: kimi-k2.6)")
+    print("  SWARM_CODE_API_KEY       API key for a remote provider")
+    print("  SWARM_CODE_ALLOW_REMOTE  set to 1 to permit non-local endpoints")
+    print("  SWARM_CODE_CWD           working directory shown to the model")
+    print("")
+    print("  `swarm --print-config` shows what these resolve to right now.")
+    print("")
+    print("IN-APP")
+    print("  Once running, type /help for slash commands and /quit to exit.")
+    print("")
+    print("  Docs & issues: https://github.com/skyblanket/swarm-code")
+}
+
+fun print_config() {
+    o = load_opts()
+    ak = map_get(o, 'api_key')
+    ak_shown = if (ak == nil) { "(not set)" }
+               else { if (string_length(to_string(ak)) == 0) { "(empty)" }
+               else { "(set)" }}
+    print("swarm-code " ++ swarm_version() ++ " — resolved configuration")
+    print("  (env overrides ~/.swarm-code/settings.json overrides defaults)")
+    print("")
+    print("  endpoint     " ++ to_string(map_get(o, 'endpoint')))
+    print("  model        " ++ to_string(map_get(o, 'model')))
+    print("  api_key      " ++ ak_shown)
+    print("  tool_format  " ++ to_string(map_get(o, 'tool_format')))
+    print("  temperature  " ++ to_string(map_get(o, 'temperature')))
+    print("  max_tokens   " ++ to_string(map_get(o, 'max_tokens')))
+    print("  cwd          " ++ resolve_cwd())
 }
 
 fun load_opts() {
