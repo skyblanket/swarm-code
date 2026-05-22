@@ -25,6 +25,7 @@ import Config
 import Memory
 import Tools
 import Agents
+import Mcp
 
 fun main() {
     print("")
@@ -49,7 +50,8 @@ fun main() {
         t_slugify(),
         t_glob(),
         t_grep(),
-        t_registry_list_names()
+        t_registry_list_names(),
+        t_mcp_unconfigured()
     ]
 
     passed = sum_list(results, 0)
@@ -275,4 +277,17 @@ fun t_registry_list_names() {
     names = Agents.registry_list_names(reg)
     check("registry_list_names returns agent names (list_agents crash)",
           if (length(names) == 2) { 'true' } else { 'false' })
+}
+
+# MCP with no mcpServers configured: init returns an empty table,
+# no tool schemas, no prompt section — the zero-cost-when-unused path
+# (also the regression guard that the Mcp module compiles + loads).
+fun t_mcp_unconfigured() {
+    table = Mcp.init(map_new())
+    schemas = Mcp.all_schemas(table)
+    section = Mcp.as_prompt_section(table)
+    ok = bool_and(
+        if (length(schemas) == 0) { 'true' } else { 'false' },
+        if (section == "") { 'true' } else { 'false' })
+    check("mcp: unconfigured -> no schemas, no prompt section", ok)
 }
