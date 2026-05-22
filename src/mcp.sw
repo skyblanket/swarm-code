@@ -100,30 +100,60 @@ fun init(settings) {
             print("  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " \e[1mMCP\e[0m " ++
                   mcp_dim() ++ "— starting " ++ to_string(length(names)) ++
                   " server(s)…" ++ mcp_reset())
-            # Pass 1: spawn every subprocess and fire its initialize
-            # request. Doing all spawns up front overlaps the slow
-            # part — an npx package download — across servers.
-            handles = mcp_spawn_all(names, specs, [])
-            # Pass 2: finish each handshake, list tools, spawn owners.
-            mcp_handshake_all(table, handles)
+            # One boot worker per server — they spawn + handshake in
+            # parallel, so total boot time is max(server), not sum.
+            # Each worker writes its own <server>/* keys (distinct, no
+            # race); this process is the sole writer of 'all_servers',
+            # appending each name as its worker reports done.
+            mcp_spawn_boot_workers(table, names, specs, self())
+            mcp_collect_boots(table, length(names), timestamp() + mcp_boot_deadline_ms())
             table
         }
     }
 }
 
-# Pass 1 — spawn + send initialize. Returns [{name, handle}, ...];
-# handle is -1 if the spawn could not even start.
-fun mcp_spawn_all(names, specs, acc) {
-    if (length(names) == 0) { acc }
+# Overall boot budget — a worker self-limits each server to
+# mcp_handshake_timeout_ms; this is that plus margin.
+fun mcp_boot_deadline_ms() { mcp_handshake_timeout_ms() + 15000 }
+
+fun mcp_spawn_boot_workers(table, names, specs, parent) {
+    if (length(names) == 0) { 'ok' }
     else {
-        name = to_string(hd(names))
-        spec = hd(specs)
-        cmd = mcp_build_command(name, spec)
-        handle = if (cmd == nil) { 0 - 1 } else { subprocess_spawn(cmd) }
-        if (handle >= 0) {
-            subprocess_send_line(handle, mcp_initialize_request())
+        spawn(mcp_boot_worker(table, to_string(hd(names)), hd(specs), parent))
+        mcp_spawn_boot_workers(table, tl(names), tl(specs), parent)
+    }
+}
+
+# A boot worker: spawn this server's subprocess, fire initialize, run
+# the full handshake (mcp_handshake_one records the outcome — success
+# or failure — in the table), then signal `parent`.
+fun mcp_boot_worker(table, name, spec, parent) {
+    cmd = mcp_build_command(name, spec)
+    handle = if (cmd == nil) { 0 - 1 } else { subprocess_spawn(cmd) }
+    if (handle >= 0) {
+        subprocess_send_line(handle, mcp_initialize_request())
+    }
+    mcp_handshake_one(table, name, handle)
+    send(parent, {'mcp_boot_done', name})
+    'ok'
+}
+
+# Collect one {'mcp_boot_done', name} per server, appending each name
+# to 'all_servers' (single-writer — workers never touch that list).
+fun mcp_collect_boots(table, remaining, deadline) {
+    if (remaining <= 0) { 'ok' }
+    else {
+        wait = deadline - timestamp()
+        if (wait <= 0) { 'ok' }
+        else {
+            receive {
+                {'mcp_boot_done', name} ->
+                    cur = ets_get(table, 'all_servers')
+                    ets_put(table, 'all_servers', cur ++ [name])
+                    mcp_collect_boots(table, remaining - 1, deadline)
+                after wait { 'ok' }
+            }
         }
-        mcp_spawn_all(tl(names), tl(specs), list_append(acc, {name, handle}))
     }
 }
 
@@ -141,18 +171,23 @@ fun mcp_initialize_request() {
 }
 
 # Build the /bin/sh command line for a server spec:
-#   KEY='val' … command arg1 arg2 … 2>>~/.swarm-code/mcp-<name>.log
+#   KEY='val' … command arg1 arg2 … 2>~/.swarm-code/mcp-<name>.log
 fun mcp_build_command(name, spec) {
-    command = if (spec == nil) { nil } else { map_get(spec, 'command') }
+    command = if (spec == nil) { nil }
+              else { if (is_map(spec) == 'false') { nil }
+              else { map_get(spec, 'command') }}
     if (command == nil) { nil }
     else {
         args = map_get(spec, 'args')
         env = map_get(spec, 'env')
         env_part = if (env == nil) { "" }
-                   else { mcp_env_prefix(map_keys(env), map_values(env), "") }
-        args_part = if (args == nil) { "" } else { mcp_args_str(args, "") }
+                   else { if (is_map(env) == 'false') { "" }
+                   else { mcp_env_prefix(map_keys(env), map_values(env), "") }}
+        args_part = if (args == nil) { "" }
+                    else { if (is_list(args) == 'false') { "" }
+                    else { mcp_args_str(args, "") }}
         env_part ++ mcp_shq(to_string(command)) ++ args_part ++
-            " 2>>" ++ mcp_shq(mcp_log_path(name))
+            " 2>" ++ mcp_shq(mcp_log_path(name))
     }
 }
 
@@ -161,8 +196,28 @@ fun mcp_env_prefix(keys, vals, acc) {
     else {
         k = to_string(hd(keys))
         v = to_string(hd(vals))
-        mcp_env_prefix(tl(keys), tl(vals), acc ++ k ++ "=" ++ mcp_shq(v) ++ " ")
+        # Skip keys with shell-significant characters — the KEY half of
+        # a `KEY='val'` assignment-prefix cannot be quoted, so a bad
+        # key would break (or inject into) the command line.
+        entry = if (mcp_safe_env_key(k) == 'true') { k ++ "=" ++ mcp_shq(v) ++ " " }
+                else { "" }
+        mcp_env_prefix(tl(keys), tl(vals), acc ++ entry)
     }
+}
+
+fun mcp_safe_env_key(k) {
+    if (string_length(k) == 0) { 'false' }
+    else { if (string_contains(k, " ") == 'true') { 'false' }
+    else { if (string_contains(k, ";") == 'true') { 'false' }
+    else { if (string_contains(k, "=") == 'true') { 'false' }
+    else { if (string_contains(k, "'") == 'true') { 'false' }
+    else { if (string_contains(k, "\"") == 'true') { 'false' }
+    else { if (string_contains(k, "$") == 'true') { 'false' }
+    else { if (string_contains(k, "&") == 'true') { 'false' }
+    else { if (string_contains(k, "|") == 'true') { 'false' }
+    else { if (string_contains(k, "`") == 'true') { 'false' }
+    else { if (string_contains(k, "\n") == 'true') { 'false' }
+    else { 'true' }}}}}}}}}}}
 }
 
 fun mcp_args_str(args, acc) {
@@ -175,22 +230,7 @@ fun mcp_shq(s) {
     "'" ++ string_replace(s, "'", "'\\''") ++ "'"
 }
 
-# Pass 2 — finish each server's handshake.
-fun mcp_handshake_all(table, handles) {
-    if (length(handles) == 0) { 'ok' }
-    else {
-        entry = hd(handles)
-        mcp_handshake_one(table, elem(entry, 0), elem(entry, 1))
-        mcp_handshake_all(table, tl(handles))
-    }
-}
-
 fun mcp_handshake_one(table, name, handle) {
-    # Record the server as configured regardless of outcome, so /mcp
-    # can surface failures.
-    cur = ets_get(table, 'all_servers')
-    ets_put(table, 'all_servers', cur ++ [name])
-
     if (handle < 0) {
         mcp_fail(table, name, handle, "could not spawn subprocess")
     } else {
@@ -205,15 +245,13 @@ fun mcp_handshake_one(table, name, handle) {
                 mcp_fail(table, name, handle,
                     "initialize rejected: " ++ to_string(map_get(ierr, 'message')))
             } else {
-                # Handshake step 2: announce we're initialised.
                 subprocess_send_line(handle,
                     json_encode(%{jsonrpc: "2.0", method: "notifications/initialized"}))
-                # Step 3: discover tools (follows nextCursor pagination).
                 tools = mcp_list_tools(handle, 1, nil, [])
                 if (tools == nil) {
                     mcp_fail(table, name, handle, "tools/list failed")
                 } else {
-                    mcp_register(table, name, handle, tools)
+                    mcp_register(table, name, handle, mcp_keep_maps(tools, []))
                 }
             }
         }
@@ -246,7 +284,8 @@ fun mcp_list_tools(handle, id, cursor, acc) {
                 if (result == nil) { acc }
                 else {
                     page = map_get(result, 'tools')
-                    acc2 = if (page == nil) { acc } else { acc ++ page }
+                    acc2 = if (page == nil) { acc }
+                           else { if (is_list(page) == 'true') { acc ++ page } else { acc } }
                     nxt = map_get(result, 'nextCursor')
                     if (nxt == nil) { acc2 }
                     else { mcp_list_tools(handle, id + 1, nxt, acc2) }
@@ -286,6 +325,17 @@ fun mcp_index_tools(table, server, tools) {
     }
 }
 
+# Keep only the map-shaped entries of a list — defends downstream
+# map_get against a server that put junk in its tools array.
+fun mcp_keep_maps(items, acc) {
+    if (length(items) == 0) { acc }
+    else {
+        h = hd(items)
+        next = if (is_map(h) == 'true') { list_append(acc, h) } else { acc }
+        mcp_keep_maps(tl(items), next)
+    }
+}
+
 fun mcp_prefixed(server, bare) { "mcp__" ++ server ++ "__" ++ bare }
 
 # ============================================================
@@ -296,9 +346,9 @@ fun mcp_prefixed(server, bare) { "mcp__" ++ server ++ "__" ++ bare }
 # scheduler threads, released the moment the call returns).
 fun mcp_owner_loop(name, handle, next_id) {
     receive {
-        {'mcp_call', tool_name, args, reply_pid} ->
+        {'mcp_call', tool_name, args, reply_pid, token} ->
             result = mcp_do_call(handle, next_id, tool_name, args)
-            if (reply_pid != nil) { send(reply_pid, {'mcp_result', result}) }
+            if (reply_pid != nil) { send(reply_pid, {'mcp_result', token, result}) }
             mcp_owner_loop(name, handle, next_id + 1)
         _other ->
             mcp_owner_loop(name, handle, next_id)
@@ -338,7 +388,7 @@ fun mcp_read_response(handle, want_id, deadline) {
         if (line == nil) {
             nil
         } else {
-            decoded = json_decode(line)
+            decoded = json_decode(string_trim(line))
             if (decoded == nil) {
                 # Non-JSON line on stdout (a stray banner) — skip it.
                 mcp_read_response(handle, want_id, deadline)
@@ -372,28 +422,72 @@ fun mcp_format_result(resp) {
     }
 }
 
-# Concatenate the text blocks of an MCP content array. Non-text
-# blocks (image / audio / resource) are noted, not dropped silently.
+# Concatenate the text blocks of an MCP content array. Non-text blocks
+# (image / audio / resource) are noted, not dropped silently. Guards
+# against a non-array `content` and caps total size.
 fun mcp_extract_text(items, acc) {
-    if (length(items) == 0) { acc }
+    if (is_list(items) == 'false') {
+        to_string(items)
+    }
+    else { if (length(items) == 0) { acc }
+    else { if (string_length(acc) >= 262144) {
+        acc ++ "\n…[truncated]"
+    }
     else {
         item = hd(items)
-        t = map_get(item, 'type')
-        piece = if (t == "text") {
-            tx = map_get(item, 'text')
-            if (tx == nil) { "" } else { to_string(tx) }
+        piece = if (is_map(item) == 'false') {
+            to_string(item)
         } else {
-            "[" ++ (if (t == nil) { "non-text" } else { to_string(t) }) ++ " content omitted]"
+            t = map_get(item, 'type')
+            if (t == "text") {
+                tx = map_get(item, 'text')
+                if (tx == nil) { "" } else { to_string(tx) }
+            } else {
+                "[" ++ (if (t == nil) { "non-text" } else { to_string(t) }) ++ " content omitted]"
+            }
         }
         sep = if (string_length(acc) == 0) { "" } else { "\n" }
         mcp_extract_text(tl(items), acc ++ sep ++ piece)
-    }
+    }}}
 }
 
 # ============================================================
 # call_tool — dispatch entry, invoked from Tools.exec
 # ============================================================
 # `prefixed` is the full mcp__<server>__<tool> name the model called.
+
+# How long call_tool waits for the owner's reply before giving up.
+# Wider than 2x mcp_call_timeout_ms so a call queued behind one slow
+# call still receives its real reply rather than a false timeout.
+fun mcp_reply_deadline_ms() { 260000 }
+
+# Wait for the owner's reply carrying our exact correlation token. A
+# reply with any other token is a stale result from an earlier call
+# that already timed out — drop it and keep waiting until the deadline.
+fun mcp_await_result(server, token, deadline) {
+    wait = deadline - timestamp()
+    if (wait <= 0) {
+        "error: MCP call to '" ++ server ++ "' got no reply (owner stalled or server hung)"
+    } else {
+        receive {
+            {'mcp_result', t, r} ->
+                if (t == token) { r }
+                else { mcp_await_result(server, token, deadline) }
+            after wait {
+                "error: MCP call to '" ++ server ++ "' got no reply (owner stalled or server hung)"
+            }
+        }
+    }
+}
+
+# A connection-level failure string means the server process is gone.
+fun mcp_is_dead_result(r) {
+    rs = to_string(r)
+    if (string_contains(rs, "connection lost") == 'true') { 'true' }
+    else { if (string_contains(rs, "did not respond") == 'true') { 'true' }
+    else { 'false' }}
+}
+
 fun call_tool(prefixed, args, opts) {
     table = map_get(opts, 'mcp_table')
     if (table == nil) {
@@ -414,13 +508,17 @@ fun call_tool(prefixed, args, opts) {
                 if (owner == nil) {
                     "error: MCP server '" ++ server ++ "' has no owner process"
                 } else {
-                    send(owner, {'mcp_call', tool, args, self()})
-                    receive {
-                        {'mcp_result', r} -> r
-                        after 130000 {
-                            "error: MCP call to '" ++ server ++ "' got no reply (owner stalled)"
-                        }
+                    token = to_string(self()) ++ "/" ++ to_string(timestamp())
+                    send(owner, {'mcp_call', tool, args, self(), token})
+                    r = mcp_await_result(server, token, timestamp() + mcp_reply_deadline_ms())
+                    # A connection-level failure means the server is gone —
+                    # mark it offline so later calls fail fast instead of
+                    # each blocking for the full timeout.
+                    if (mcp_is_dead_result(r) == 'true') {
+                        ets_put(table, server ++ "/status", "failed")
+                        ets_put(table, server ++ "/error", "stopped responding mid-session")
                     }
+                    r
                 }
             }
         }

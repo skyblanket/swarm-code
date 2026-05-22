@@ -48,6 +48,22 @@ fun main() {
     # before any runtime setup. Returns "ok" when no flag was given.
     handle_cli_flags(os_args())
 
+    # Headless mode: `swarm -p "<prompt>"` runs one task to completion
+    # and exits — no TUI, no Reader. `--json` adds a final result line.
+    # The prompt comes from the argument after -p, OR from stdin when
+    # no argument follows (or `-p -`) — so an orchestrator can pipe a
+    # multi-line prompt without shell-quoting it as an argument.
+    cli_args = os_args()
+    p_present = if (has_flag(cli_args, "-p") == 'true') { 'true' }
+                else { if (has_flag(cli_args, "--print") == 'true') { 'true' }
+                else { 'false' }}
+    json_mode = if (has_flag(cli_args, "--json") == 'true') { 'true' } else { 'false' }
+    arg_prompt = get_print_arg(cli_args)
+    headless = p_present
+    headless_prompt = if (p_present == 'false') { nil }
+                      else { if (arg_prompt != nil) { arg_prompt }
+                      else { read_all_stdin("") }}
+
     base_opts = load_opts()
     cwd = resolve_cwd()
 
@@ -66,15 +82,17 @@ fun main() {
     endpoint_url = to_string(map_get(base_opts, 'endpoint'))
     verify_network_isolation(endpoint_url, map_get(base_opts, 'api_key'))
 
-    # Optional full-terminal alt-screen mode
+    # Optional full-terminal alt-screen mode (interactive only)
     tui_env = getenv("SWARM_CODE_TUI")
-    if (tui_env == "1") {
+    if (tui_env == "1" && headless == 'false') {
         UI.enter_alt_screen()
     }
 
-    UI.banner(to_string(map_get(base_opts, 'model')),
-              endpoint_url,
-              cwd)
+    if (headless == 'false') {
+        UI.banner(to_string(map_get(base_opts, 'model')),
+                  endpoint_url,
+                  cwd)
+    }
 
     # Load settings (user-global + project-local merged) and project context.
     settings = Config.load()
@@ -153,9 +171,10 @@ fun main() {
     # Default OFF — the buddy is a toy, not the product.
     buddy_env = getenv("SWARM_CODE_BUDDY")
     settings_buddy = map_get(settings, 'buddy_enabled')
-    buddy_enabled = if (buddy_env == "1") { 'true' }
+    buddy_enabled = if (headless == 'true') { 'false' }
+                    else { if (buddy_env == "1") { 'true' }
                     else { if (settings_buddy == 'true') { 'true' }
-                    else { 'false' }}
+                    else { 'false' }}}
     buddy = if (buddy_enabled == 'true') { Arthopod.hatch(opts4) } else { nil }
 
     if (buddy != nil) {
@@ -201,7 +220,11 @@ fun main() {
         telemetry_section ++
         buddy_prompt
 
-    Agent.run(opts5, system_prompt_text)
+    if (headless == 'true') {
+        Agent.run_headless(opts5, system_prompt_text, headless_prompt, json_mode)
+    } else {
+        Agent.run(opts5, system_prompt_text)
+    }
 }
 
 # ============================================================
@@ -222,6 +245,42 @@ fun has_flag(args, flag) {
     if (length(args) == 0) { 'false' }
     else { if (hd(args) == flag) { 'true' }
     else { has_flag(tl(args), flag) }}
+}
+
+# Value of the -p / --print flag — the inline headless prompt — or
+# nil. nil means either the flag is absent OR it's present with no
+# inline prompt (a flag-looking next arg, or nothing), in which case
+# the caller reads the prompt from stdin instead.
+fun get_print_arg(args) {
+    if (length(args) == 0) { nil }
+    else {
+        h = hd(args)
+        if (h == "-p" || h == "--print") {
+            rest = tl(args)
+            if (length(rest) == 0) { nil }
+            else {
+                cand = hd(rest)
+                # A flag-looking next arg (`--json`, `-`) is not the
+                # prompt — that's stdin mode.
+                if (string_starts_with(cand, "-") == 'true') { nil } else { cand }
+            }
+        } else {
+            get_print_arg(tl(args))
+        }
+    }
+}
+
+# Slurp all of stdin into one string (newline-joined). Used for the
+# headless prompt when `-p` has no inline argument. read_line returns
+# nil at EOF (pipe closed / Ctrl-D), which ends the loop.
+fun read_all_stdin(acc) {
+    line = read_line("")
+    if (line == nil) {
+        acc
+    } else {
+        next = if (string_length(acc) == 0) { line } else { acc ++ "\n" ++ line }
+        read_all_stdin(next)
+    }
 }
 
 fun handle_cli_flags(args) {
@@ -245,6 +304,8 @@ fun print_usage() {
     print("")
     print("USAGE")
     print("  swarm                  start the interactive agent")
+    print("  swarm -p \"<prompt>\"     run one task headless, then exit")
+    print("  swarm -p \"...\" --json   headless + a final JSON result line")
     print("  swarm --help, -h       show this help and exit")
     print("  swarm --version, -V    print the version and exit")
     print("  swarm --print-config   show the resolved config and exit")

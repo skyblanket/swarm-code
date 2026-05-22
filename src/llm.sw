@@ -517,6 +517,30 @@ fun transcode_loop(tool_calls, acc) {
     }
 }
 
+# Decode a native (OpenAI-shaped) response and return the assistant's
+# content with any structured `tool_calls` transcoded into in-band
+# `call:` text — the shape run_agent_turn's parser expects. Without
+# this a native subagent's tool calls are dropped: it reasons, then
+# "finishes" with an empty reply. nil on a malformed/empty response.
+fun native_content_from_resp(resp) {
+    decoded = json_decode(resp)
+    if (decoded == nil) { nil }
+    else {
+        choices = map_get(decoded, 'choices')
+        if (choices == nil) { nil }
+        else { if (length(choices) == 0) { nil }
+        else {
+            msg_obj = map_get(hd(choices), 'message')
+            if (msg_obj == nil) { nil }
+            else {
+                raw = map_get(msg_obj, 'content')
+                prose = if (raw == nil) { "" } else { to_string(raw) }
+                transcode_native_calls(map_get(msg_obj, 'tool_calls'), prose)
+            }
+        }}
+    }
+}
+
 # 3 retries = 4 total attempts. Spans a ~7s transient outage.
 fun max_chat_retries() { 3 }
 
@@ -664,7 +688,15 @@ fun chat_for_subagent(messages, opts, target_pid, name) {
         Log.llm_error("http_post returned nil (subagent " ++ name ++ ")", "")
         nil
     } else {
-        content = extract_content(resp)
+        # Native models put tool calls in structured `tool_calls`, not
+        # in-band `call:` text. extract_content only pulls prose, so a
+        # native subagent's tool calls vanished — it would reason then
+        # reply empty. Transcode them, exactly as chat_native does.
+        content = if (map_get(opts, 'tool_format') == 'native') {
+                      native_content_from_resp(resp)
+                  } else {
+                      extract_content(resp)
+                  }
         if (content == nil) {
             Log.llm_error("extract_content returned nil (subagent)", resp)
             nil

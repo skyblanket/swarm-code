@@ -79,9 +79,11 @@ fun load_project_context() {
 # Returns an atom: 'allow', 'deny', or 'ask'.
 #
 # Policy (updated):
-#   1. Default-allow for EVERY tool. The user explicitly asked for
-#      "all allowed by default" — prompting on every bash/write/edit
-#      was breaking flow during tool test runs.
+#   1. Default-allow for every BUILT-IN tool. The user explicitly asked
+#      for "all allowed by default" — prompting on every bash/write/edit
+#      was breaking flow during tool test runs. The one exception is MCP
+#      tools (mcp__*): being external and unvetted, they default to 'ask'
+#      so the user is prompted on first use (see default_permission).
 #   2. settings.permissions[tool_name] in settings.json can downgrade
 #      a specific tool to 'ask' or 'deny' if the user wants tighter
 #      control on one tool (e.g. "bash": "ask").
@@ -121,9 +123,16 @@ fun string_to_perm(s) {
     else { 'ask' }}
 }
 
-# Default-allow for every tool. See check_permission comment block above.
+# Built-in tools default to 'allow' (see the check_permission comment
+# block above). MCP tools (mcp__server__tool) default to 'ask' instead:
+# they are external and unvetted, and unlike `bash` they get no
+# dangerous-pattern gate. The session permission cache means this is
+# one prompt per MCP tool, not per call; a user can still pre-authorise
+# one via the settings.json permissions map
+# (e.g. "mcp__github__create_issue": "allow").
 fun default_permission(tool_name) {
-    'allow'
+    if (string_starts_with(to_string(tool_name), "mcp__") == 'true') { 'ask' }
+    else { 'allow' }
 }
 
 # Return 'true' ONLY for truly catastrophic, unambiguous patterns.

@@ -26,7 +26,7 @@ import Log
 import Agents
 import Mcp
 
-export [run]
+export [run, run_headless]
 
 # Maximum tool-call rounds per user turn (prevents runaway loops).
 fun max_steps() { 200 }
@@ -279,6 +279,92 @@ fun run(opts, system_prompt_text) {
     }
     opts_with_reader = map_put(opts_journal, 'reader_pid', reader_pid)
     main_loop(history, opts_with_reader)
+}
+
+# ------------------------------------------------------------
+# Headless entry — `swarm -p "<prompt>"`.
+#
+# Runs ONE task to completion with no Reader, no input box, no
+# banner, then exits. `route_input` -> `run_turn` already recurses
+# through every tool step until the model emits no more tool calls,
+# so this is a real agentic run to task completion, not one turn.
+#
+# Permissions auto-accept: opts.headless gates resolve_permission so
+# an 'ask' tool isn't denied (there's no human/Reader to prompt). An
+# explicit `-p` invocation IS the opt-in to autonomous execution.
+#
+# Journal resume still applies — the agent's prior session carries
+# over across invocations. That's swarm-code's native persistence,
+# and it makes `swarm -p` a drop-in persistent worker for an
+# orchestrator with zero extra plumbing.
+#
+# json_mode 'true' -> emit one final {"status","summary"} line for
+# programmatic callers; otherwise just the streamed work + a plain
+# exit code.
+# ------------------------------------------------------------
+fun run_headless(opts, system_prompt_text, prompt, json_mode) {
+    register('main_agent', self())
+
+    jdir = session_dir()
+    shell("mkdir -p " ++ jdir)
+    ap = journal_active_ptr()
+    prev_ptr = if (file_exists(ap) == 'true') { file_read(ap) } else { nil }
+    resumed_raw = if (prev_ptr == nil) { [] }
+                  else {
+                      prev_path = string_trim(prev_ptr)
+                      if (string_length(prev_path) > 0 && file_exists(prev_path) == 'true') {
+                          replay_journal(prev_path)
+                      } else { [] }
+                  }
+    resumed = trim_incomplete(resumed_raw)
+
+    journal_path = if (length(resumed) > 0) {
+        string_trim(prev_ptr)
+    } else {
+        jp_new = jdir ++ "/journal-" ++ to_string(timestamp()) ++ ".jsonl"
+        file_write(jp_new, "")
+        jp_new
+    }
+    file_write(ap, journal_path)
+    opts_journal = map_put(opts, 'journal_path', journal_path)
+
+    history = if (length(resumed) > 0) {
+        prepend([{'system', system_prompt_text}], resumed)
+    } else {
+        [{'system', system_prompt_text}]
+    }
+    journal_sync(opts_journal, history)
+
+    # Headless: auto-accept permissions, no reader_pid in opts.
+    opts_h = map_put(opts_journal, 'headless', 'true')
+
+    final_history = route_input(prompt, history, opts_h)
+    journal_sync(opts_h, final_history)
+
+    last_text = last_assistant_text(final_history)
+    ok = if (string_length(last_text) > 0) { 'true' } else { 'false' }
+    if (json_mode == 'true') {
+        status = if (ok == 'true') { "ok" } else { "error" }
+        print(json_encode(%{status: status, summary: last_text}))
+    } else {
+        ""
+    }
+    # main() returning exits 0; sys_exit(1) marks a failed run.
+    if (ok == 'true') { "" } else { sys_exit(1) }
+}
+
+# Text of the last assistant message in history, or "" if none.
+fun last_assistant_text(history) {
+    last_assistant_loop(history, "")
+}
+
+fun last_assistant_loop(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        na = if (elem(m, 0) == 'assistant') { to_string(elem(m, 1)) } else { acc }
+        last_assistant_loop(tl(msgs), na)
+    }
 }
 
 # ------------------------------------------------------------
@@ -1556,15 +1642,22 @@ fun resolve_permission(name, args, opts) {
     if (raw == 'allow') { 'allow' }
     else { if (raw == 'deny') { 'deny' }
     else {
-        # 'ask' — check cached session answer first.
-        table = map_get(opts, 'perms_table')
-        cache_key = to_string(name)
-        cached = if (table == nil) { nil } else { ets_get(table, cache_key) }
-        if (cached == 'allow_session') { 'allow' }
-        else { if (cached == 'deny_session') { 'deny' }
+        # 'ask' — headless mode has no human/Reader to prompt, so it
+        # auto-accepts. An explicit `swarm -p` IS the opt-in to
+        # autonomous execution (mirrors `claude -p --dangerously-
+        # skip-permissions`). Interactive mode prompts as before.
+        headless = map_get(opts, 'headless')
+        if (headless == 'true') { 'allow' }
         else {
-            ask_via_reader(name, opts, table, cache_key)
-        }}
+            table = map_get(opts, 'perms_table')
+            cache_key = to_string(name)
+            cached = if (table == nil) { nil } else { ets_get(table, cache_key) }
+            if (cached == 'allow_session') { 'allow' }
+            else { if (cached == 'deny_session') { 'deny' }
+            else {
+                ask_via_reader(name, opts, table, cache_key)
+            }}
+        }
     }}
 }
 

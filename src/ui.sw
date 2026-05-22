@@ -720,19 +720,26 @@ fun format_agent_row(name, entry) {
     tokens = if (tokens_v == nil) { "0" } else { to_string(tokens_v) }
     spawned_v = map_get(entry, 'spawned_at')
     age_ms = if (spawned_v == nil) { 0 } else { timestamp() - spawned_v }
-    age_s = age_ms / 1000
-    age_str = to_string(age_s) ++ "s"
-    "  " ++ agent_prefix(name) ++ pad_right(name, 18 - string_length(name)) ++
-        pad_right(role, 16 - string_length(role)) ++
-        status_color(status) ++ pad_right(status, 9 - string_length(status)) ++ reset() ++
-        pad_right(tokens, 11 - string_length(tokens)) ++
+    age_str = to_string(age_ms / 1000) ++ "s"
+    # Each cell is padded as plain text to a fixed column width; the
+    # color codes wrap the padded cell so they never skew width math.
+    "  " ++ agent_color(name) ++ pad_right(name, 18) ++ reset() ++
+        pad_right(role, 16) ++
+        status_color(status) ++ pad_right(status, 9) ++ reset() ++
+        pad_right(tokens, 11) ++
         grey_text() ++ age_str ++ reset()
 }
 
-# Truncates if longer than width, otherwise pads with spaces.
-fun pad_right(s, padding) {
-    if (padding <= 0) { " " }
-    else { s_pad(padding, "") }
+# Pad — or truncate — a plain string to exactly `width` visible
+# columns. The old version discarded `s` and emitted only spaces.
+fun pad_right(s, width) {
+    len = string_length(s)
+    if (len >= width) {
+        if (width <= 1) { string_sub(s, 0, 1) }
+        else { string_sub(s, 0, width - 1) ++ " " }
+    } else {
+        s ++ s_pad(width - len, "")
+    }
 }
 
 fun s_pad(n, acc) {

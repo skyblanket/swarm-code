@@ -26,6 +26,7 @@ import Memory
 import Tools
 import Agents
 import Mcp
+import HarnessLimits
 
 fun main() {
     print("")
@@ -51,7 +52,8 @@ fun main() {
         t_glob(),
         t_grep(),
         t_registry_list_names(),
-        t_mcp_unconfigured()
+        t_mcp_unconfigured(),
+        HarnessLimits.run_all()
     ]
 
     passed = sum_list(results, 0)
