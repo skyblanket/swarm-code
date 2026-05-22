@@ -23,6 +23,7 @@ import Background
 import Heartbeat
 import Telemetry
 import Browser
+import Mcp
 
 export [exec, max_output_bytes]
 
@@ -31,8 +32,17 @@ export [exec, max_output_bytes]
 fun max_output_bytes() { 6000 }
 
 # Dispatch a tool call by name.
+#
+# MCP tools (mcp__server__tool) are checked FIRST and routed to their
+# owning server subprocess via Mcp.call_tool. This is the single
+# dispatch chokepoint — it covers the main agent and subagents alike
+# (subagents call exec directly, bypassing agent.sw's dispatch_tool).
+# The result is truncated like any other tool's output.
 fun exec(name, args, opts) {
-    if (name == 'bash') { do_bash(args) }
+    if (string_starts_with(to_string(name), "mcp__") == 'true') {
+        truncate_output(Mcp.call_tool(to_string(name), args, opts), max_output_bytes())
+    }
+    else { if (name == 'bash') { do_bash(args) }
     else { if (name == 'read') { do_read(args) }
     else { if (name == 'write') { do_write(args) }
     else { if (name == 'edit') { do_edit(args) }
@@ -70,7 +80,7 @@ fun exec(name, args, opts) {
     else { if (name == 'browser_evaluate')   { do_browser_evaluate(args, opts) }
     else { if (name == 'browser_close')      { do_browser_close(args, opts) }
     else { "error: unknown tool '" ++ to_string(name) ++ "'"
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # ------------------------------------------------------------

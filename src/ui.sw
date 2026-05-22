@@ -556,57 +556,85 @@ fun agent_emit_render(name, content) {
 }
 
 # ------------------------------------------------------------
-# Streaming render — handles {'stream_chunk'} from a subagent.
+# Streaming render — {'stream_chunk'} (prose) and {'stream_reason'}
+# (thinking) chunks from a subagent.
 #
-# State machine: the stream_state ETS table holds the name of the agent
-# currently mid-stream. When a chunk arrives:
-#   - same agent → just print text inline (no new prefix)
-#   - different agent → close previous line + start new prefix
-#   - first chunk → start fresh prefix
-# A {'stream_done'} clears the state so the next chunk re-prints prefix.
+# Chunks arrive token-by-token. The stream_state ETS table holds
+# {name, channel} for whatever is mid-stream — channel is 'prose' or
+# 'reason'. A chunk that matches the open stream appends inline (no new
+# prefix); anything else closes the open line and starts a fresh
+# prefixed one. {'stream_done'} closes the line. Without this, every
+# single token would land on its own [agent] line.
 # ------------------------------------------------------------
-fun stream_chunk_render(name, content, opts) {
-    tbl = map_get(opts, 'stream_state_table')
-    if (tbl == nil) {
-        # Fallback: just print with a prefix on every chunk if no state table.
-        print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
-    } else {
+
+# True when `cur` ({name, channel} tuple, or nil) is exactly this
+# agent streaming this channel.
+fun stream_is_current(cur, name, channel) {
+    if (cur == nil) { 'false' }
+    else { if (elem(cur, 0) == name && elem(cur, 1) == channel) { 'true' }
+    else { 'false' }}
+}
+
+# Close whatever stream line is open: emit an ANSI reset + newline and
+# clear the state. No-op when nothing is open.
+fun stream_close_open(tbl) {
+    if (tbl != nil) {
         cur = ets_get(tbl, 'current')
-        if (cur == nil) {
-            print("")
-            print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " ")
-            print_inline(to_string(content))
-            ets_put(tbl, 'current', name)
-        } else {
-            if (cur == name) {
-                print_inline(to_string(content))
-            } else {
-                print("")
-                print("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
-                ets_put(tbl, 'current', name)
-            }
+        if (cur != nil) {
+            print(reset())
+            ets_put(tbl, 'current', nil)
         }
     }
 }
 
-# Reasoning chunks render dim+italic with the agent prefix. v1: each chunk
-# gets its own line with a 'reason' arrow so users see thinking arrive but
-# it's visually separated from prose.
+fun stream_chunk_render(name, content, opts) {
+    tbl = map_get(opts, 'stream_state_table')
+    if (tbl == nil) {
+        # No state table: degrade to a prefix on every chunk.
+        print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " " ++ to_string(content))
+    } else {
+        cur = ets_get(tbl, 'current')
+        if (stream_is_current(cur, name, 'prose') == 'true') {
+            print_inline(to_string(content))
+        } else {
+            stream_close_open(tbl)
+            print_inline("  " ++ agent_prefix(name) ++ " " ++ grey_border() ++ "│" ++ reset() ++ " ")
+            print_inline(to_string(content))
+            ets_put(tbl, 'current', {name, 'prose'})
+        }
+    }
+}
+
+# Reasoning chunks render dim + italic. Same inline-merge state machine
+# as prose, so a token-by-token thinking stream flows on one line
+# instead of one [agent] line per word.
 fun stream_reason_render(name, content, opts) {
     tbl = map_get(opts, 'stream_state_table')
-    # Reasoning bypasses the inline-stream state (it's a different channel).
-    if (tbl != nil) { ets_put(tbl, 'current', nil) }
-    print("")
-    print("  " ++ agent_prefix(name) ++ " \e[38;5;240m\e[3m" ++ to_string(content) ++ "\e[0m")
+    if (tbl == nil) {
+        print_inline("\e[38;5;240m\e[3m" ++ to_string(content) ++ reset())
+    } else {
+        cur = ets_get(tbl, 'current')
+        if (stream_is_current(cur, name, 'reason') == 'true') {
+            print_inline(to_string(content))
+        } else {
+            stream_close_open(tbl)
+            print_inline("  " ++ agent_prefix(name) ++ " \e[38;5;240m\e[3m")
+            print_inline(to_string(content))
+            ets_put(tbl, 'current', {name, 'reason'})
+        }
+    }
 }
 
 fun stream_done_render(name, opts) {
     tbl = map_get(opts, 'stream_state_table')
     if (tbl != nil) {
         cur = ets_get(tbl, 'current')
-        if (cur == name) {
-            print("")
-            ets_put(tbl, 'current', nil)
+        # Only close the line if THIS agent owns the open stream.
+        if (cur != nil) {
+            if (elem(cur, 0) == name) {
+                print(reset())
+                ets_put(tbl, 'current', nil)
+            }
         }
     }
 }

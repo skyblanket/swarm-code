@@ -82,15 +82,24 @@ fun build_request_body(messages, opts) {
     }
 
     final_req = if (tool_format == 'native') {
-        native_req(base)
+        native_req(base, opts)
     } else {
         inband_req(base)
     }
     json_encode(final_req)
 }
 
-fun native_req(base) {
-    a = map_put(base, 'tools', ToolSchemas.all_schemas())
+fun native_req(base, opts) {
+    # Built-in tool schemas plus any discovered MCP tool schemas
+    # (precomputed at boot, stashed in opts['mcp_schemas']). MCP tools
+    # self-describe with a JSON Schema, so they slot into the same
+    # OpenAI `tools` array as the built-ins with no transformation.
+    mcp_schemas = map_get(opts, 'mcp_schemas')
+    builtins = ToolSchemas.all_schemas()
+    tools = if (mcp_schemas == nil) { builtins }
+            else { if (length(mcp_schemas) == 0) { builtins }
+            else { builtins ++ mcp_schemas }}
+    a = map_put(base, 'tools', tools)
     b = map_put(a, 'tool_choice', "auto")
     # Native used to be non-streaming (stream:false). It now streams:
     # http_post_stream parses delta.tool_calls out of the SSE feed and

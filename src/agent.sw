@@ -24,6 +24,7 @@ import Arthopod
 import Reader
 import Log
 import Agents
+import Mcp
 
 export [run]
 
@@ -604,6 +605,9 @@ fun handle_eof(history, opts) {
     }
     Log.session_end("user_exit")
     Config.run_hooks("Stop", 'session', "{}", opts)
+    # Close MCP server subprocesses before exit — sys_exit(0) below
+    # would otherwise orphan them (they'd reparent to init and linger).
+    Mcp.shutdown(map_get(opts, 'mcp_table'))
     # Clean exit — drop the .active pointer so the next launch doesn't
     # mistake this for a crash and replay the journal.
     journal_clean(opts)
@@ -626,6 +630,9 @@ fun slash_dispatch(cmd, history, opts) {
     }
     else { if (cmd == "/tools") {
         print("available: bash, read, write, edit, multi_edit, glob, grep, todo_write, web_fetch, task, remember, recall, background, bg_status, bg_result, bg_server, bg_tail, bg_kill, sys_stats, heartbeat_status")
+        print("browser: browser_launch, browser_navigate, browser_click, browser_type, browser_screenshot, browser_get_text, browser_get_html, browser_evaluate, browser_close")
+        print("swarm: spawn_agent, ask, tell, list_agents, kill, parallel")
+        print(UI.grey_text() ++ "MCP tools (if any) are listed by /mcp" ++ UI.reset())
         history
     }
     else { if (cmd == "/status") {
@@ -753,10 +760,14 @@ fun slash_dispatch(cmd, history, opts) {
         print(Agents.list_tool(map_new(), opts))
         history
     }
+    else { if (cmd == "/mcp") {
+        print(Mcp.list_servers(map_get(opts, 'mcp_table')))
+        history
+    }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -766,6 +777,7 @@ fun show_help() {
     print("  /tools                list available tools")
     print("  /todos                show todo list")
     print("  /agents               list live subagents (swarm)")
+    print("  /mcp                  list MCP servers and their tools")
     print("  /model                show active model")
     print("  /history              print recent messages")
     print("  /tokens               approximate token count")
@@ -1784,7 +1796,11 @@ fun string_to_atom(s) {
     else { if (s == "code_search") { 'code_search' }
     else { if (s == "log_wait") { 'log_wait' }
     else { if (s == "file_watch") { 'file_watch' }
-    else { 'unknown' }
+    # Unrecognized name → return the raw string (not 'unknown'). This
+    # lets MCP tool names (mcp__server__tool) survive the XML-inband
+    # path: Tools.exec checks the mcp__ prefix on to_string(name), and
+    # a genuinely-unknown tool still resolves to "error: unknown tool".
+    else { s }
     }}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 

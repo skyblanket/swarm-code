@@ -41,6 +41,7 @@ import Background
 import Telemetry
 import Log
 import Agents
+import Mcp
 
 fun main() {
     # CLI flags (--help / --version / --print-config) print and exit
@@ -104,6 +105,14 @@ fun main() {
     hb_interval = if (hb_parsed < 1) { 2 } else { hb_parsed }
     heartbeat_table = Heartbeat.start(hb_interval, bg_table)
 
+    # MCP — start any configured Model Context Protocol servers and
+    # discover their tools. Returns an empty table (and prints nothing)
+    # when no mcpServers are set, so MCP is zero-cost when unused.
+    # mcp_schemas is the discovered tools as OpenAI function schemas,
+    # merged into the request `tools` array by llm.sw's native_req.
+    mcp_table = Mcp.init(settings)
+    mcp_schemas = Mcp.all_schemas(mcp_table)
+
     # Load the SWARM_MANIFESTO.md if present — Swarm's letter to itself
     manifesto_path = getenv("HOME") ++ "/.swarm-code/SWARM_MANIFESTO.md"
     manifesto_text = if (file_exists(manifesto_path) == 'true') {
@@ -121,6 +130,8 @@ fun main() {
     opts3c = map_put(opts3c, 'swarm_registry', swarm_registry)
     opts3c = map_put(opts3c, 'browser_table', browser_table)
     opts3c = map_put(opts3c, 'stream_state_table', stream_state)
+    opts3c = map_put(opts3c, 'mcp_table', mcp_table)
+    opts3c = map_put(opts3c, 'mcp_schemas', mcp_schemas)
     # Autonomy: wake the LLM on bg_done events so the model can react to
     # background activity without a user prompt. Default ON. Disable with
     # SWARM_CODE_AUTONOMY=0.
@@ -173,6 +184,7 @@ fun main() {
 
     memory_section = Memory.as_prompt_section(memory_table)
     heartbeat_section = Heartbeat.as_prompt_section(heartbeat_table)
+    mcp_section = Mcp.as_prompt_section(mcp_table)
 
     # Capture a system-stats snapshot at startup so Swarm sees the host
     # without having to call sys_stats for basic context.
@@ -185,6 +197,7 @@ fun main() {
         manifesto_section ++
         memory_section ++
         heartbeat_section ++
+        mcp_section ++
         telemetry_section ++
         buddy_prompt
 
