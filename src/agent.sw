@@ -1,20 +1,27 @@
 module Agent
 
 # ============================================================
-# Agent — REPL loop + tool-call extraction
+# Agent — REPL loop + tool dispatch (structured tool_calls)
 # ============================================================
 #
 # The interactive loop:
 #   1. Read a line from stdin (prompt "> ")
-#   2. Append as a user message
-#   3. Call the LLM; loop:
-#        - extract <tool_call> blocks from the assistant response
-#        - print rationale text + each tool invocation
-#        - execute each tool via Tools.exec
-#        - append <tool_result> as a user message
-#        - call LLM again
-#      Stop when the assistant response has no tool calls.
+#   2. Append a %{role:'user', content: line} message
+#   3. Call LLM.chat → %{content, tool_calls, reasoning}:
+#        - Append %{role:'assistant', content, tool_calls, reasoning}
+#        - If tool_calls is non-empty, execute each in order, append
+#          one %{role:'tool', tool_call_id, content: result} per call
+#        - Loop: re-call LLM with the updated history
+#      Stop when the assistant emits no tool_calls.
 #   4. Back to (1).
+#
+# Structured rule (matches Claude Code's pattern, see
+# /Users/sky/claude-code/src/services/api/claude.ts:2201-2238):
+# tool calls are STRUCTURED content peers to text — they live as a
+# separate `tool_calls` field on the assistant message, all the way
+# through history and back to the API on subsequent turns. No
+# parse → stringify → re-parse cycle, no risk that the model echoing
+# the format in prose gets mis-dispatched as a real tool call.
 
 import LLM
 import Tools
@@ -27,58 +34,27 @@ import Mcp
 
 export [run, run_headless]
 
-# Maximum tool-call rounds per user turn (prevents runaway loops).
+# Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
 
-# Auto-compaction threshold (message count). Raised from 50 because a
-# single turn with one tool call adds ~3 messages (user, assistant-with-
-# tool, tool-result), so 50 fires after only ~16 turns which felt early.
+# Auto-compaction threshold (message count).
 fun compact_threshold() { 120 }
 
 # ------------------------------------------------------------
 # Context budget — token-based, sourced from server usage
 # ------------------------------------------------------------
-# We now budget compaction against REAL prompt_tokens returned by the
-# server's `usage` field on every LLM response, not a char estimate.
-# This matches Claude Code's approach and uses the exact number the
-# model sees internally.
-#
-# Model context window: set via SWARM_CODE_MAX_TOKENS env var. Default
-# 262144 (256K), matching Kimi K2.6's published context window. Override
-# via env var when running against smaller models (Gemma 4 31B = 128000).
-#
-# Compaction trigger: prompt_tokens > (max_tokens - output_reserve -
-# buffer). Claude Code uses a 20k output reserve + 13k buffer, so
-# effective trigger ≈ 84% of max for a 200k model, 97% for 1M. We
-# mirror that with configurable reserves.
-#
-# Env vars:
-#   SWARM_CODE_MAX_TOKENS       — the model's context window (default 262144 = Kimi K2.6)
-#   SWARM_CODE_OUTPUT_RESERVE   — tokens reserved for the response (default 16384 = K2.6 max output)
-#   SWARM_CODE_COMPACT_BUFFER   — extra safety buffer (default 52000)
-#
-# Resulting default trigger: 262144 - 16384 - 52000 = 193760 tokens.
-# Compaction kicks in at ~74% of K2.6's window — leaves headroom for
-# the response plus safety margin against retrieval drift on long runs.
 fun max_tokens_env()      { parse_env_int("SWARM_CODE_MAX_TOKENS",      262144) }
 fun output_reserve_env()  { parse_env_int("SWARM_CODE_OUTPUT_RESERVE",   16384) }
 fun compact_buffer_env()  { parse_env_int("SWARM_CODE_COMPACT_BUFFER",   52000) }
 
-# Effective token budget — compact when prompt_tokens exceeds this.
 fun context_budget_tokens() {
     max_tokens_env() - output_reserve_env() - compact_buffer_env()
 }
 
-# Legacy: char-based budget used ONLY as a fallback on the very first
-# turn of a session before we've seen any usage from the server. Once
-# we have a real prompt_tokens, char estimates are never used again.
 fun context_budget_chars_fallback() {
-    # Char budget roughly matches token budget at 4 chars/token.
     context_budget_tokens() * 4
 }
 
-# Minimal positive-integer env-var parser. Returns fallback if unset
-# or unparseable.
 fun parse_env_int(name, fallback) {
     env = getenv(name)
     if (env == nil) { fallback }
@@ -107,27 +83,19 @@ fun parse_budget_env(s, i, acc, saw_digit) {
     }
 }
 
-# Session file path (for persistence).
 fun session_dir() { getenv("HOME") ++ "/.swarm-code/sessions" }
 
 # ============================================================
 # Crash-recovery journal
 # ============================================================
-# swarm-code panics are exit(1) — uncatchable — and a C-level fault
-# kills the whole VM. No in-process supervisor can save a crashed
-# turn. The ONLY thing that survives is on-disk state, so we journal
-# every message the instant history changes.
-#
 # Layout (~/.swarm-code/sessions/):
-#   journal-<ts>.jsonl  — one ["role","content"] JSON array per line
+#   journal-<ts>.jsonl  — one JSON object per line, the message map
 #   .active             — pointer file holding the live session's
 #                         journal path. Deleted on a clean /quit.
-#                         If it still exists at startup, the last
-#                         session crashed → we replay and resume.
 #
-# The system prompt is NOT journaled (rebuilt fresh every boot).
-# The bin/swc-run supervisor relaunches the binary on abnormal exit;
-# this journal is what lets the relaunched process pick up the thread.
+# The system prompt is NOT journaled. Format v2 writes objects
+# {role, content, tool_calls?, tool_call_id?, reasoning?}; v1 wrote
+# 2-element arrays ["role", "content"] — replay_journal accepts both.
 fun journal_active_ptr() { session_dir() ++ "/.active" }
 
 # Serialize history (minus the system message) to JSONL text.
@@ -138,22 +106,37 @@ fun encode_journal(history) {
 fun encode_journal_loop(msgs, acc) {
     if (length(msgs) == 0) { acc }
     else {
-        entry = hd(msgs)
-        role = elem(entry, 0)
-        content = elem(entry, 1)
+        msg = hd(msgs)
+        role = map_get(msg, 'role')
         if (role == 'system') {
             encode_journal_loop(tl(msgs), acc)
         } else {
-            line = json_encode([to_string(role), content]) ++ "\n"
+            line = json_encode(msg_for_journal(msg)) ++ "\n"
             encode_journal_loop(tl(msgs), acc ++ line)
         }
     }
 }
 
-# Atomically rewrite the journal to match the current in-memory
-# history. Rewrite (not append) so /reset and /compact keep the
-# journal in sync. temp + rename means a crash mid-write can never
-# truncate the real journal — it's all-or-nothing.
+# Convert an in-memory message map to its on-disk JSON shape.
+# Atom role becomes a string; nil/missing optional fields are omitted.
+fun msg_for_journal(msg) {
+    role = map_get(msg, 'role')
+    base = %{
+        role: to_string(role),
+        content: to_string(map_get(msg, 'content'))
+    }
+    tcs = map_get(msg, 'tool_calls')
+    out1 = if (tcs == nil || length(tcs) == 0) { base }
+           else { map_put(base, 'tool_calls', tcs) }
+    tcid = map_get(msg, 'tool_call_id')
+    out2 = if (tcid == nil) { out1 }
+           else { map_put(out1, 'tool_call_id', to_string(tcid)) }
+    reasoning = map_get(msg, 'reasoning')
+    if (reasoning == nil) { out2 }
+    else { map_put(out2, 'reasoning', to_string(reasoning)) }
+}
+
+# Atomically rewrite the journal to match current in-memory history.
 fun journal_sync(opts, history) {
     jp = map_get(opts, 'journal_path')
     if (jp == nil) { 'ok' }
@@ -179,38 +162,65 @@ fun replay_lines(lines, acc) {
         if (string_length(ln) == 0) {
             replay_lines(tl(lines), acc)
         } else {
-            pair = json_decode(ln)
-            if (pair == nil) {
-                replay_lines(tl(lines), acc)
-            } else { if (length(pair) < 2) {
-                replay_lines(tl(lines), acc)
-            } else {
-                role = string_to_role(to_string(hd(pair)))
-                body = hd(tl(pair))
-                replay_lines(tl(lines), list_append(acc, {role, body}))
-            }}
+            parsed = json_decode(ln)
+            if (parsed == nil) { replay_lines(tl(lines), acc) }
+            else {
+                msg = replay_one(parsed)
+                if (msg == nil) { replay_lines(tl(lines), acc) }
+                else { replay_lines(tl(lines), list_append(acc, msg)) }
+            }
         }
     }
 }
 
-# Drop a trailing assistant message that still carries unexecuted
-# `call:` markers — the turn crashed before the tools ran, so the
-# tool_calls have no matching results. Leaving it would desync the
-# native-mode protocol on the next request.
+# Convert a journal-parsed value back into a message map. Accepts
+# both v1 ([role, content] arrays) and v2 ({role, content, ...} maps).
+fun replay_one(parsed) {
+    if (is_list(parsed) == 'true') {
+        # v1 legacy: 2-element array.
+        if (length(parsed) < 2) { nil }
+        else {
+            role = string_to_role(to_string(hd(parsed)))
+            body = hd(tl(parsed))
+            %{role: role, content: to_string(body)}
+        }
+    }
+    else { if (is_map(parsed) == 'true') {
+        role_str = map_get(parsed, 'role')
+        content_v = map_get(parsed, 'content')
+        role_a = string_to_role(to_string(role_str))
+        base = %{
+            role: role_a,
+            content: if (content_v == nil) { "" } else { to_string(content_v) }
+        }
+        tcs = map_get(parsed, 'tool_calls')
+        out1 = if (tcs == nil) { base } else { map_put(base, 'tool_calls', tcs) }
+        tcid = map_get(parsed, 'tool_call_id')
+        out2 = if (tcid == nil) { out1 }
+               else { map_put(out1, 'tool_call_id', to_string(tcid)) }
+        reasoning = map_get(parsed, 'reasoning')
+        if (reasoning == nil) { out2 }
+        else { map_put(out2, 'reasoning', to_string(reasoning)) }
+    } else { nil }}
+}
+
+# Drop a trailing assistant message that has unresolved tool_calls —
+# the prior turn crashed before the tool results were journaled, so
+# the next request would carry orphan tool_calls and the API would
+# reject it (or worse, re-dispatch on the model's next echo).
 fun trim_incomplete(msgs) {
     if (length(msgs) == 0) { msgs }
     else {
         last = hd(take_last(msgs, 1))
-        role = elem(last, 0)
-        content = to_string(elem(last, 1))
-        if (role == 'assistant' && string_contains(content, "\ncall:") == 'true') {
-            drop_last(msgs, 1)
+        role = map_get(last, 'role')
+        if (role == 'assistant') {
+            tcs = map_get(last, 'tool_calls')
+            if (tcs == nil || length(tcs) == 0) { msgs }
+            else { drop_last(msgs, 1) }
         } else { msgs }
     }
 }
 
-# Mark the session cleanly ended — drop the .active pointer so the
-# next launch doesn't think we crashed.
 fun journal_clean(opts) {
     ap = journal_active_ptr()
     if (file_exists(ap) == 'true') { file_delete(ap) }
@@ -219,21 +229,11 @@ fun journal_clean(opts) {
 
 # ------------------------------------------------------------
 # Entry point — called from Main.main once config is ready.
-#
-# This registers the current process as 'main_agent' so the
-# heartbeat, background workers, and reader can all send messages
-# here. Then it spawns the reader process (which forwards stdin as
-# {'user_input', line} messages) and enters the receive-based
-# continuous loop.
-#
-# opts: %{endpoint, model, api_key, cwd, memory_table, bg_table,
-#         heartbeat_table, settings, buddy?, ...}
-# system_prompt_text: assembled system prompt
 # ------------------------------------------------------------
 fun run(opts, system_prompt_text) {
     register('main_agent', self())
 
-    # --- Crash-recovery journal: set up / resume ---
+    # Crash-recovery journal: set up / resume.
     jdir = session_dir()
     shell("mkdir -p " ++ jdir)
     ap = journal_active_ptr()
@@ -248,7 +248,6 @@ fun run(opts, system_prompt_text) {
     resumed = trim_incomplete(resumed_raw)
 
     journal_path = if (length(resumed) > 0) {
-        # Crashed last run — keep appending to the same journal.
         string_trim(prev_ptr)
     } else {
         jp_new = jdir ++ "/journal-" ++ to_string(timestamp()) ++ ".jsonl"
@@ -262,17 +261,14 @@ fun run(opts, system_prompt_text) {
         print("")
         print(UI.grey_text() ++ "  ⏺ resumed crashed session — " ++
               to_string(length(resumed)) ++ " messages recovered" ++ UI.reset())
-        prepend([{'system', system_prompt_text}], resumed)
+        prepend([LLM.new_message_system(system_prompt_text)], resumed)
     } else {
-        [{'system', system_prompt_text}]
+        [LLM.new_message_system(system_prompt_text)]
     }
-    # Normalize the journal to the (possibly trimmed) resumed state.
     journal_sync(opts_journal, history)
 
     reader_pid = Reader.start()
     print("")
-    # Kick off the first prompt — tells reader to draw the box and read.
-    # Messages sent before the target runs `receive` queue in its mailbox.
     if (reader_pid != nil) {
         send(reader_pid, {'draw_and_read'})
     }
@@ -282,24 +278,6 @@ fun run(opts, system_prompt_text) {
 
 # ------------------------------------------------------------
 # Headless entry — `swarm -p "<prompt>"`.
-#
-# Runs ONE task to completion with no Reader, no input box, no
-# banner, then exits. `route_input` -> `run_turn` already recurses
-# through every tool step until the model emits no more tool calls,
-# so this is a real agentic run to task completion, not one turn.
-#
-# Permissions auto-accept: opts.headless gates resolve_permission so
-# an 'ask' tool isn't denied (there's no human/Reader to prompt). An
-# explicit `-p` invocation IS the opt-in to autonomous execution.
-#
-# Journal resume still applies — the agent's prior session carries
-# over across invocations. That's swarm-code's native persistence,
-# and it makes `swarm -p` a drop-in persistent worker for an
-# orchestrator with zero extra plumbing.
-#
-# json_mode 'true' -> emit one final {"status","summary"} line for
-# programmatic callers; otherwise just the streamed work + a plain
-# exit code.
 # ------------------------------------------------------------
 fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     register('main_agent', self())
@@ -328,13 +306,13 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     opts_journal = map_put(opts, 'journal_path', journal_path)
 
     history = if (length(resumed) > 0) {
-        prepend([{'system', system_prompt_text}], resumed)
+        prepend([LLM.new_message_system(system_prompt_text)], resumed)
     } else {
-        [{'system', system_prompt_text}]
+        [LLM.new_message_system(system_prompt_text)]
     }
     journal_sync(opts_journal, history)
 
-    # Headless: auto-accept permissions, no reader_pid in opts.
+    # Auto-accept permissions in headless.
     opts_h = map_put(opts_journal, 'headless', 'true')
 
     final_history = route_input(prompt, history, opts_h)
@@ -345,14 +323,10 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     if (json_mode == 'true') {
         status = if (ok == 'true') { "ok" } else { "error" }
         print(json_encode(%{status: status, summary: last_text}))
-    } else {
-        ""
-    }
-    # main() returning exits 0; sys_exit(1) marks a failed run.
+    } else { "" }
     if (ok == 'true') { "" } else { sys_exit(1) }
 }
 
-# Text of the last assistant message in history, or "" if none.
 fun last_assistant_text(history) {
     last_assistant_loop(history, "")
 }
@@ -360,8 +334,9 @@ fun last_assistant_text(history) {
 fun last_assistant_loop(msgs, acc) {
     if (length(msgs) == 0) { acc }
     else {
-        m = hd(msgs)
-        na = if (elem(m, 0) == 'assistant') { to_string(elem(m, 1)) } else { acc }
+        msg = hd(msgs)
+        role = map_get(msg, 'role')
+        na = if (role == 'assistant') { to_string(map_get(msg, 'content')) } else { acc }
         last_assistant_loop(tl(msgs), na)
     }
 }
@@ -369,13 +344,6 @@ fun last_assistant_loop(msgs, acc) {
 # ------------------------------------------------------------
 # The continuous loop.
 # ------------------------------------------------------------
-# Instead of blocking on read_line, we `receive` messages from:
-#   - Reader process:    {'user_input', line}   {'eof'}
-#   - Heartbeat process: {'heartbeat_tick', count}
-#   - Background workers:{'bg_done', task_id, exit_code, label}
-#
-# `after 15000` fires if nothing happens for 15 seconds — a quiet
-# idle period where we can do background checks.
 fun main_loop(history, opts) {
     next_state = receive {
         {'user_input', line} ->
@@ -392,26 +360,18 @@ fun main_loop(history, opts) {
             on_idle(history, opts)
         }
     }
-    # Journal backstop: persist whenever the event changed history.
-    # A length delta covers appends, compaction, and /reset. Idle
-    # heartbeat ticks leave history untouched and skip the write.
-    # Mid-turn durability is handled by run_turn / execute_all, which
-    # journal after every assistant message and tool result.
     if (length(next_state) != length(history)) {
         journal_sync(opts, next_state)
     }
     main_loop(next_state, opts)
 }
 
-
-# Handle a user_input message: run the turn, return the new history.
 fun handle_user_input_msg(line, history, opts) {
     Log.user_input(line)
-    # Close the input box with the bottom border + footer, then run the turn.
-    UI.input_box_bottom_full(to_string(map_get(opts, 'model')), display_tokens(history, opts), context_budget_tokens())
+    UI.input_box_bottom_full(to_string(map_get(opts, 'model')),
+        display_tokens(history, opts), context_budget_tokens())
     post_input_history = route_input(line, history, opts)
     print("")
-    # Tell reader to draw the next input box and start reading again.
     reader_pid = map_get(opts, 'reader_pid')
     if (reader_pid != nil) {
         send(reader_pid, {'draw_and_read'})
@@ -419,89 +379,57 @@ fun handle_user_input_msg(line, history, opts) {
     post_input_history
 }
 
-# Route input through slash-command handler or LLM turn.
 fun route_input(line, history, opts) {
     trimmed = string_trim(line)
-    if (string_length(trimmed) == 0) {
-        history
-    } else {
-        if (trimmed == "/quit") {
-            handle_eof(history, opts)
-        } else {
-            if (trimmed == "/exit") {
-                handle_eof(history, opts)
-            } else {
-                if (trimmed == "/reset") {
-                    print("\e[2m[history reset]\e[0m")
-                    [hd(history)]
-                } else {
-                    if (string_starts_with(trimmed, "/") == 'true') {
-                        slash_dispatch(trimmed, history, opts)
-                    } else {
-                        Config.run_hooks("UserPromptSubmit", 'user', line, opts)
-                        user_buddy = map_get(opts, 'buddy')
-                        if (user_buddy != nil) {
-                            if (Arthopod.is_addressed(line, user_buddy) == 'true') {
-                                bubble = Arthopod.address_response(user_buddy, line, opts)
-                                Arthopod.render_with_bubble(user_buddy, bubble)
-                            }
-                        }
-                        new_hist = list_append(history, {'user', line})
-                        # Compact BEFORE the turn, not after, so the LLM call
-                        # runs on a slim context instead of burning tokens on
-                        # the bloated history we're about to discard anyway.
-                        pre_turn_hist = if (length(new_hist) > compact_threshold()) {
-                            print("\e[2m[auto-compacting " ++ to_string(length(new_hist)) ++ " messages]\e[0m")
-                            compact_history(new_hist, opts)
-                        } else {
-                            new_hist
-                        }
-                        run_turn(pre_turn_hist, opts, 0)
-                    }
+    if (string_length(trimmed) == 0) { history }
+    else {
+        if (trimmed == "/quit") { handle_eof(history, opts) }
+        else { if (trimmed == "/exit") { handle_eof(history, opts) }
+        else { if (trimmed == "/reset") {
+            print("\e[2m[history reset]\e[0m")
+            [hd(history)]
+        }
+        else { if (string_starts_with(trimmed, "/") == 'true') {
+            slash_dispatch(trimmed, history, opts)
+        }
+        else {
+            Config.run_hooks("UserPromptSubmit", 'user', line, opts)
+            user_buddy = map_get(opts, 'buddy')
+            if (user_buddy != nil) {
+                if (Arthopod.is_addressed(line, user_buddy) == 'true') {
+                    bubble = Arthopod.address_response(user_buddy, line, opts)
+                    Arthopod.render_with_bubble(user_buddy, bubble)
                 }
             }
-        }
+            new_hist = list_append(history, LLM.new_message_user(line))
+            pre_turn_hist = if (length(new_hist) > compact_threshold()) {
+                print("\e[2m[auto-compacting " ++ to_string(length(new_hist)) ++ " messages]\e[0m")
+                compact_history(new_hist, opts)
+            } else { new_hist }
+            run_turn(pre_turn_hist, opts, 0)
+        }}}}
     }
 }
 
-# Heartbeat tick handler — silent by default. Could do proactive
-# work: save state, check bg tasks, self-reflect.
-# Cognitive pulse — the daemon's heartbeat.
-#
-# Every pulse_interval ticks, if daemon mode is on, we inject a short
-# system-level prompt asking the model to assess whether action is needed.
-# The model sees recent history + any pending state and decides:
-#   - "idle" → go back to sleep (no cost, no output)
-#   - take action → call tools, notify user
-#
-# This is NOT a CC Stop Hook (which fires after a turn). This is a
-# timer-driven self-prompt that fires even when the user is AFK.
-# The heartbeat ticks every 2s; we pulse every 30 ticks = ~60s.
+# Heartbeat tick handler — silent unless daemon mode.
 fun pulse_interval() { 30 }
 
 fun on_heartbeat_tick(count, history, opts) {
     daemon = map_get(opts, 'daemon')
-    if (daemon != 'true') {
-        history
-    } else {
-        # Only pulse every Nth tick
+    if (daemon != 'true') { history }
+    else {
         interval = pulse_interval()
         remainder = count - ((count / interval) * interval)
-        if (remainder != 0) {
-            history
-        } else {
-            # Don't pulse if we're already inside a wake chain or a turn
+        if (remainder != 0) { history }
+        else {
             in_wake = map_get(opts, 'in_wake_chain')
             if (in_wake == 'true') { history }
-            else {
-                cognitive_pulse(count, history, opts)
-            }
+            else { cognitive_pulse(count, history, opts) }
         }
     }
 }
 
 fun cognitive_pulse(tick_count, history, opts) {
-    # Gather context for the pulse
     bg_table = map_get(opts, 'bg_table')
     pending_bg = if (bg_table == nil) { "none" }
                  else { Background.list_all(bg_table) }
@@ -524,50 +452,41 @@ fun cognitive_pulse(tick_count, history, opts) {
         "Keep any output VERY brief (1 sentence). Do NOT start major " ++
         "work without user approval."
 
-    # Use chat_silent to avoid streaming pulse deliberation to the terminal.
-    # We only show output if the model decides to act.
-    pulse_msgs = list_append(history, {'user', pulse_msg})
+    pulse_msgs = list_append(history, LLM.new_message_user(pulse_msg))
     wake_opts = map_put(opts, 'in_wake_chain', 'true')
     response = LLM.chat_silent(pulse_msgs, wake_opts)
 
-    if (response == nil) {
-        history
-    } else {
+    if (response == nil) { history }
+    else {
         trimmed = string_trim(to_string(response))
-        # Require an exact "idle" (with optional trailing punctuation /
-        # whitespace) instead of a `startsWith` prefix — otherwise a
-        # legit response like "Idle servers detected; restarting now."
-        # gets swallowed and the action never runs.
         lower = string_lower(trimmed)
         is_idle = if (lower == "idle") { 'true' }
                   else { if (lower == "idle.") { 'true' }
                   else { 'false' }}
-        if (is_idle == 'true') {
-            # Model says nothing to do — stay quiet
-            history
-        } else {
-            # Model wants to act — show a subtle indicator and run the turn
+        if (is_idle == 'true') { history }
+        else {
             print("")
             print("\e[2m[daemon pulse — acting autonomously]\e[0m")
-            with_pulse = list_append(history, {'user', pulse_msg})
-            with_response = list_append(with_pulse, {'assistant', trimmed})
-            # Check if response contains tool calls
-            tool_calls = extract_tool_calls(trimmed)
-            if (length(tool_calls) == 0) {
-                # Just a message, show it
-                print("  " ++ UI.grey_text() ++ trimmed ++ UI.reset())
+            with_pulse = list_append(history, LLM.new_message_user(pulse_msg))
+            # chat_silent returns a string; pulse may have emitted inband
+            # tool markers. Parse them once via LLM.parse_inband_tool_calls.
+            parsed = LLM.parse_inband_tool_calls(trimmed)
+            pulse_prose = to_string(map_get(parsed, 'content'))
+            pulse_tcs = map_get(parsed, 'tool_calls')
+            with_response = list_append(with_pulse,
+                LLM.new_message_assistant(pulse_prose, pulse_tcs, nil))
+            if (length(pulse_tcs) == 0) {
+                print("  " ++ UI.grey_text() ++ pulse_prose ++ UI.reset())
                 print("")
                 with_response
             } else {
-                # Has tool calls — execute them
-                post_exec = execute_all(tool_calls, with_response, wake_opts)
-                post_exec
+                execute_all(pulse_tcs, with_response, wake_opts)
             }
         }
     }
 }
 
-# Background task completion handler — visible notification.
+# Background task completion handler.
 fun on_bg_done(task_id, exit_code, label, history, opts) {
     Log.bg_done(task_id, exit_code, label)
     color = if (exit_code == 0) { UI.brand_color() } else { "\e[31m" }
@@ -576,15 +495,9 @@ fun on_bg_done(task_id, exit_code, label, history, opts) {
           "  \e[2mexit " ++ to_string(exit_code) ++ " · " ++ label ++ "\e[0m")
     print_above("")
 
-    # If autonomy is enabled AND we're not already inside a wake-up chain,
-    # inject the event as a synthetic user message and invoke the LLM so
-    # the model can acknowledge / react / take follow-up action. This is
-    # what makes swarm-code actually autonomous — the model sees background
-    # events and decides whether to speak or act without waiting for user.
     autonomy = map_get(opts, 'autonomy')
     in_wake = map_get(opts, 'in_wake_chain')
     if (autonomy == 'true' && in_wake != 'true') {
-        # Pull a short log preview so the model has context for its decision.
         bg_table = map_get(opts, 'bg_table')
         preview = if (bg_table == nil) { "(no log)" }
                   else {
@@ -606,12 +519,9 @@ fun on_bg_done(task_id, exit_code, label, history, opts) {
             "Do NOT start new long-running work without user approval."
 
         print("\e[2m[autonomy: reacting to bg_done...]\e[0m")
-        with_wake = list_append(history, {'user', wake_msg})
-        # Mark we're in a wake chain so a response that triggers another
-        # bg_done doesn't cascade infinitely.
+        with_wake = list_append(history, LLM.new_message_user(wake_msg))
         wake_opts = map_put(opts, 'in_wake_chain', 'true')
-        after_wake = run_turn(with_wake, wake_opts, 0)
-        after_wake
+        run_turn(with_wake, wake_opts, 0)
     } else {
         print("  \e[38;5;240m⎿\e[0m  \e[38;5;244muse bg_result " ++ task_id ++ " to see output\e[0m")
         print("")
@@ -619,7 +529,7 @@ fun on_bg_done(task_id, exit_code, label, history, opts) {
     }
 }
 
-# EOF / /quit handler — farewell and exit.
+# EOF / /quit handler.
 fun handle_eof(history, opts) {
     bye_b = map_get(opts, 'buddy')
     if (bye_b != nil) {
@@ -627,57 +537,32 @@ fun handle_eof(history, opts) {
     }
     Log.session_end("user_exit")
     Config.run_hooks("Stop", 'session', "{}", opts)
-    # Close MCP server subprocesses before exit — sys_exit(0) below
-    # would otherwise orphan them (they'd reparent to init and linger).
     Mcp.shutdown(map_get(opts, 'mcp_table'))
-    # Clean exit — drop the .active pointer so the next launch doesn't
-    # mistake this for a crash and replay the journal.
     journal_clean(opts)
     sys_exit(0)
     history
 }
 
-# Idle handler — fires when no messages in `after` window. For v1 no
-# visible work; future: summarize recent activity, commit memory.
-fun on_idle(history, opts) {
-    history
-}
+fun on_idle(history, opts) { history }
 
-# Slash-command dispatch. Returns the new history (most commands return
-# it unchanged; /reset, /compact, /resume change it).
+# Slash-command dispatch.
 fun slash_dispatch(cmd, history, opts) {
-    if (cmd == "/help") {
-        show_help()
-        history
-    }
+    if (cmd == "/help") { show_help() ; history }
     else { if (cmd == "/tools") {
         print("available: bash, read, write, edit, multi_edit, glob, grep, todo_write, web_fetch, task, remember, recall, background, bg_status, bg_result, bg_server, bg_tail, bg_kill, sys_stats, heartbeat_status")
         print("browser: browser_launch, browser_navigate, browser_click, browser_type, browser_screenshot, browser_get_text, browser_get_html, browser_evaluate, browser_close")
-        print("swarm: spawn_agent, ask, tell, list_agents, kill, parallel")
         print(UI.grey_text() ++ "MCP tools (if any) are listed by /mcp" ++ UI.reset())
         history
     }
-    else { if (cmd == "/status") {
-        show_status(history, opts)
-        history
-    }
-    else { if (cmd == "/clear") {
-        print_inline("\e[2J\e[H")
-        history
-    }
-    else { if (cmd == "/history") {
-        show_history(history)
-        history
-    }
+    else { if (cmd == "/status") { show_status(history, opts) ; history }
+    else { if (cmd == "/clear") { print_inline("\e[2J\e[H") ; history }
+    else { if (cmd == "/history") { show_history(history) ; history }
     else { if (cmd == "/tokens") {
         tok_count = approx_tokens(history)
         print("approx tokens in history: " ++ to_string(tok_count))
         history
     }
-    else { if (cmd == "/model") {
-        show_model_info(opts)
-        history
-    }
+    else { if (cmd == "/model") { show_model_info(opts) ; history }
     else { if (cmd == "/compact") {
         compacted = compact_history(history, opts)
         print("\e[2m[history compacted: " ++ to_string(length(history)) ++
@@ -699,10 +584,7 @@ fun slash_dispatch(cmd, history, opts) {
             restored
         }
     }
-    else { if (cmd == "/sessions") {
-        list_sessions()
-        history
-    }
+    else { if (cmd == "/sessions") { list_sessions() ; history }
     else { if (cmd == "/todos") {
         todos = Tools.todo_read(opts)
         if (todos == nil) {
@@ -721,14 +603,8 @@ fun slash_dispatch(cmd, history, opts) {
         print("cost: $0.00  (local inference on sushi)")
         history
     }
-    else { if (cmd == "/telemetry") {
-        print(Log.tail_recent(30))
-        history
-    }
-    else { if (cmd == "/stats") {
-        print(Log.summarize())
-        history
-    }
+    else { if (cmd == "/telemetry") { print(Log.tail_recent(30)) ; history }
+    else { if (cmd == "/stats") { print(Log.summarize()) ; history }
     else { if (cmd == "/autonomy") {
         cur = map_get(opts, 'autonomy')
         if (cur == 'true') {
@@ -752,17 +628,13 @@ fun slash_dispatch(cmd, history, opts) {
         history
     }
     else { if (cmd == "/reflect") {
-        # Manual trigger for low-frequency LLM reflection. Feeds recent
-        # history + an instruction to review what happened and suggest
-        # next steps. Adds the reflection as a fresh user message so the
-        # next turn picks it up naturally.
         print("\e[2m[reflecting — this is a separate LLM call, will take a moment]\e[0m")
         reflect_msg =
             "REFLECTION REQUEST: Review the conversation so far. " ++
             "Briefly summarize: (1) what we've done, (2) what's still open, " ++
             "(3) one or two concrete next steps you'd suggest. Be terse. " ++
             "This is a self-review — no tool calls, just prose."
-        with_reflect = list_append(history, {'user', reflect_msg})
+        with_reflect = list_append(history, LLM.new_message_user(reflect_msg))
         run_turn(with_reflect, opts, 0)
     }
     else { if (cmd == "/buddy") {
@@ -778,10 +650,7 @@ fun slash_dispatch(cmd, history, opts) {
         }
         history
     }
-    else { if (cmd == "/mcp") {
-        print(Mcp.list_servers(map_get(opts, 'mcp_table')))
-        history
-    }
+    else { if (cmd == "/mcp") { print(Mcp.list_servers(map_get(opts, 'mcp_table'))) ; history }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
@@ -794,7 +663,6 @@ fun show_help() {
     print("  /status               session info")
     print("  /tools                list available tools")
     print("  /todos                show todo list")
-    print("  /agents               list live subagents (swarm)")
     print("  /mcp                  list MCP servers and their tools")
     print("  /model                show active model")
     print("  /history              print recent messages")
@@ -823,10 +691,6 @@ fun show_status(history, opts) {
     print("  ~tokens  : " ++ to_string(approx_tokens(history)))
 }
 
-# Probe the server's /v1/models endpoint and show what's actually
-# loaded on the host, alongside the client-side limits. Useful for
-# verifying a fresh serving restart took effect (e.g., after
-# switching to multi-GPU tensor-parallel or bumping max context).
 fun show_model_info(opts) {
     endpoint = to_string(map_get(opts, 'endpoint'))
     configured = to_string(map_get(opts, 'model'))
@@ -881,65 +745,44 @@ fun show_history(history) {
 }
 
 fun print_msgs(msgs, i) {
-    if (length(msgs) == 0) {
-        'ok'
-    } else {
-        entry = hd(msgs)
-        role = elem(entry, 0)
-        content = elem(entry, 1)
-        truncated = preview_string(content, 200)
-        print("\e[2m[" ++ to_string(i) ++ "] " ++ to_string(role) ++ ":\e[0m " ++ truncated)
+    if (length(msgs) == 0) { 'ok' }
+    else {
+        msg = hd(msgs)
+        role = map_get(msg, 'role')
+        content = map_get(msg, 'content')
+        truncated = preview_string(to_string(content), 200)
+        tcs = map_get(msg, 'tool_calls')
+        tcs_suffix = if (tcs == nil) { "" }
+                     else { if (length(tcs) == 0) { "" }
+                     else { " \e[38;5;240m[+" ++ to_string(length(tcs)) ++ " tool_calls]\e[0m" }}
+        print("\e[2m[" ++ to_string(i) ++ "] " ++ to_string(role) ++ ":\e[0m " ++
+              truncated ++ tcs_suffix)
         print_msgs(tl(msgs), i + 1)
     }
 }
 
-# Token count for footer display. Prefers the server-reported
-# prompt_tokens from the last LLM response (exact number the model
-# saw) and falls back to a 4-char-per-token estimate on the first
-# turn of a session before we've made any calls.
+# Token count for footer display — prefers server-reported prompt_tokens.
 fun display_tokens(history, opts) {
     last_pt = LLM.last_prompt_tokens(opts)
     if (last_pt != nil) { last_pt }
-    else {
-        total = sum_msg_chars(history, 0)
-        total / 4
-    }
+    else { approx_tokens(history) }
 }
 
-# Legacy char-estimate, kept for the few call sites that don't have
-# opts handy (status commands, etc).
 fun approx_tokens(history) {
-    total = sum_msg_chars(history, 0)
-    total / 4
+    history_chars(history) / 4
 }
 
-fun sum_msg_chars(msgs, acc) {
-    if (length(msgs) == 0) {
-        acc
-    } else {
-        entry = hd(msgs)
-        content = elem(entry, 1)
-        sum_msg_chars(tl(msgs), acc + string_length(content))
-    }
-}
+fun sum_msg_chars(msgs, acc) { history_chars_loop(msgs, acc) }
 
 # ------------------------------------------------------------
-# Compaction — summarize oldest messages via an LLM call, replace
-# them with a single synthetic assistant "summary" message.
+# Compaction — summarize oldest messages, keep system + last 16.
 # ------------------------------------------------------------
 fun compact_history(history, opts) {
-    # Keep system message + last 16 messages untouched. Summarize the rest.
-    # 16 ≈ 5 tool turns (user+assistant+result each). Keeps recent findings
-    # fresh so the model can recall specific values (keys, paths, IPs).
-    if (length(history) < 10) {
-        history
-    } else {
+    if (length(history) < 10) { history }
+    else {
         sys_msg = hd(history)
         rest = tl(history)
         keep_tail = take_last(rest, 16)
-        # Earlier this dropped 8, which meant the same 8 messages
-        # appeared both in the summary AND the kept tail. Use 16 to
-        # match keep_tail so the two slices are disjoint.
         to_summarize = drop_last(rest, 16)
 
         summary_prompt =
@@ -954,32 +797,25 @@ fun compact_history(history, opts) {
             format_for_summary(to_summarize, "")
 
         ask_msgs = [
-            {'system', "You are a concise summarizer."},
-            {'user', summary_prompt}
+            LLM.new_message_system("You are a concise summarizer."),
+            LLM.new_message_user(summary_prompt)
         ]
-        # IMPORTANT: use chat_silent here — compaction is an internal
-        # operation; its output must NOT stream to the user's terminal.
-        # Previously we used LLM.chat which streamed the summary on top
-        # of the user's view, making it look like the assistant replied
-        # to the user with a compaction summary.
         summary = LLM.chat_silent(ask_msgs, opts)
         summary_text = if (summary == nil) {
             "[compaction failed, messages elided]"
-        } else { summary }
+        } else { to_string(summary) }
 
-        synth = {'assistant', "Summary of earlier conversation: " ++ summary_text}
+        synth = LLM.new_message_assistant(
+            "Summary of earlier conversation: " ++ summary_text,
+            nil, nil)
 
-        # Rebuild: system + synth summary + tail
         prepend([sys_msg, synth], keep_tail)
     }
 }
 
 fun take_last(lst, n) {
-    if (length(lst) <= n) {
-        lst
-    } else {
-        take_last(tl(lst), n)
-    }
+    if (length(lst) <= n) { lst }
+    else { take_last(tl(lst), n) }
 }
 
 fun drop_last(lst, n) {
@@ -988,14 +824,10 @@ fun drop_last(lst, n) {
 }
 
 fun take_first(lst, n, acc) {
-    if (n <= 0) {
-        acc
-    } else {
-        if (length(lst) == 0) {
-            acc
-        } else {
-            take_first(tl(lst), n - 1, list_append(acc, hd(lst)))
-        }
+    if (n <= 0) { acc }
+    else {
+        if (length(lst) == 0) { acc }
+        else { take_first(tl(lst), n - 1, list_append(acc, hd(lst))) }
     }
 }
 
@@ -1015,9 +847,7 @@ fun append_all(xs, ys, i, acc) {
 fun append_all_ys(ys, i, acc) {
     if (i < length(ys)) {
         append_all_ys(ys, i + 1, list_append(acc, list_at(ys, i)))
-    } else {
-        acc
-    }
+    } else { acc }
 }
 
 fun list_at(lst, i) {
@@ -1028,41 +858,40 @@ fun list_at(lst, i) {
 fun format_for_summary(msgs, acc) {
     if (length(msgs) == 0) { acc }
     else {
-        entry = hd(msgs)
-        role = elem(entry, 0)
-        content = elem(entry, 1)
-        line = "[" ++ to_string(role) ++ "] " ++ preview_string(content, 500) ++ "\n"
+        msg = hd(msgs)
+        role = map_get(msg, 'role')
+        content = map_get(msg, 'content')
+        tcs = map_get(msg, 'tool_calls')
+        tcs_note = if (tcs == nil) { "" }
+                   else { if (length(tcs) == 0) { "" }
+                   else { " (+" ++ to_string(length(tcs)) ++ " tool_calls)" }}
+        line = "[" ++ to_string(role) ++ "] " ++
+               preview_string(to_string(content), 500) ++ tcs_note ++ "\n"
         format_for_summary(tl(msgs), acc ++ line)
     }
 }
 
 # ------------------------------------------------------------
-# Session persistence — save/load to ~/.swarm-code/sessions/
-# Format: JSON list of [role_string, content] pairs.
+# Session persistence — /save and /resume
+# Format: JSON list of message objects.
 # ------------------------------------------------------------
 fun save_session(history, opts) {
     dir = session_dir()
     shell("mkdir -p " ++ dir)
     ts = to_string(timestamp())
     path = dir ++ "/session-" ++ ts ++ ".json"
-    encoded = encode_history(history)
-    file_write(path, encoded)
+    file_write(path, encode_history(history))
     path
 }
 
 fun encode_history(history) {
-    pairs = history_to_pairs(history, [])
-    json_encode(pairs)
+    json_encode(history_to_objects(history, []))
 }
 
-fun history_to_pairs(msgs, acc) {
+fun history_to_objects(msgs, acc) {
     if (length(msgs) == 0) { acc }
     else {
-        entry = hd(msgs)
-        role = to_string(elem(entry, 0))
-        content = elem(entry, 1)
-        as_pair = [role, content]
-        history_to_pairs(tl(msgs), list_append(acc, as_pair))
+        history_to_objects(tl(msgs), list_append(acc, msg_for_journal(hd(msgs))))
     }
 }
 
@@ -1071,9 +900,8 @@ fun load_latest_session(opts) {
     list_cmd = "ls -t " ++ dir ++ "/session-*.json 2>/dev/null | head -1"
     result = shell(list_cmd)
     out = string_trim(elem(result, 1))
-    if (string_length(out) == 0) {
-        []
-    } else {
+    if (string_length(out) == 0) { [] }
+    else {
         content = file_read(out)
         if (content == nil) { [] }
         else { decode_history(content) }
@@ -1081,19 +909,17 @@ fun load_latest_session(opts) {
 }
 
 fun decode_history(json_str) {
-    pairs = json_decode(json_str)
-    if (pairs == nil) { [] }
-    else { pairs_to_history(pairs, []) }
+    parsed = json_decode(json_str)
+    if (parsed == nil) { [] }
+    else { decode_history_loop(parsed, []) }
 }
 
-fun pairs_to_history(pairs, acc) {
-    if (length(pairs) == 0) { acc }
+fun decode_history_loop(items, acc) {
+    if (length(items) == 0) { acc }
     else {
-        p = hd(pairs)
-        role_str = hd(p)
-        content = hd(tl(p))
-        tup = {string_to_role(role_str), content}
-        pairs_to_history(tl(pairs), list_append(acc, tup))
+        msg = replay_one(hd(items))
+        if (msg == nil) { decode_history_loop(tl(items), acc) }
+        else { decode_history_loop(tl(items), list_append(acc, msg)) }
     }
 }
 
@@ -1101,7 +927,8 @@ fun string_to_role(s) {
     if (s == "system") { 'system' }
     else { if (s == "user") { 'user' }
     else { if (s == "assistant") { 'assistant' }
-    else { 'user' }}}
+    else { if (s == "tool") { 'tool' }
+    else { 'user' }}}}
 }
 
 fun list_sessions() {
@@ -1109,31 +936,36 @@ fun list_sessions() {
     cmd = "ls -t " ++ dir ++ "/session-*.json 2>/dev/null | head -20"
     result = shell(cmd)
     out = elem(result, 1)
-    if (string_length(out) == 0) {
-        print("(no sessions)")
-    } else {
-        print(out)
-    }
+    if (string_length(out) == 0) { print("(no sessions)") }
+    else { print(out) }
 }
 
 # ------------------------------------------------------------
-# One turn: call LLM, handle tool calls, recurse until the
-# assistant produces a response with no tool calls.
-# Returns the updated history.
+# One turn: call LLM, dispatch any tool_calls, recurse until no more
+# tool_calls are emitted. Returns the updated history.
 # ------------------------------------------------------------
-# Sum the character length of every message body in history. Cheap
-# proxy for context size; real tokens are ~4x smaller.
-fun history_chars(history) {
-    history_chars_loop(history, 0)
-}
+fun history_chars(history) { history_chars_loop(history, 0) }
 
 fun history_chars_loop(h, acc) {
     if (length(h) == 0) { acc }
     else {
-        entry = hd(h)
-        content = elem(entry, 1)
-        n = if (content == nil) { 0 } else { string_length(to_string(content)) }
-        history_chars_loop(tl(h), acc + n)
+        msg = hd(h)
+        content = map_get(msg, 'content')
+        c_chars = if (content == nil) { 0 } else { string_length(to_string(content)) }
+        tcs = map_get(msg, 'tool_calls')
+        t_chars = if (tcs == nil) { 0 } else { tcs_chars(tcs, 0) }
+        history_chars_loop(tl(h), acc + c_chars + t_chars)
+    }
+}
+
+# Approximate char count for serialized tool_calls (name + args + overhead).
+fun tcs_chars(tcs, acc) {
+    if (length(tcs) == 0) { acc }
+    else {
+        tc = hd(tcs)
+        name_l = string_length(to_string(map_get(tc, 'name')))
+        args_l = string_length(to_string(map_get(tc, 'arguments')))
+        tcs_chars(tl(tcs), acc + name_l + args_l + 16)
     }
 }
 
@@ -1142,20 +974,11 @@ fun run_turn(history, opts, step) {
         print("\e[33m[warn] max tool steps reached\e[0m")
         history
     } else {
-        # Preflight context budget check. Uses the server-reported
-        # prompt_tokens from the previous LLM response when available
-        # (exact count, same number the model sees) and falls back to
-        # char estimate on the very first turn of a session.
-        #
-        # Trigger matches Claude Code's pattern: max_tokens - output
-        # reserve - safety buffer. Tunable via SWARM_CODE_MAX_TOKENS,
-        # SWARM_CODE_OUTPUT_RESERVE, SWARM_CODE_COMPACT_BUFFER env vars.
         last_pt = LLM.last_prompt_tokens(opts)
         budget_t = context_budget_tokens()
         over_budget = if (last_pt != nil) {
             if (last_pt > budget_t) { 'true' } else { 'false' }
         } else {
-            # First turn, no server stats yet — char fallback.
             if (history_chars(history) > context_budget_chars_fallback()) { 'true' } else { 'false' }
         }
         working_hist = if (over_budget == 'true') {
@@ -1169,32 +992,33 @@ fun run_turn(history, opts, step) {
             compact_history(history, opts)
         } else { history }
 
-        content = LLM.chat(working_hist, opts)
+        result = LLM.chat(working_hist, opts)
         debug_env = getenv("SWARM_CODE_DEBUG")
-        if (debug_env == "1" && content != nil) {
-            print("\e[2m[debug raw content]\n" ++ content ++ "\n[/debug]\e[0m")
+        if (debug_env == "1" && result != nil) {
+            print("\e[2m[debug result map keys: " ++
+                  to_string(map_keys(result)) ++ "]\e[0m")
         }
-        if (content == nil) {
+        if (result == nil) {
             print("\e[31m[error] llm call failed\e[0m")
             working_hist
         } else {
-            with_assistant = list_append(working_hist, {'assistant', content})
+            content = to_string(map_get(result, 'content'))
+            tool_calls_v = map_get(result, 'tool_calls')
+            reasoning = map_get(result, 'reasoning')
+            tool_calls = if (tool_calls_v == nil) { [] } else { tool_calls_v }
+
+            asst_msg = LLM.new_message_assistant(content, tool_calls, reasoning)
+            with_assistant = list_append(working_hist, asst_msg)
             journal_sync(opts, with_assistant)
-            tool_calls = extract_tool_calls(content)
+
             if (length(tool_calls) == 0) {
                 visible = string_trim(content)
                 if (string_length(visible) == 0) {
-                    # Empty response — distinguish context blowup from
-                    # a genuine "model had nothing to say".
                     last_pt2 = LLM.last_prompt_tokens(opts)
                     if (last_pt2 != nil && last_pt2 > context_budget_tokens() - 2000) {
                         print("  \e[38;5;240m(empty response — context near budget at " ++
                               to_string(last_pt2) ++ " tokens. Try /reset or a tighter query.)\e[0m")
                     } else {
-                        # Reasoning-model failure mode: model emitted only
-                        # `reasoning_content` and no spoken `content`. The
-                        # streamed thinking is already visible above, so
-                        # tell the user that's what happened — not "rephrase".
                         prior_reasoning = LLM.last_reasoning(opts)
                         if (prior_reasoning != nil) {
                             r_chars = string_length(to_string(prior_reasoning))
@@ -1217,8 +1041,6 @@ fun run_turn(history, opts, step) {
 }
 
 # Per-tool user-facing args formatter — matches CC's renderToolUseMessage.
-# For bash show the command, for read/write/edit show the path, etc.
-# (Each branch uses unique var names to avoid sw's cross-branch scoping quirk.)
 fun format_tool_args(name, args_map, args_raw) {
     if (name == 'bash') {
         b_cmd = map_get(args_map, 'command')
@@ -1336,23 +1158,15 @@ fun format_tool_args(name, args_map, args_raw) {
     else { preview_string(args_raw, 100) }}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
-# Helper used by format_tool_args to accept either 'path' or 'file_path'
 fun resolve_path_key(args_map) {
     rp = map_get(args_map, 'path')
     if (rp != nil) { rp } else { map_get(args_map, 'file_path') }
 }
 
-# Dispatch a tool call. Two families:
-#   - 'task'         → in-process synchronous subagent (Claude-Code style).
-#                      The single agent primitive. Model issues 2-3 task calls
-#                      in one message for parallel work; execute_all runs them
-#                      one at a time (sequential but correct — no orchestrator,
-#                      no message-storm crash). Subagents are ephemeral: they
-#                      run to completion, return the result, gone. Recursive
-#                      task-from-inside-subagent is banned to avoid fork-bombs.
-#   - everything else → Tools.exec, run in an isolated worker process
-#                       (see exec_tool_isolated) so a panicking tool can't
-#                       take down the REPL.
+# Dispatch a tool call. `task` runs synchronously in-process; browser
+# tools run inline so their CDP/WS handles persist; everything else
+# runs in an isolated linked worker so a panicking tool can't kill
+# the REPL.
 fun dispatch_tool(name, args, opts) {
     if (name == 'task') {
         if (map_get(opts, 'is_subagent') == 'true') {
@@ -1360,9 +1174,6 @@ fun dispatch_tool(name, args, opts) {
         } else { handle_task_tool(args, opts) }
     }
     else {
-        # Browser tools hold a persistent CDP/WebSocket connection in
-        # browser_table; a throwaway worker process would orphan it, so
-        # they run inline. Everything else runs isolated.
         if (string_starts_with(to_string(name), "browser_") == 'true') {
             Tools.exec(name, args, opts)
         } else {
@@ -1372,17 +1183,9 @@ fun dispatch_tool(name, args, opts) {
 }
 
 # ------------------------------------------------------------
-# Isolated tool execution
+# Isolated tool execution — short-lived linked worker process so a
+# tool panic stays scoped to the worker.
 # ------------------------------------------------------------
-# A tool is plain sw code, and a bug in it — or a builtin it calls on
-# bad data (elem on a non-tuple, hd of [], a divide by zero) — can
-# panic. panic is uncatchable in-process: run inside the main agent
-# process it unwinds all the way out and kills the whole REPL.
-#
-# So Tools.exec tools run in a short-lived linked worker process. If
-# the tool panics, only the worker dies; we trap the {'EXIT', ...}
-# signal and hand the model an error string it can react to — exactly
-# like any other failed tool call — instead of the session crashing.
 fun exec_tool_isolated(name, args, opts) {
     trap_exit('true')
     w = spawn(tool_worker(self(), name, args, opts))
@@ -1390,25 +1193,15 @@ fun exec_tool_isolated(name, args, opts) {
     collect_tool_result(name, nil)
 }
 
-# Worker process body: run the tool, ship the result home, exit.
 fun tool_worker(parent, name, args, opts) {
     result = Tools.exec(name, args, opts)
     send(parent, {'tool_done', result})
 }
 
-# Collect from the worker. It emits at most one {'tool_done', result}
-# and then — being linked — always an {'EXIT', _, reason} when it
-# exits, normally or by panic. We loop until that EXIT (the last thing
-# it can ever send), so nothing is stranded in the mailbox.
 fun collect_tool_result(name, pending) {
     receive {
         {'tool_done', result} -> collect_tool_result(name, result)
         {'EXIT', _, ex_reason} ->
-            # A tool_done means the tool produced a result — success,
-            # whatever the worker's exit reason turns out to be. Only
-            # an EXIT with no result behind it is a real crash; then
-            # ex_reason is the panic message (or a bare code if the
-            # worker died before we managed to link it).
             if (pending == nil) { tool_crash_msg(name, ex_reason) }
             else { pending }
     }
@@ -1420,17 +1213,8 @@ fun tool_crash_msg(name, reason) {
 }
 
 # ------------------------------------------------------------
-# Subagent via the Task tool
+# Subagent via the Task tool — synchronous in-process loop.
 # ------------------------------------------------------------
-# Matches Claude Code's Task tool: spawn a subagent with a focused
-# prompt, run it to completion, return its final text response.
-#
-# Why this fits swarmrt: the runtime is built for spawn + receive.
-# v1 runs the subagent synchronously in-process; a later version can
-# flip to `spawn` for parallel subagents (swarmrt does up to 100K
-# concurrent processes at ~100ns spawn cost).
-#
-# args: {"description": "...", "prompt": "...", "subagent_type": "explore|bash|general"}
 fun handle_task_tool(args, opts) {
     prompt = map_get(args, 'prompt')
     subtype_opt = map_get(args, 'subagent_type')
@@ -1440,9 +1224,10 @@ fun handle_task_tool(args, opts) {
         "error: task tool requires a 'prompt' argument"
     } else {
         sub_sys = subagent_system_prompt(stype)
-        sub_history = [{'system', sub_sys}, {'user', prompt}]
-        # Mark the subagent's opts so dispatch_tool refuses any nested
-        # `task` call from inside this subagent — no fork-bombs.
+        sub_history = [
+            LLM.new_message_system(sub_sys),
+            LLM.new_message_user(prompt)
+        ]
         sub_opts = map_put(opts, 'is_subagent', 'true')
         result = run_subagent_loop(sub_history, sub_opts, 0)
         "[subagent:" ++ stype ++ "]\n" ++ result
@@ -1453,8 +1238,7 @@ fun subagent_max_steps() { 15 }
 
 fun subagent_system_prompt(stype) {
     base = "You are a focused subagent spawned from swarm-code for a single " ++
-           "task. Use tools as needed, then return a concise final answer. " ++
-           "Call tools with: call:name{\"arg\":\"value\"}"
+           "task. Use tools as needed, then return a concise final answer."
     if (stype == "explore") {
         base ++ "\n\nAllowed tools: read, glob, grep. Do NOT call bash, write, " ++
                 "edit, multi_edit, or web_fetch. Your job is to survey the " ++
@@ -1474,15 +1258,19 @@ fun run_subagent_loop(history, opts, step) {
     if (step >= subagent_max_steps()) {
         "[subagent hit max steps without final answer]"
     } else {
-        content = LLM.chat(history, opts)
-        if (content == nil) {
+        result = LLM.chat(history, opts)
+        if (result == nil) {
             "[subagent llm call failed]"
         } else {
-            tool_calls = extract_tool_calls(content)
+            content = to_string(map_get(result, 'content'))
+            tcs_v = map_get(result, 'tool_calls')
+            reasoning = map_get(result, 'reasoning')
+            tool_calls = if (tcs_v == nil) { [] } else { tcs_v }
             if (length(tool_calls) == 0) {
-                strip_tool_blocks(content)
+                content
             } else {
-                with_assistant = list_append(history, {'assistant', content})
+                asst = LLM.new_message_assistant(content, tool_calls, reasoning)
+                with_assistant = list_append(history, asst)
                 post_tools = subagent_exec_all(tool_calls, with_assistant, opts)
                 run_subagent_loop(post_tools, opts, step + 1)
             }
@@ -1491,69 +1279,62 @@ fun run_subagent_loop(history, opts, step) {
 }
 
 fun subagent_exec_all(tool_calls, history, opts) {
-    if (length(tool_calls) == 0) {
-        history
-    } else {
+    if (length(tool_calls) == 0) { history }
+    else {
         tc = hd(tool_calls)
-        name = elem(tc, 0)
-        args_map = elem(tc, 1)
-        # Subagents skip permission prompts and hooks to stay non-interactive.
-        sub_result = dispatch_tool(name, args_map, opts)
-        wrapped = "<tool_result>\n" ++ sub_result ++ "\n</tool_result>"
-        new_hist = list_append(history, {'user', wrapped})
+        id = to_string(map_get(tc, 'id'))
+        name_str = to_string(map_get(tc, 'name'))
+        name_atom = string_to_atom(name_str)
+        args_raw = to_string(map_get(tc, 'arguments'))
+        args_map = json_decode(args_raw)
+        args_map_safe = if (args_map == nil) { map_new() } else { args_map }
+        sub_result = dispatch_tool(name_atom, args_map_safe, opts)
+        tool_msg = LLM.new_message_tool(id, sub_result)
+        new_hist = list_append(history, tool_msg)
         subagent_exec_all(tl(tool_calls), new_hist, opts)
     }
 }
 
-# Execute each tool call in sequence, appending results to history.
-# opts carries session state (todos_table, cwd, permissions, settings, ...).
-#
-# Permission + hook flow per tool:
-#   1. check_permission → allow | deny | ask
-#   2. If ask: prompt user, cache decision in perms_table
-#   3. If denied: append a "permission denied" tool_result, skip hooks
-#   4. Run PreToolUse hooks → if any block, append "blocked by hook"
-#   5. Execute the tool
-#   6. Run PostToolUse hooks (not blocking)
+# Execute each structured tool_call in sequence, appending a
+# role:'tool' result message for each. opts carries session state.
 fun execute_all(tool_calls, history, opts) {
-    if (length(tool_calls) == 0) {
-        history
-    } else {
+    if (length(tool_calls) == 0) { history }
+    else {
         tc = hd(tool_calls)
-        name = elem(tc, 0)
-        args_map = elem(tc, 1)
-        args_raw = elem(tc, 2)
+        id = to_string(map_get(tc, 'id'))
+        name_str = to_string(map_get(tc, 'name'))
+        name_atom = string_to_atom(name_str)
+        args_raw = to_string(map_get(tc, 'arguments'))
+        args_map = json_decode(args_raw)
+        args_map_safe = if (args_map == nil) { map_new() } else { args_map }
 
-        UI.tool_header(name, format_tool_args(name, args_map, args_raw))
-        Log.tool_call(name, args_raw)
+        UI.tool_header(name_atom, format_tool_args(name_atom, args_map_safe, args_raw))
+        Log.tool_call(name_atom, args_raw)
 
-        # Permission gate.
-        decision = resolve_permission(name, args_map, opts)
+        decision = resolve_permission(name_atom, args_map_safe, opts)
         if (decision == 'deny') {
-            denial = "error: permission denied for tool '" ++ to_string(name) ++ "'"
+            denial = "error: permission denied for tool '" ++ name_str ++ "'"
             print("\e[31m" ++ denial ++ "\e[0m")
-            hist_denied = list_append(history, {'user', "<tool_result>\n" ++ denial ++ "\n</tool_result>"})
+            hist_denied = list_append(history, LLM.new_message_tool(id, denial))
             journal_sync(opts, hist_denied)
             execute_all(tl(tool_calls), hist_denied, opts)
         } else {
-            # PreToolUse hooks.
-            pre = Config.run_hooks("PreToolUse", name, args_raw, opts)
+            pre = Config.run_hooks("PreToolUse", name_atom, args_raw, opts)
             if (pre == 'block') {
-                blocked = "error: tool '" ++ to_string(name) ++ "' blocked by PreToolUse hook"
+                blocked = "error: tool '" ++ name_str ++ "' blocked by PreToolUse hook"
                 print("\e[31m" ++ blocked ++ "\e[0m")
-                hist_blocked = list_append(history, {'user', "<tool_result>\n" ++ blocked ++ "\n</tool_result>"})
+                hist_blocked = list_append(history, LLM.new_message_tool(id, blocked))
                 journal_sync(opts, hist_blocked)
                 execute_all(tl(tool_calls), hist_blocked, opts)
             } else {
-                result = dispatch_tool(name, args_map, opts)
+                result = dispatch_tool(name_atom, args_map_safe, opts)
                 UI.tool_result(result)
                 had_err = if (string_starts_with(result, "error:") == 'true') { 'true' } else { 'false' }
-                Log.tool_result(name, string_length(result), had_err)
+                Log.tool_result(name_atom, string_length(result), had_err)
 
-                Config.run_hooks("PostToolUse", name, args_raw, opts)
+                Config.run_hooks("PostToolUse", name_atom, args_raw, opts)
 
-                wrapped = "<tool_result>\n" ++ result ++ "\n</tool_result>"
-                hist_ok = list_append(history, {'user', wrapped})
+                hist_ok = list_append(history, LLM.new_message_tool(id, result))
                 journal_sync(opts, hist_ok)
                 execute_all(tl(tool_calls), hist_ok, opts)
             }
@@ -1561,23 +1342,15 @@ fun execute_all(tool_calls, history, opts) {
     }
 }
 
-# Resolve a permission, possibly prompting the user. Caches 'ask' answers
-# in opts.perms_table so the same tool+action isn't asked twice per session.
-#
-# The prompt is delegated to the Reader process via {'permission_ask',
-# prompt, reply_pid} — Reader is the ONLY process that's allowed to call
-# read_line, so there's no race between its main-input read_line and a
-# concurrent permission read_line. We wait for {'permission_answer', ans}
-# back before returning.
+# ------------------------------------------------------------
+# Permission resolution. 'ask' is delegated to the Reader process —
+# the sole owner of read_line, preventing stdin races.
+# ------------------------------------------------------------
 fun resolve_permission(name, args, opts) {
     raw = Config.check_permission(name, args, opts)
     if (raw == 'allow') { 'allow' }
     else { if (raw == 'deny') { 'deny' }
     else {
-        # 'ask' — headless mode has no human/Reader to prompt, so it
-        # auto-accepts. An explicit `swarm -p` IS the opt-in to
-        # autonomous execution (mirrors `claude -p --dangerously-
-        # skip-permissions`). Interactive mode prompts as before.
         headless = map_get(opts, 'headless')
         if (headless == 'true') { 'allow' }
         else {
@@ -1593,11 +1366,6 @@ fun resolve_permission(name, args, opts) {
     }}
 }
 
-# Delegate the permission prompt to the Reader process via the
-# interactive arrow-key picker (matching Claude Code's UX). Reader
-# renders the choices, handles up/down + Enter + Esc + 1-9 shortcuts,
-# and sends back the selected index. Nested selective receive lets
-# other messages (heartbeat, bg_done) wait in the mailbox.
 fun ask_via_reader(name, opts, table, cache_key) {
     reader_pid = map_get(opts, 'reader_pid')
     if (reader_pid == nil) { 'deny' }
@@ -1617,9 +1385,6 @@ fun ask_via_reader(name, opts, table, cache_key) {
     }
 }
 
-# Map the picker index back to an allow/deny decision. -1 = cancelled
-# (Esc), treated as deny. 0 = Yes once. 1 = Yes + cache for session.
-# 2 = No.
 fun interpret_picker(idx, table, cache_key) {
     if (idx == 0) { 'allow' }
     else { if (idx == 1) {
@@ -1629,171 +1394,11 @@ fun interpret_picker(idx, table, cache_key) {
     else { 'deny' }}
 }
 
-# ------------------------------------------------------------
-# Tool-call extraction: scan content for <tool_call>{...}</tool_call>
-# blocks. Returns a list of {name_atom, args_map, raw_json} tuples.
-# ------------------------------------------------------------
-fun extract_tool_calls(content) {
-    # Primary: Gemma 4 native call:name{json} via C builtin.
-    native = parse_gemma_calls(content)
-    native_converted = convert_native_calls(native, [])
-    if (length(native_converted) > 0) { native_converted }
-    else {
-        # Fallback: <tool_call>{...}</tool_call> XML wrapper (legacy/other models).
-        extract_loop(content, [])
-    }
-}
-
-# Convert parse_gemma_calls output [{name_atom, args_map}, ...] to the
-# standard [{name_atom, args_map, raw_json}, ...] format the executor expects.
-fun convert_native_calls(calls, acc) {
-    if (length(calls) == 0) { acc }
-    else {
-        tc = hd(calls)
-        name = elem(tc, 0)
-        args = elem(tc, 1)
-        raw = json_encode(args)
-        converted = {name, args, raw}
-        convert_native_calls(tl(calls), list_append(acc, converted))
-    }
-}
-
-fun extract_loop(content, acc) {
-    if (string_contains(content, "<tool_call>") == 'false') {
-        acc
-    } else {
-        block = extract_between(content, "<tool_call>", "</tool_call>")
-        if (block == nil) {
-            acc
-        } else {
-            parsed = parse_tool_block(block)
-            new_acc = if (parsed == nil) { acc } else { list_append(acc, parsed) }
-            rest = after_tag(content, "</tool_call>")
-            extract_loop(rest, new_acc)
-        }
-    }
-}
-
-# (rescue_native_calls removed — replaced by C builtin parse_gemma_calls)
-
-# Parse a single block (the raw JSON string inside the tags) into a
-# {name_atom, args_map, raw_json_string} tuple. Returns nil on failure.
-#
-# Defensive: accepts multiple common arg key names (arguments/args/parameters/
-# input) and falls back to top-level keys if the arguments object is missing,
-# since Gemma 4 occasionally flattens simple calls.
-fun parse_tool_block(block) {
-    trimmed = string_trim(block)
-    decoded = json_decode(trimmed)
-    if (decoded == nil) {
-        nil
-    } else {
-        name_str = map_get(decoded, 'name')
-        if (name_str == nil) {
-            nil
-        } else {
-            # Try multiple key names for the arguments object.
-            args_from_arguments = map_get(decoded, 'arguments')
-            args_from_args = map_get(decoded, 'args')
-            args_from_params = map_get(decoded, 'parameters')
-            args_from_input = map_get(decoded, 'input')
-            chosen = if (args_from_arguments != nil) { args_from_arguments }
-                     else { if (args_from_args != nil) { args_from_args }
-                     else { if (args_from_params != nil) { args_from_params }
-                     else { if (args_from_input != nil) { args_from_input }
-                     else { nil }}}}
-
-            # If still nothing, flatten: strip known meta keys, pass the rest as args.
-            flat_args = if (chosen == nil) { flatten_top_level(decoded) } else { chosen }
-
-            raw_json = if (flat_args == nil) { "{}" } else { json_encode(flat_args) }
-            resolved_args = if (flat_args == nil) { map_new() } else { flat_args }
-            {string_to_atom(name_str), resolved_args, raw_json}
-        }
-    }
-}
-
-# Build a map from decoded top-level keys minus the metadata ones (name/type/id).
-# This handles calls like {"name":"bash","command":"ls"} where args aren't nested.
-fun flatten_top_level(decoded) {
-    keys = map_keys(decoded)
-    vals = map_values(decoded)
-    flatten_filter(keys, vals, map_new())
-}
-
-fun flatten_filter(keys, vals, acc) {
-    if (length(keys) == 0) {
-        if (length(map_keys(acc)) == 0) { nil } else { acc }
-    } else {
-        k = hd(keys)
-        ks = to_string(k)
-        skip = if (ks == "name") { 'true' }
-               else { if (ks == "type") { 'true' }
-               else { if (ks == "id") { 'true' }
-               else { 'false' }}}
-        new_acc = if (skip == 'true') { acc } else { map_put(acc, k, hd(vals)) }
-        flatten_filter(tl(keys), tl(vals), new_acc)
-    }
-}
-
-# Helper: find substring between two markers. Returns nil if either is missing.
-fun extract_between(s, start_tag, end_tag) {
-    if (string_contains(s, start_tag) == 'false') {
-        nil
-    } else {
-        after_start = after_tag(s, start_tag)
-        if (string_contains(after_start, end_tag) == 'false') {
-            nil
-        } else {
-            before_end(after_start, end_tag)
-        }
-    }
-}
-
-# Return everything after the first occurrence of `tag`.
-# Uses string_replace with a unique marker because string_sub needs an index
-# and we don't have string_find. Cute hack: replace tag with a marker, then
-# split on marker.
-fun after_tag(s, tag) {
-    marker = "\x01\x02SWMARK\x02\x01"
-    replaced = string_replace(s, tag, marker)
-    parts = string_split(replaced, marker)
-    if (length(parts) < 2) {
-        ""
-    } else {
-        hd(tl(parts))
-    }
-}
-
-# Return everything BEFORE the first occurrence of `tag` in `s`.
-fun before_end(s, tag) {
-    marker = "\x01\x02SWMARK\x02\x01"
-    replaced = string_replace(s, tag, marker)
-    parts = string_split(replaced, marker)
-    hd(parts)
-}
-
-# Rationale = text before the first <tool_call>.
-fun rationale_prefix(content) {
-    if (string_contains(content, "<tool_call>") == 'false') {
-        content
-    } else {
-        before_end(content, "<tool_call>")
-    }
-}
-
-# Strip all <tool_call>...</tool_call> blocks from content.
-fun strip_tool_blocks(content) {
-    if (string_contains(content, "<tool_call>") == 'false') {
-        content
-    } else {
-        prefix = before_end(content, "<tool_call>")
-        tail_part = after_tag(content, "</tool_call>")
-        strip_tool_blocks(prefix ++ tail_part)
-    }
-}
-
-# Convert a string value to an atom (for tool name dispatch).
+# Convert tool-name string → atom. Used by execute_all when iterating
+# structured tool_calls (which carry name as string) to dispatch into
+# Tools.exec / dispatch_tool (which compare against atoms).
+# Unknown strings return the string as-is so MCP names (mcp__*) and
+# any future tools still resolve.
 fun string_to_atom(s) {
     if (s == "bash") { 'bash' }
     else { if (s == "read") { 'read' }
@@ -1824,19 +1429,12 @@ fun string_to_atom(s) {
     else { if (s == "code_search") { 'code_search' }
     else { if (s == "log_wait") { 'log_wait' }
     else { if (s == "file_watch") { 'file_watch' }
-    # Unrecognized name → return the raw string (not 'unknown'). This
-    # lets MCP tool names (mcp__server__tool) survive the XML-inband
-    # path: Tools.exec checks the mcp__ prefix on to_string(name), and
-    # a genuinely-unknown tool still resolves to "error: unknown tool".
     else { s }
     }}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # Truncate string for inline preview.
 fun preview_string(s, cap) {
-    if (string_length(s) <= cap) {
-        s
-    } else {
-        string_sub(s, 0, cap) ++ " ..."
-    }
+    if (string_length(s) <= cap) { s }
+    else { string_sub(s, 0, cap) ++ " ..." }
 }

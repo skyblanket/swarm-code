@@ -25,10 +25,11 @@ export [system_prompt]
 fun system_prompt(cwd, tool_format) {
     protocol_section = if (tool_format == "native") {
         "\n\n=== TOOL USE ===\n" ++
-        "You are provided with function tools in the `tools` array of this " ++
-        "request. When you need to take an action, emit a structured tool_call — " ++
-        "do NOT write `call:NAME{...}` text in your content, that's a legacy " ++
-        "format for other models. Do the work, don't narrate it.\n\n" ++
+        "Function tools are provided via this request's `tools` array. When " ++
+        "you need to take an action, emit a structured tool_call — your " ++
+        "harness only executes tool_calls that arrive on that channel, never " ++
+        "anything embedded as text in your content. Do the work, don't " ++
+        "narrate it.\n\n" ++
         "If you say \"let me do X\" you must emit the tool_call in the same " ++
         "response. Never end a turn with announce-only prose."
     } else {
@@ -53,7 +54,7 @@ fun environment_section(cwd) {
     "Working directory: " ++ cwd ++ "\n" ++
     "Platform: " ++ to_string(getenv("OSTYPE")) ++ " (" ++ detect_platform() ++ ")\n" ++
     "Shell: /bin/sh via the bash tool\n" ++
-    "Context window: 128K tokens (compaction at 100K)"
+    "Context window: configured per model — use /model to see the active budget."
 }
 
 fun detect_platform() {

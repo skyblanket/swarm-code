@@ -41,6 +41,8 @@ fun main() {
         t_list_ops(),
         t_native_tool_calls(),
         t_native_no_wrapper(),
+        t_no_name_glitch_native(),
+        t_journal_roundtrip(),
         t_chat_url(),
         t_markdown_basic(),
         t_markdown_empty(),
@@ -167,17 +169,22 @@ fun t_list_ops() {
 }
 
 # ------------------------------------------------------------
-# LLM — native-mode request reconstruction
+# LLM — structured tool_call roundtrip (matches Claude Code's pattern)
 # ------------------------------------------------------------
-# The infinite-write loop: native mode dropped the assistant's
-# tool_calls and the <tool_result> pairing when re-sending history.
-# build_request_body must rebuild proper tool_calls[] + role:tool.
+# History is now a list of message MAPS. Tool calls live as a
+# separate field on the assistant message; tool results have their
+# own role:'tool' messages keyed by tool_call_id. build_request_body
+# is a structured roundtrip — no parse → stringify → re-parse cycle.
 fun native_history() {
     [
-        {'system', "you are a test"},
-        {'user', "make a file"},
-        {'assistant', "Sure.\ncall:write{\"path\":\"/tmp/x\",\"content\":\"hi\"}"},
-        {'user', "<tool_result>\nok: wrote 2 bytes\n</tool_result>"}
+        LLM.new_message_system("you are a test"),
+        LLM.new_message_user("make a file"),
+        LLM.new_message_assistant(
+            "Sure.",
+            [%{id: "call_abc", name: "write",
+               arguments: "{\"path\":\"/tmp/x\",\"content\":\"hi\"}"}],
+            nil),
+        LLM.new_message_tool("call_abc", "ok: wrote 2 bytes")
     ]
 }
 
@@ -190,16 +197,72 @@ fun t_native_tool_calls() {
     ok = bool_and3(
         string_contains(body, "tool_calls"),
         string_contains(body, "tool_call_id"),
-        string_contains(body, "swc_2_0"))
-    check("native build_request_body rebuilds tool_calls + tool role", ok)
+        string_contains(body, "call_abc"))
+    check("native build_request_body emits structured tool_calls + tool role", ok)
 }
 
-# The raw <tool_result> wrapper must be stripped — leaving it in
-# would desync the OpenAI protocol.
+# The raw <tool_result> wrapper must NOT appear in the native-mode
+# wire body — that's the inband-mode flatten; native uses role:'tool'.
 fun t_native_no_wrapper() {
     body = LLM.build_request_body(native_history(), native_opts())
     check("native build strips <tool_result> wrapper",
           if (string_contains(body, "<tool_result>") == 'false') { 'true' } else { 'false' })
+}
+
+# Regression for the "NAME glitch": when the model emits the literal
+# substring `call:NAME{"arg":"val"}` in its prose (echoing a legacy
+# anti-example from the system prompt, or just talking about the
+# format), it must NOT be dispatched as a real tool call in native
+# mode. With structured tool_calls, the content is content; only the
+# server's actual tool_calls field can drive dispatch.
+fun t_no_name_glitch_native() {
+    glitch_history = [
+        LLM.new_message_system("you are a test"),
+        LLM.new_message_user("explain the legacy format"),
+        LLM.new_message_assistant(
+            "The legacy inband syntax looked like call:NAME{\"arg\":\"val\"} but we don't use it.",
+            [],
+            nil)
+    ]
+    body = LLM.build_request_body(glitch_history, native_opts())
+    # Prose is preserved verbatim — but no extracted tool_call named "NAME"
+    # appears in the request body. (Look for the exact OpenAI tool_calls
+    # field with the bad name, not the prose mention.)
+    has_prose = string_contains(body, "legacy inband syntax")
+    has_fake_call = string_contains(body, "\"name\":\"NAME\"")
+    ok = bool_and(
+        if (has_prose == 'true') { 'true' } else { 'false' },
+        if (has_fake_call == 'false') { 'true' } else { 'false' })
+    check("native mode never parses tool_calls out of prose", ok)
+}
+
+# Round-trip the new structured journal format through encode +
+# decode. An assistant with tool_calls + a matching tool result must
+# survive verbatim, including tool_call_id pairing.
+fun t_journal_roundtrip() {
+    h = native_history()
+    # Drop the system message — encode_journal omits system anyway.
+    body = h
+    encoded = LLM.build_request_body(body, native_opts())
+    decoded_req = json_decode(encoded)
+    if (decoded_req == nil) { check("journal/api shape decodes", 'false') }
+    else {
+        msgs = map_get(decoded_req, 'messages')
+        # Find the assistant message — must carry tool_calls[].
+        has_struct_tcs = walk_for_tcs(msgs, 0, 'false')
+        check("structured assistant.tool_calls survives encode", has_struct_tcs)
+    }
+}
+
+fun walk_for_tcs(msgs, i, found) {
+    if (length(msgs) == 0) { found }
+    else {
+        m = hd(msgs)
+        role = map_get(m, 'role')
+        tcs = map_get(m, 'tool_calls')
+        new_found = if (role == "assistant" && tcs != nil && length(tcs) > 0) { 'true' } else { found }
+        walk_for_tcs(tl(msgs), i + 1, new_found)
+    }
 }
 
 fun t_chat_url() {

@@ -7,71 +7,95 @@ import ToolSchemas
 # LLM — OpenAI-compatible chat completions client
 # ============================================================
 #
-# Two tool-call wire formats are supported, selected per-call via
-# opts.tool_format:
+# Returns structured %{content, tool_calls, reasoning} maps — never
+# stringifies tool calls into the assistant prose. This is the rule
+# Claude Code follows (see /Users/sky/claude-code/src/utils/messages.ts
+# and /Users/sky/claude-code/src/services/api/claude.ts): a tool call
+# is its own structured content block, peer to text, all the way
+# through history and back to the API on subsequent turns. No parse
+# → stringify → re-parse cycle, no collision risk if the model emits
+# prose that happens to look like a tool-call marker.
 #
-#   'inband' — the original Gemma 4 format. Model emits `call:NAME{JSON}`
-#              text inline in its content. We stream the response and
-#              parse it with parse_gemma_calls. Works with Gemma fine-
-#              tunes on sushi.
+# Two wire formats, selected per-call via opts.tool_format:
 #
-#   'native' — OpenAI-native function calling. We send the tool schemas
-#              in the `tools` request field; model emits structured
-#              `tool_calls` in the response; we transcode those back
-#              into in-band text so the agent's extract_tool_calls path
-#              stays unchanged. Non-streaming for v1.
+#   'native' — OpenAI-native function calling. We send the tool
+#              schemas in the `tools` request field; the model emits
+#              structured `tool_calls`; we keep them structured.
 #
-# Auto-detected in main.sw from endpoint (z.ai, openai.com, groq, etc →
-# native; local/private → inband). Override with SWARM_CODE_TOOL_FORMAT.
+#   'inband' — Gemma-4-style protocol. Model emits `call:NAME{JSON}`
+#              text inline in its content. We parse the markers ONCE
+#              on receive into the same structured form used by
+#              native mode. The agent never sees the text markers
+#              again; they're rebuilt on demand when we POST history
+#              back to an inband-mode server.
+#
+# Auto-detected in main.sw from endpoint (z.ai, openai.com, groq, …
+# → native; local/private → inband). Override via
+# SWARM_CODE_TOOL_FORMAT.
 
-export [chat, chat_silent, chat_for_subagent,
-        build_request_body, extract_content, extract_reasoning,
-        extract_usage, last_prompt_tokens, record_usage, chat_completions_url,
-        record_reasoning, last_reasoning]
+export [
+    chat, chat_silent, chat_for_subagent,
+    build_request_body, chat_completions_url,
+    last_prompt_tokens, last_reasoning,
+    record_usage, record_reasoning, extract_usage, extract_reasoning,
+    extract_content,
+    new_message_system, new_message_user,
+    new_message_assistant, new_message_tool,
+    parse_inband_tool_calls, inband_assistant_text,
+    api_tool_calls_to_internal
+]
 
-# Build the final chat-completions URL from an endpoint base.
+# ============================================================
+# Internal message shape (lives in history + journal):
 #
-# Most OpenAI-compatible servers (vLLM, Ollama, Groq, Together, OpenRouter,
-# DeepInfra, Fireworks, xAI, DeepSeek) expose the standard path
-# `/v1/chat/completions`, so we append it by default.
+#   %{role: 'system',    content: "..."}
+#   %{role: 'user',      content: "..."}
+#   %{role: 'assistant', content: "...",
+#                        tool_calls: [%{id, name, arguments}, ...] | nil,
+#                        reasoning:  "..." | nil}
+#   %{role: 'tool',      tool_call_id: "...", content: "..."}
 #
-# Some providers use a non-standard path — e.g. Zhipu / Z.AI's GLM series
-# lives at `/api/paas/v4/chat/completions` (no `/v1/`). For those, set
-# SWARM_CODE_ENDPOINT to the FULL URL ending in `/chat/completions` and we
-# use it verbatim.
+# Internal tool_call shape:
+#   %{id: "call_abc",  name: "bash",  arguments: "{\"command\":\"ls\"}"}
+#
+# `arguments` is a JSON-encoded string (OpenAI's wire format). The
+# executor json_decodes it at dispatch time.
+# ============================================================
+fun new_message_system(content)    { %{role: 'system',    content: content} }
+fun new_message_user(content)      { %{role: 'user',      content: content} }
+fun new_message_assistant(content, tool_calls, reasoning) {
+    %{role: 'assistant', content: content,
+       tool_calls: tool_calls, reasoning: reasoning}
+}
+fun new_message_tool(tool_call_id, content) {
+    %{role: 'tool', tool_call_id: tool_call_id, content: content}
+}
+
+# ------------------------------------------------------------
+# Endpoint URL — most OpenAI-compat servers expose
+# `/v1/chat/completions`. Some providers (Zhipu / Z.AI GLM) use a
+# non-standard path; for those, set SWARM_CODE_ENDPOINT to the full
+# URL ending in `/chat/completions` and we'll use it verbatim.
+# ------------------------------------------------------------
 fun chat_completions_url(endpoint) {
     if (string_ends_with(endpoint, "/chat/completions") == 'true') {
         endpoint
-    } else {
-        endpoint ++ "/v1/chat/completions"
-    }
+    } else { endpoint ++ "/v1/chat/completions" }
 }
 
-# Build the JSON request body for a chat completions call.
-#
-# Dispatches on opts.tool_format:
-#   'native' → adds `tools: [...]` + `tool_choice: "auto"` + stream:false,
-#              and strips internal `call:NAME{JSON}` blocks from assistant
-#              history (server sees clean prose only).
-#   'inband' → original streaming shape, history passed as-is.
+# ============================================================
+# build_request_body — serialize history to OpenAI wire shape
+# ============================================================
 fun build_request_body(messages, opts) {
     model = map_get(opts, 'model')
     temp = map_get(opts, 'temperature')
     max_tokens = map_get(opts, 'max_tokens')
     tool_format = map_get(opts, 'tool_format')
 
-    # In native mode the history must be reconstructed into proper
-    # OpenAI shapes: assistant messages re-attach `tool_calls[]` parsed
-    # from the inband markers we transcoded earlier, and the matching
-    # `<tool_result>` user messages flip to `role: "tool"` with the
-    # right `tool_call_id`. Without this, the server has no idea the
-    # model has already acted — it sees orphan prose + an unparseable
-    # tool_result wrapper and just re-runs the previous tool. See the
-    # native-mode walker below for the full transformation.
     msg_maps = if (tool_format == 'native') {
-        messages_to_maps_native(messages, 0, [], [])
+        messages_to_api_native(messages, [])
     } else {
-        messages_to_maps(messages, [])
+        messages_to_api_inband(messages, [])
     }
 
     base = %{
@@ -90,10 +114,6 @@ fun build_request_body(messages, opts) {
 }
 
 fun native_req(base, opts) {
-    # Built-in tool schemas plus any discovered MCP tool schemas
-    # (precomputed at boot, stashed in opts['mcp_schemas']). MCP tools
-    # self-describe with a JSON Schema, so they slot into the same
-    # OpenAI `tools` array as the built-ins with no transformation.
     mcp_schemas = map_get(opts, 'mcp_schemas')
     builtins = ToolSchemas.all_schemas()
     tools = if (mcp_schemas == nil) { builtins }
@@ -101,11 +121,6 @@ fun native_req(base, opts) {
             else { builtins ++ mcp_schemas }}
     a = map_put(base, 'tools', tools)
     b = map_put(a, 'tool_choice', "auto")
-    # Native used to be non-streaming (stream:false). It now streams:
-    # http_post_stream parses delta.tool_calls out of the SSE feed and
-    # reassembles them per-index, so the user sees tokens live instead
-    # of staring at a spinner for the whole turn. include_usage gives
-    # us real prompt_tokens on the terminal SSE chunk.
     c = map_put(b, 'stream', 'true')
     map_put(c, 'stream_options', %{include_usage: 'true'})
 }
@@ -115,253 +130,175 @@ fun inband_req(base) {
     map_put(a, 'stream_options', %{include_usage: 'true'})
 }
 
-# ============================================================
-# Native-mode history walker — the heart of the fix
-# ============================================================
-#
-# In inband mode, the assistant emits `prose\ncall:NAME{args}` and we
-# keep that text verbatim in history. The model sees its own markers
-# next turn and stays oriented.
-#
-# In native mode we transcoded the structured `tool_calls[]` into the
-# same `\ncall:NAME{args}` text so agent.sw could keep one extraction
-# path — but we still must REBUILD the structured shape every time we
-# re-send history to the server, because OpenAI-compatible APIs do not
-# understand the in-band marker.
-#
-# Transform per role:
-#   {assistant, "prose\ncall:bash{...}\ncall:read{...}"}
-#     →  %{role: "assistant", content: "prose",
-#           tool_calls: [{id, type: "function", function:{name, arguments}}, ...]}
-#
-#   {user, "<tool_result>\nresult body\n</tool_result>"}
-#     →  %{role: "tool", tool_call_id: <id from prior assistant>,
-#           content: "result body"}
-#
-# Tool-call ids are deterministic (`swc_<msg_idx>_<call_idx>`) so the
-# same history rebuilds to the same ids every turn.
-fun messages_to_maps_native(messages, idx, pending_ids, acc) {
+# ------------------------------------------------------------
+# History → OpenAI native wire shape. Assistant messages with
+# tool_calls re-emit them as a structured `tool_calls` array; tool
+# results become role:"tool" messages with their tool_call_id intact.
+# This is the lossless roundtrip — what the server sent us, we send
+# back, with no text parsing in between.
+# ------------------------------------------------------------
+fun messages_to_api_native(messages, acc) {
     if (length(messages) == 0) { acc }
     else {
-        entry = hd(messages)
-        role = elem(entry, 0)
-        raw = elem(entry, 1)
-        c_str = if (raw == nil) { "" } else { to_string(raw) }
-
-        if (role == 'assistant') {
-            rebuilt = build_assistant_native(c_str, idx)
-            msg = elem(rebuilt, 0)
-            new_ids = elem(rebuilt, 1)
-            messages_to_maps_native(tl(messages), idx + 1, new_ids,
-                list_append(acc, msg))
-        }
-        else { if (role == 'user' && string_starts_with(c_str, "<tool_result>") == 'true') {
-            if (length(pending_ids) == 0) {
-                # Orphan tool result (e.g. survived compaction). Send as
-                # a regular user message so we never desync the protocol.
-                messages_to_maps_native(tl(messages), idx + 1, [],
-                    list_append(acc, %{role: "user", content: c_str}))
-            } else {
-                id = hd(pending_ids)
-                stripped = strip_tool_result_wrapper(c_str)
-                tool_msg = %{
-                    role: "tool",
-                    tool_call_id: id,
-                    content: stripped
-                }
-                messages_to_maps_native(tl(messages), idx + 1, tl(pending_ids),
-                    list_append(acc, tool_msg))
-            }
-        } else {
-            messages_to_maps_native(tl(messages), idx + 1, pending_ids,
-                list_append(acc, %{role: to_string(role), content: c_str}))
-        }}
+        msg = hd(messages)
+        api_msg = one_msg_native(msg)
+        messages_to_api_native(tl(messages), list_append(acc, api_msg))
     }
 }
 
-# Build a native assistant message map from an in-band content string.
-# Returns {msg_map, [tool_call_id, ...]} — the id list is what we expect
-# matching tool_result messages to pop in order.
-#
-# Kimi K2 quirk: when `thinking` mode is enabled (the default), any
-# assistant message that includes `tool_calls` MUST carry a
-# `reasoning_content` field or the server 400s with
-# "reasoning_content is missing in assistant tool call message". We
-# don't yet round-trip the original reasoning_content across turns (it
-# isn't stored in the history tuple), so we emit a short placeholder.
-# Real reasoning preservation is a follow-up — see notes in
-# record_reasoning / last_reasoning.
-fun build_assistant_native(content, idx) {
-    if (string_contains(content, "\ncall:") == 'false') {
-        {%{role: "assistant", content: content}, []}
+fun one_msg_native(msg) {
+    role = map_get(msg, 'role')
+    if (role == 'system') {
+        %{role: "system", content: to_string(map_get(msg, 'content'))}
+    }
+    else { if (role == 'user') {
+        %{role: "user", content: to_string(map_get(msg, 'content'))}
+    }
+    else { if (role == 'assistant') {
+        build_api_assistant_native(msg)
+    }
+    else { if (role == 'tool') {
+        tcid = map_get(msg, 'tool_call_id')
+        %{
+            role: "tool",
+            tool_call_id: if (tcid == nil) { "" } else { to_string(tcid) },
+            content: to_string(map_get(msg, 'content'))
+        }
+    }
+    else {
+        %{role: to_string(role), content: to_string(map_get(msg, 'content'))}
+    }}}}
+}
+
+fun build_api_assistant_native(msg) {
+    content = map_get(msg, 'content')
+    tool_calls = map_get(msg, 'tool_calls')
+    content_str = if (content == nil) { "" } else { to_string(content) }
+    has_tcs = if (tool_calls == nil) { 'false' }
+              else { if (length(tool_calls) == 0) { 'false' } else { 'true' }}
+    if (has_tcs == 'false') {
+        %{role: "assistant", content: content_str}
     } else {
-        parts = string_split(content, "\ncall:")
-        prose = hd(parts)
-        rest = tl(parts)
-        parsed = parse_call_segments(rest, idx, 0, [], [])
-        calls = elem(parsed, 0)
-        ids = elem(parsed, 1)
-        # See the comment block above this function: Kimi K2 in
-        # thinking mode requires `reasoning_content` to be present on
-        # any assistant message that carries tool_calls, or the API
-        # 400s. We don't roundtrip per-message reasoning across turns
-        # yet (history is a flat {role, content} tuple), so we emit a
-        # short placeholder. The 💭 emoji that used to render this in
-        # the UI was removed — only the streaming response's real
-        # reasoning gets displayed now, so this placeholder is API-only.
-        msg = %{
+        api_tcs = tool_calls_to_api(tool_calls, [])
+        # Kimi K2 thinking-mode requires reasoning_content on any
+        # assistant message carrying tool_calls. Round-trip stored
+        # reasoning when we have it; otherwise stamp a short placeholder.
+        reasoning = map_get(msg, 'reasoning')
+        rc = if (reasoning == nil) { "Executing tool call." }
+             else {
+                 rs = to_string(reasoning)
+                 if (string_length(rs) == 0) { "Executing tool call." } else { rs }
+             }
+        %{
             role: "assistant",
-            content: string_trim(prose),
-            reasoning_content: "Executing tool call.",
-            tool_calls: calls
+            content: content_str,
+            reasoning_content: rc,
+            tool_calls: api_tcs
         }
-        {msg, ids}
     }
 }
 
-# Parse each `NAME{json...}` segment into a native tool_call map.
-# Skips malformed segments (no `{`, unbalanced braces) instead of
-# crashing, so a stray "call:" in prose never breaks the request.
-fun parse_call_segments(segs, msg_idx, call_idx, calls_acc, ids_acc) {
-    if (length(segs) == 0) { {calls_acc, ids_acc} }
+fun tool_calls_to_api(tcs, acc) {
+    if (length(tcs) == 0) { acc }
     else {
-        seg = hd(segs)
-        brace_idx = llm_find_substring(seg, "{")
-        if (brace_idx < 0) {
-            parse_call_segments(tl(segs), msg_idx, call_idx + 1, calls_acc, ids_acc)
-        } else {
-            name = string_trim(string_sub(seg, 0, brace_idx))
-            end_idx = find_matching_brace(seg, brace_idx)
-            if (end_idx < 0) {
-                parse_call_segments(tl(segs), msg_idx, call_idx + 1, calls_acc, ids_acc)
-            } else {
-                args_len = end_idx - brace_idx + 1
-                args_str = string_sub(seg, brace_idx, args_len)
-                id = "swc_" ++ to_string(msg_idx) ++ "_" ++ to_string(call_idx)
-                call_obj = %{
-                    id: id,
-                    type: "function",
-                    function: %{
-                        name: name,
-                        arguments: args_str
-                    }
-                }
-                parse_call_segments(tl(segs), msg_idx, call_idx + 1,
-                    list_append(calls_acc, call_obj),
-                    list_append(ids_acc, id))
+        tc = hd(tcs)
+        api_tc = %{
+            id: to_string(map_get(tc, 'id')),
+            type: "function",
+            function: %{
+                name: to_string(map_get(tc, 'name')),
+                arguments: to_string(map_get(tc, 'arguments'))
             }
         }
+        tool_calls_to_api(tl(tcs), list_append(acc, api_tc))
     }
 }
 
-# Local substring scan (local copy so we don't reach across modules).
-fun llm_find_substring(haystack, needle) {
-    nl = string_length(needle)
-    hl = string_length(haystack)
-    if (nl == 0) { 0 }
-    else { fsub_loop(haystack, needle, 0, hl, nl) }
-}
-
-fun fsub_loop(h, n, i, hl, nl) {
-    if (i + nl > hl) { 0 - 1 }
+# ------------------------------------------------------------
+# History → inband wire shape. Inband servers don't understand
+# OpenAI's structured tool_calls field, so assistant messages get
+# re-flattened: prose followed by `\ncall:NAME{json}` markers
+# reconstructed from the stored tool_calls. Tool results flatten
+# back to user-role messages wrapped in <tool_result>…</tool_result>
+# the way Gemma-style models expect.
+# ------------------------------------------------------------
+fun messages_to_api_inband(messages, acc) {
+    if (length(messages) == 0) { acc }
     else {
-        slice = string_sub(h, i, nl)
-        if (slice == n) { i }
-        else { fsub_loop(h, n, i + 1, hl, nl) }
+        msg = hd(messages)
+        api_msg = one_msg_inband(msg)
+        messages_to_api_inband(tl(messages), list_append(acc, api_msg))
     }
 }
 
-# Find the index of the closing `}` that matches the opening `{` at
-# `open_idx`. Treats JSON string boundaries as opaque (so a `}` inside
-# `"foo}bar"` does not close the object) and honours `\` escapes.
-# Returns -1 if no match (malformed).
-fun find_matching_brace(s, open_idx) {
-    fmb_loop(s, open_idx, string_length(s), 0, 'false', 'false')
-}
-
-fun fmb_loop(s, i, sl, depth, in_str, escaped) {
-    if (i >= sl) { 0 - 1 }
+fun one_msg_inband(msg) {
+    role = map_get(msg, 'role')
+    if (role == 'system') {
+        %{role: "system", content: to_string(map_get(msg, 'content'))}
+    }
+    else { if (role == 'user') {
+        %{role: "user", content: to_string(map_get(msg, 'content'))}
+    }
+    else { if (role == 'assistant') {
+        %{role: "assistant", content: inband_assistant_text(msg)}
+    }
+    else { if (role == 'tool') {
+        %{
+            role: "user",
+            content: "<tool_result>\n" ++ to_string(map_get(msg, 'content')) ++ "\n</tool_result>"
+        }
+    }
     else {
-        ch = string_sub(s, i, 1)
-        if (escaped == 'true') {
-            fmb_loop(s, i + 1, sl, depth, in_str, 'false')
-        }
-        else { if (in_str == 'true' && ch == "\\") {
-            fmb_loop(s, i + 1, sl, depth, in_str, 'true')
-        }
-        else { if (ch == "\"") {
-            new_in_str = if (in_str == 'true') { 'false' } else { 'true' }
-            fmb_loop(s, i + 1, sl, depth, new_in_str, 'false')
-        }
-        else { if (in_str == 'true') {
-            fmb_loop(s, i + 1, sl, depth, in_str, 'false')
-        }
-        else { if (ch == "{") {
-            fmb_loop(s, i + 1, sl, depth + 1, in_str, 'false')
-        }
-        else { if (ch == "}") {
-            new_depth = depth - 1
-            if (new_depth <= 0) { i }
-            else { fmb_loop(s, i + 1, sl, new_depth, in_str, 'false') }
-        }
-        else {
-            fmb_loop(s, i + 1, sl, depth, in_str, 'false')
-        }}}}}}
+        %{role: to_string(role), content: to_string(map_get(msg, 'content'))}
+    }}}}
+}
+
+# Rebuild the inband assistant string from stored content + tool_calls.
+# This is the canonical form an inband model would have emitted.
+fun inband_assistant_text(msg) {
+    content = map_get(msg, 'content')
+    tool_calls = map_get(msg, 'tool_calls')
+    base = if (content == nil) { "" } else { to_string(content) }
+    if (tool_calls == nil) { base }
+    else { if (length(tool_calls) == 0) { base }
+    else {
+        appended = inband_tc_loop(tool_calls, "")
+        if (string_length(base) == 0) {
+            # Trim the leading "\n" — no prose to separate from.
+            if (string_length(appended) > 0 && string_sub(appended, 0, 1) == "\n") {
+                string_sub(appended, 1, string_length(appended) - 1)
+            } else { appended }
+        } else { base ++ appended }
+    }}
+}
+
+fun inband_tc_loop(tcs, acc) {
+    if (length(tcs) == 0) { acc }
+    else {
+        tc = hd(tcs)
+        line = "\ncall:" ++ to_string(map_get(tc, 'name')) ++
+               to_string(map_get(tc, 'arguments'))
+        inband_tc_loop(tl(tcs), acc ++ line)
     }
 }
 
-# Strip the `<tool_result>` wrapper that agent.sw adds around tool
-# output before appending the message back to history. Accepts both
-# the `\n`-padded form (the agent's actual output) and the unpadded
-# form (defensive — older sessions, manual edits).
-fun strip_tool_result_wrapper(s) {
-    no_open = if (string_starts_with(s, "<tool_result>\n") == 'true') {
-        string_sub(s, 14, string_length(s) - 14)
-    } else { if (string_starts_with(s, "<tool_result>") == 'true') {
-        string_sub(s, 13, string_length(s) - 13)
-    } else { s }}
-    if (string_ends_with(no_open, "\n</tool_result>") == 'true') {
-        string_sub(no_open, 0, string_length(no_open) - 15)
-    } else { if (string_ends_with(no_open, "</tool_result>") == 'true') {
-        string_sub(no_open, 0, string_length(no_open) - 14)
-    } else { no_open }}
-}
-
-# messages: [{role, content}, ...]  →  list of %{role: ..., content: ...} maps
-fun messages_to_maps(messages, acc) {
-    if (length(messages) == 0) {
-        acc
-    } else {
-        entry = hd(messages)
-        role = elem(entry, 0)
-        content = elem(entry, 1)
-        as_map = %{role: to_string(role), content: content}
-        messages_to_maps(tl(messages), list_append(acc, as_map))
-    }
-}
-
-# Public chat() — dispatches on tool_format.
-#
-# 'native' → chat_native (non-streaming, structured tool_calls parsing)
-# 'inband' → chat_attempt (streaming with retry on transport failures)
+# ============================================================
+# chat — public entry, dispatches on tool_format
+# ============================================================
 fun chat(messages, opts) {
     tool_format = map_get(opts, 'tool_format')
     if (tool_format == 'native') {
         chat_native_retry(messages, opts, 0)
     } else {
-        chat_attempt(messages, opts, 0)
+        chat_inband_retry(messages, opts, 0)
     }
 }
 
 # ------------------------------------------------------------
-# Retry — transient LLM failures should not end a turn
+# Retry on transient failures (5xx, dropped connection, half-decoded
+# body). User-interrupted streams (ESC) are NOT retried — record_fail
+# marks them and chat_*_retry honors that.
 # ------------------------------------------------------------
-# A dropped connection, a 5xx, a rate-limit, a half-decoded body —
-# all transient. The native path previously gave up on the first
-# nil and the turn just died ("[error] llm call failed"). Now we
-# back off and try again. The ONE failure we never retry is a user
-# interrupt (ESC) — they asked to stop. chat_native records the
-# reason via record_fail; chat_native_retry reads it here.
 fun record_fail(opts, reason) {
     table = map_get(opts, 'llm_stats_table')
     if (table == nil) { 'ok' }
@@ -373,22 +310,21 @@ fun last_fail(opts) {
     if (table == nil) { nil } else { ets_get(table, 'fail_reason') }
 }
 
-# Backoff in milliseconds (sw `sleep` takes ms).
 fun retry_delay_ms(attempt) {
     if (attempt == 0) { 1000 }
     else { if (attempt == 1) { 2000 }
     else { 4000 }}
 }
 
+fun max_chat_retries() { 3 }
+
 fun chat_native_retry(messages, opts, attempt) {
-    content = chat_native(messages, opts)
-    if (content != nil) { content }
+    result = chat_native(messages, opts)
+    if (result != nil) { result }
     else {
         reason = last_fail(opts)
-        if (reason == "interrupted") {
-            # User pressed ESC — honour it, don't retry.
-            nil
-        } else { if (attempt >= max_chat_retries()) {
+        if (reason == "interrupted") { nil }
+        else { if (attempt >= max_chat_retries()) {
             print("  \e[38;5;208m✗ llm call failed after " ++
                   to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
             nil
@@ -404,22 +340,33 @@ fun chat_native_retry(messages, opts, attempt) {
     }
 }
 
+fun chat_inband_retry(messages, opts, attempt) {
+    result = chat_inband(messages, opts)
+    needs_retry = if (result == nil) { 'true' }
+                  else {
+                      content = to_string(map_get(result, 'content'))
+                      is_transport_truncated(content)
+                  }
+    if (needs_retry == 'true' && attempt < max_chat_retries()) {
+        d = retry_delay_ms(attempt)
+        print("")
+        print("  \e[38;5;208m↻ transport failure — retrying in " ++
+              to_string(d / 1000) ++ "s (attempt " ++
+              to_string(attempt + 2) ++ "/" ++
+              to_string(max_chat_retries() + 1) ++ ")\e[0m")
+        sleep(d)
+        chat_inband_retry(messages, opts, attempt + 1)
+    } else { result }
+}
+
+fun is_transport_truncated(content) {
+    if (string_contains(content, "[Response cut off by transport timeout") == 'true') { 'true' }
+    else { 'false' }
+}
+
 # ============================================================
-# Native function-calling path — streaming
+# Native streaming path — structured tool_calls preserved end-to-end
 # ============================================================
-#
-# Sends a STREAMING request with `tools` + `tool_choice:"auto"`. The
-# swarmrt http_post_stream builtin prints content + reasoning to the
-# terminal as tokens arrive (with a TTFT spinner), and reassembles the
-# fragmented `delta.tool_calls` SSE frames — keyed by `index`, exactly
-# like TCP segment reassembly — into a `tool_calls` array on the
-# returned synthetic OpenAI response. We read that array and transcode
-# it back into swarm-code's internal `call:NAME{JSON}` text so
-# agent.sw's extract_tool_calls() keeps working unchanged.
-#
-# Native prose now streams raw, like the inband path — no markdown
-# render. Streaming and deferred markdown are mutually exclusive; live
-# feedback beats a tidy-but-late page.
 fun chat_native(messages, opts) {
     endpoint = map_get(opts, 'endpoint')
     api_key = map_get(opts, 'api_key')
@@ -436,15 +383,7 @@ fun chat_native(messages, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    # Pessimistic default: assume failure. Cleared on success below.
-    # chat_native_retry reads this to decide whether a nil is retryable.
-    # An ESC interrupt is NOT nil here — http_post_stream returns the
-    # partial response with an "[Request interrupted by user]" marker
-    # in content, so the turn ends cleanly without triggering a retry.
     record_fail(opts, "fail")
-
-    # http_post_stream handles the TTFT spinner + live token display
-    # C-side, and folds delta.tool_calls into the response it returns.
     resp = http_post_stream(url, hdrs, body)
     latency = timestamp() - start_ms
 
@@ -474,289 +413,199 @@ fun chat_native(messages, opts) {
                     Log.llm_error("no choices (native)", resp)
                     nil
                 } else {
-                    # Got a real response — clear the failure flag.
                     record_fail(opts, nil)
                     choice0 = hd(choices)
                     msg_obj = map_get(choice0, 'message')
                     raw_content = map_get(msg_obj, 'content')
-                    tool_calls_list = map_get(msg_obj, 'tool_calls')
+                    raw_tool_calls = map_get(msg_obj, 'tool_calls')
                     prose = if (raw_content == nil) { "" } else { to_string(raw_content) }
+                    tool_calls = api_tool_calls_to_internal(raw_tool_calls, [])
 
-                    # content + reasoning already streamed to the
-                    # terminal C-side — do NOT reprint them here.
-                    tc_count = if (tool_calls_list == nil) { 0 } else { length(tool_calls_list) }
-                    had_tools = if (tc_count > 0) { 'true' } else { 'false' }
+                    had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
 
-                    # Transcode tool_calls → in-band string. Zero agent.sw changes.
-                    transcode_native_calls(tool_calls_list, prose)
+                    %{
+                        content: prose,
+                        tool_calls: tool_calls,
+                        reasoning: reason_text
+                    }
                 }
             }
         }
     }
 }
 
-fun transcode_native_calls(tool_calls, prose) {
-    if (tool_calls == nil) { prose }
-    else { if (length(tool_calls) == 0) { prose }
-    else { transcode_loop(tool_calls, prose) }}
-}
-
-fun transcode_loop(tool_calls, acc) {
-    if (length(tool_calls) == 0) { acc }
+# Convert OpenAI tool_calls → internal flat shape.
+# Wire shape:    [%{id, type:"function", function:%{name, arguments: <json_string>}}, ...]
+# Internal flat: [%{id, name, arguments: <json_string>}, ...]
+fun api_tool_calls_to_internal(raw, acc) {
+    if (raw == nil) { acc }
+    else { if (length(raw) == 0) { acc }
     else {
-        tc = hd(tool_calls)
+        tc = hd(raw)
         fn = map_get(tc, 'function')
-        name = map_get(fn, 'name')
-        # OpenAI returns `arguments` as an already-JSON-encoded STRING,
-        # so `call:NAME` + args_str directly produces a valid in-band
-        # `call:bash{"command":"ls"}` marker. No further escaping needed.
-        args_str = map_get(fn, 'arguments')
-        line = "\ncall:" ++ to_string(name) ++ to_string(args_str)
-        transcode_loop(tl(tool_calls), acc ++ line)
-    }
+        name_v = if (fn == nil) { map_get(tc, 'name') } else { map_get(fn, 'name') }
+        args_v = if (fn == nil) { map_get(tc, 'arguments') } else { map_get(fn, 'arguments') }
+        id_v = map_get(tc, 'id')
+        # Synthesize an id when the server omits one — tool_call_id is the
+        # pairing key between assistant.tool_calls[N] and the role:tool
+        # response. Without a stable id the next-turn API request can't
+        # match results to calls.
+        id_str = if (id_v == nil) {
+            "swc_synth_" ++ to_string(timestamp()) ++ "_" ++ to_string(length(acc))
+        } else { to_string(id_v) }
+        internal = %{
+            id: id_str,
+            name: if (name_v == nil) { "" } else { to_string(name_v) },
+            arguments: if (args_v == nil) { "{}" } else { to_string(args_v) }
+        }
+        api_tool_calls_to_internal(tl(raw), list_append(acc, internal))
+    }}
 }
 
-# Decode a native (OpenAI-shaped) response and return the assistant's
-# content with any structured `tool_calls` transcoded into in-band
-# `call:` text — the shape run_agent_turn's parser expects. Without
-# this a native subagent's tool calls are dropped: it reasons, then
-# "finishes" with an empty reply. nil on a malformed/empty response.
-fun native_content_from_resp(resp) {
-    decoded = json_decode(resp)
-    if (decoded == nil) { nil }
-    else {
-        choices = map_get(decoded, 'choices')
-        if (choices == nil) { nil }
-        else { if (length(choices) == 0) { nil }
-        else {
-            msg_obj = map_get(hd(choices), 'message')
-            if (msg_obj == nil) { nil }
-            else {
-                raw = map_get(msg_obj, 'content')
-                prose = if (raw == nil) { "" } else { to_string(raw) }
-                transcode_native_calls(map_get(msg_obj, 'tool_calls'), prose)
-            }
-        }}
-    }
-}
-
-# 3 retries = 4 total attempts. Spans a ~7s transient outage.
-fun max_chat_retries() { 3 }
-
-fun chat_attempt(messages, opts, attempt) {
-    content = chat_once(messages, opts)
-    needs_retry = if (content == nil) { 'true' }
-                  else { is_transport_truncated(content) }
-    if (needs_retry == 'true' && attempt < max_chat_retries()) {
-        delay_ms = retry_delay_ms(attempt)
-        print("")
-        print("  \e[38;5;208m↻ transport failure — retrying in " ++
-              to_string(delay_ms / 1000) ++ "s (attempt " ++
-              to_string(attempt + 2) ++ "/" ++
-              to_string(max_chat_retries() + 1) ++ ")\e[0m")
-        # sw `sleep` takes milliseconds — the old `sleep(2)` was a
-        # 2ms no-op, so retries effectively had no backoff at all.
-        sleep(delay_ms)
-        chat_attempt(messages, opts, attempt + 1)
-    } else {
-        content
-    }
-}
-
-# Detect the C streaming layer's mid-stream truncation marker.
-# Only matches on curl 28 (transport timeout); doesn't match on
-# user interrupt or model token-limit truncation.
-fun is_transport_truncated(content) {
-    if (string_contains(content, "[Response cut off by transport timeout") == 'true') { 'true' }
-    else { 'false' }
-}
-
-# POST to {endpoint}/v1/chat/completions and return the raw assistant
-# content string, or nil on error. Logs request/response/error to the
-# telemetry layer for observability. Wrapped by chat() above for retry.
-fun chat_once(messages, opts) {
+# ============================================================
+# Inband streaming path — parse markers ONCE into structured form
+# ============================================================
+fun chat_inband(messages, opts) {
     endpoint = map_get(opts, 'endpoint')
     api_key = map_get(opts, 'api_key')
     model = map_get(opts, 'model')
     url = chat_completions_url(endpoint)
-
     body = build_request_body(messages, opts)
     body_chars = string_length(body)
 
-    # Debug: always dump the last request to /tmp so we can curl it
-    # directly when chat() misbehaves. Cheap, always on — the file is
-    # clobbered per call so it's just "the last thing we sent".
     file_write("/tmp/swarm-code-last-body.json", body)
-
     Log.llm_request(to_string(model), length(messages), body_chars)
     start_ms = timestamp()
 
     base_hdrs = [{"Content-Type", "application/json"}]
-    hdrs = if (api_key == nil) {
-        base_hdrs
-    } else {
-        list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key})
-    }
+    hdrs = if (api_key == nil) { base_hdrs }
+           else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    # Use the streaming variant: tokens print to stdout as they arrive,
-    # and the returned string is a minimal OpenAI response shape with the
-    # accumulated content, so extract_content still works unchanged.
     resp = http_post_stream(url, hdrs, body)
     latency = timestamp() - start_ms
 
     if (resp == nil) {
-        Log.llm_error("http_post returned nil", "")
+        Log.llm_error("http_post returned nil (inband)", "")
         nil
     } else {
-        content = extract_content(resp)
-        if (content == nil) {
-            Log.llm_error("extract_content returned nil", resp)
+        raw_content = extract_content(resp)
+        if (raw_content == nil) {
+            Log.llm_error("extract_content returned nil (inband)", resp)
             nil
         } else {
-            # Scrape real prompt_tokens from the server's usage field and
-            # cache it in the stats table for compaction decisions + footer
-            # display. This is the SAME number the server uses internally,
-            # not a client-side char estimate.
             usage = extract_usage(resp)
             record_usage(opts, usage)
-            # Cache reasoning_content (GLM-5.1 / DeepSeek-R1 / o1) in the
-            # stats table so the agent loop can detect "model reasoned but
-            # said nothing" and recover instead of giving up.
             reason_text = extract_reasoning(resp)
             record_reasoning(opts, reason_text)
-            has_xml = string_contains(content, "<tool_call>") == 'true'
-            has_native = string_contains(content, "call:") == 'true'
-            had_tools = if (has_xml == 'true') { 'true' }
-                        else { if (has_native == 'true') { 'true' } else { 'false' } }
-            Log.llm_response(latency, string_length(content), had_tools)
-            # Sick-server detection: empty response returned in under
-            # 500ms with a small body is the fingerprint of a wedged or
-            # OOM'd serving process — NOT context exhaustion and NOT a
-            # bad prompt. Warn the user so they know where the problem
-            # actually is instead of blaming themselves.
-            empty = string_length(string_trim(content)) == 0
+
+            parsed = parse_inband_tool_calls(to_string(raw_content))
+            prose = map_get(parsed, 'content')
+            tool_calls = map_get(parsed, 'tool_calls')
+
+            had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
+            Log.llm_response(latency, string_length(to_string(prose)), had_tools)
+
+            # Sick-server detection: empty response in <500ms with a
+            # small body = fingerprint of a wedged / OOM'd serving
+            # process. NOT context exhaustion, NOT a bad prompt.
+            empty = string_length(string_trim(to_string(prose))) == 0
+                    && length(tool_calls) == 0
             if (empty == 'true' && latency < 500 && body_chars < 30000) {
                 print("")
                 print("  \e[38;5;208m⚠ server at " ++ to_string(endpoint) ++
                       " returned empty in " ++ to_string(latency) ++ "ms\e[0m")
-                print("  \e[38;5;240m(fingerprint of a wedged / OOM'd serving process." ++
-                      " Try restarting vllm on the host.)\e[0m")
+                print("  \e[38;5;240m(fingerprint of a wedged / OOM'd serving process. " ++
+                      "Try restarting vllm on the host.)\e[0m")
                 print("")
             }
-            content
+            %{
+                content: prose,
+                tool_calls: tool_calls,
+                reasoning: reason_text
+            }
         }
     }
 }
 
-# ------------------------------------------------------------
-# Subagent chat — streaming, but every content chunk is sent as a
-# {'stream_chunk', name, text} message to target_pid instead of being
-# printed to stdout. The parent agent multiplexes them and renders with
-# its own per-agent prefix so 3 parallel subagents don't interleave on
-# the shared TTY.
-#
-# Returns the full accumulated content (same shape as chat_once) so the
-# subagent's run_agent_turn loop is unchanged. Reasoning + truncation
-# markers also come through as separate message tags.
-# ------------------------------------------------------------
-fun chat_for_subagent(messages, opts, target_pid, name) {
-    endpoint = map_get(opts, 'endpoint')
-    api_key = map_get(opts, 'api_key')
-    model = map_get(opts, 'model')
-    url = chat_completions_url(endpoint)
-
-    body = build_request_body(messages, opts)
-    body_chars = string_length(body)
-
-    Log.llm_request(to_string(model), length(messages), body_chars)
-    start_ms = timestamp()
-
-    base_hdrs = [{"Content-Type", "application/json"}]
-    hdrs = if (api_key == nil) {
-        base_hdrs
+# Parse inband `\ncall:NAME{json}` markers out of content. Returns
+# %{content: prose_only_no_markers, tool_calls: [%{id, name, arguments}, ...]}.
+# Synthesizes ids since the inband protocol carries none.
+fun parse_inband_tool_calls(text) {
+    raw_calls = parse_gemma_calls(text)
+    if (raw_calls == nil || length(raw_calls) == 0) {
+        %{content: text, tool_calls: []}
     } else {
-        list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key})
-    }
-
-    # Subagent-mode call: pass parent pid + name as 4th/5th args so the
-    # C builtin routes every chunk as a tagged message instead of stdout.
-    resp = http_post_stream(url, hdrs, body, target_pid, name)
-    latency = timestamp() - start_ms
-
-    if (resp == nil) {
-        Log.llm_error("http_post returned nil (subagent " ++ name ++ ")", "")
-        nil
-    } else {
-        # Native models put tool calls in structured `tool_calls`, not
-        # in-band `call:` text. extract_content only pulls prose, so a
-        # native subagent's tool calls vanished — it would reason then
-        # reply empty. Transcode them, exactly as chat_native does.
-        content = if (map_get(opts, 'tool_format') == 'native') {
-                      native_content_from_resp(resp)
-                  } else {
-                      extract_content(resp)
-                  }
-        if (content == nil) {
-            Log.llm_error("extract_content returned nil (subagent)", resp)
-            nil
-        } else {
-            usage = extract_usage(resp)
-            record_usage(opts, usage)
-            reason_text = extract_reasoning(resp)
-            record_reasoning(opts, reason_text)
-            has_xml = string_contains(content, "<tool_call>") == 'true'
-            has_native = string_contains(content, "call:") == 'true'
-            had_tools = if (has_xml == 'true') { 'true' }
-                        else { if (has_native == 'true') { 'true' } else { 'false' } }
-            Log.llm_response(latency, string_length(content), had_tools)
-            content
-        }
+        prose = string_before_first(text, "\ncall:")
+        tcs = inband_calls_to_internal(raw_calls, 0, [])
+        %{content: prose, tool_calls: tcs}
     }
 }
 
-# ------------------------------------------------------------
-# Silent chat — same as chat() but uses non-streaming http_post so
-# nothing leaks onto the user's terminal. Used for internal ops
-# like compaction, background summarization, buddy replies. Requests
-# are sent with "stream": false so the server returns a single JSON
-# blob instead of an SSE event stream.
-# ------------------------------------------------------------
+fun inband_calls_to_internal(raw, idx, acc) {
+    if (length(raw) == 0) { acc }
+    else {
+        tc = hd(raw)
+        name = elem(tc, 0)
+        args = elem(tc, 1)
+        args_str = json_encode(args)
+        id = "swc_inband_" ++ to_string(timestamp()) ++ "_" ++ to_string(idx)
+        internal = %{
+            id: id,
+            name: to_string(name),
+            arguments: args_str
+        }
+        inband_calls_to_internal(tl(raw), idx + 1, list_append(acc, internal))
+    }
+}
+
+# Prefix of s up to (not including) the first occurrence of marker.
+# If marker isn't found, returns s unchanged. Used to strip inband
+# tool-call markers from prose so they don't sit in stored content.
+fun string_before_first(s, marker) {
+    if (string_contains(s, marker) == 'false') { s }
+    else {
+        sentinel = "\x01\x02SWPROSE\x02\x01"
+        replaced = string_replace(s, marker, sentinel)
+        parts = string_split(replaced, sentinel)
+        hd(parts)
+    }
+}
+
+# ============================================================
+# chat_silent — non-streaming, used by compaction + daemon pulse.
+# Returns just the content string. Tool calls would not be useful
+# for compaction (it's a summarisation prompt) and the pulse path
+# does its own inband-only parse via parse_inband_tool_calls.
+# ============================================================
 fun chat_silent(messages, opts) {
     endpoint = map_get(opts, 'endpoint')
     api_key = map_get(opts, 'api_key')
     url = chat_completions_url(endpoint)
-
     body = build_request_body_silent(messages, opts)
 
     base_hdrs = [{"Content-Type", "application/json"}]
-    hdrs = if (api_key == nil) {
-        base_hdrs
-    } else {
-        list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key})
-    }
+    hdrs = if (api_key == nil) { base_hdrs }
+           else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     resp = http_post(url, hdrs, body)
-    if (resp == nil) {
-        nil
-    } else {
-        # Silent path — DO NOT print [llm error] to the terminal. The
-        # caller (compaction, daemon pulse, buddy) handles failure by
-        # returning nil and falling back. A printed error here would
-        # leak debug noise on top of the user's view.
+    if (resp == nil) { nil }
+    else {
         usage = extract_usage(resp)
         record_usage(opts, usage)
         extract_content_quiet(resp)
     }
 }
 
-# Same shape as build_request_body but with stream:false — the
-# non-streaming http_post builtin expects a plain JSON response.
+# Silent path: stream:false + no tools array. We send via the inband
+# walker (`messages_to_api_inband`) which flattens both formats to
+# straight prose — the silent call never benefits from server-side
+# tool_choice anyway.
 fun build_request_body_silent(messages, opts) {
     model = map_get(opts, 'model')
     temp = map_get(opts, 'temperature')
     max_tokens = map_get(opts, 'max_tokens')
-    msg_maps = messages_to_maps(messages, [])
+    msg_maps = messages_to_api_inband(messages, [])
     req = %{
         model: model,
         temperature: temp,
@@ -767,24 +616,84 @@ fun build_request_body_silent(messages, opts) {
     json_encode(req)
 }
 
-# Pull choices[0].message.content out of an OpenAI-compat response.
-# Prints `[llm error]` to the terminal if the server returned a
-# structured error — the streaming chat path wants this visibility.
-# Use `extract_content_quiet/1` for internal ops (compaction, pulse).
+# ============================================================
+# chat_for_subagent — streaming with per-chunk routing to a parent.
+# Same structured return shape as chat() so a subagent's run-loop is
+# uniform with main's.
+# ============================================================
+fun chat_for_subagent(messages, opts, target_pid, name) {
+    endpoint = map_get(opts, 'endpoint')
+    api_key = map_get(opts, 'api_key')
+    model = map_get(opts, 'model')
+    url = chat_completions_url(endpoint)
+    body = build_request_body(messages, opts)
+    body_chars = string_length(body)
+
+    Log.llm_request(to_string(model), length(messages), body_chars)
+    start_ms = timestamp()
+
+    base_hdrs = [{"Content-Type", "application/json"}]
+    hdrs = if (api_key == nil) { base_hdrs }
+           else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
+
+    resp = http_post_stream(url, hdrs, body, target_pid, name)
+    latency = timestamp() - start_ms
+
+    if (resp == nil) {
+        Log.llm_error("http_post returned nil (subagent " ++ name ++ ")", "")
+        nil
+    } else {
+        decoded = json_decode(resp)
+        if (decoded == nil) {
+            Log.llm_error("subagent json_decode failed", resp)
+            nil
+        } else {
+            usage = extract_usage(resp)
+            record_usage(opts, usage)
+            reason_text = extract_reasoning(resp)
+            record_reasoning(opts, reason_text)
+
+            choices = map_get(decoded, 'choices')
+            if (choices == nil || length(choices) == 0) { nil }
+            else {
+                choice0 = hd(choices)
+                msg_obj = map_get(choice0, 'message')
+                raw_content = map_get(msg_obj, 'content')
+                prose_raw = if (raw_content == nil) { "" } else { to_string(raw_content) }
+                tool_format = map_get(opts, 'tool_format')
+                result_map = if (tool_format == 'native') {
+                    %{
+                        content: prose_raw,
+                        tool_calls: api_tool_calls_to_internal(
+                            map_get(msg_obj, 'tool_calls'), [])
+                    }
+                } else {
+                    parse_inband_tool_calls(prose_raw)
+                }
+                tcs_len = length(map_get(result_map, 'tool_calls'))
+                had_tools = if (tcs_len > 0) { 'true' } else { 'false' }
+                Log.llm_response(latency, string_length(prose_raw), had_tools)
+                map_put(result_map, 'reasoning', reason_text)
+            }
+        }
+    }
+}
+
+# ============================================================
+# Response extraction helpers
+# ============================================================
 fun extract_content(resp_body) {
     extract_content_impl(resp_body, 'false')
 }
 
-# Quiet variant — same parsing, no terminal printing on errors.
 fun extract_content_quiet(resp_body) {
     extract_content_impl(resp_body, 'true')
 }
 
 fun extract_content_impl(resp_body, silent) {
     decoded = json_decode(resp_body)
-    if (decoded == nil) {
-        nil
-    } else {
+    if (decoded == nil) { nil }
+    else {
         err = map_get(decoded, 'error')
         if (err != nil) {
             if (silent != 'true') {
@@ -794,9 +703,8 @@ fun extract_content_impl(resp_body, silent) {
             nil
         } else {
             choices = map_get(decoded, 'choices')
-            if (length(choices) == 0) {
-                nil
-            } else {
+            if (length(choices) == 0) { nil }
+            else {
                 choice0 = hd(choices)
                 msg_obj = map_get(choice0, 'message')
                 map_get(msg_obj, 'content')
@@ -805,10 +713,6 @@ fun extract_content_impl(resp_body, silent) {
     }
 }
 
-# Pull choices[0].message.reasoning_content. Returns nil if the model
-# isn't a reasoning model (Gemma, GPT-3.5-class) or the field is empty.
-# Populated by swarmrt's http_post_stream when the server emits
-# delta.reasoning_content (GLM-5.1, DeepSeek-R1, o1-style models).
 fun extract_reasoning(resp_body) {
     decoded = json_decode(resp_body)
     if (decoded == nil) { nil }
@@ -829,13 +733,6 @@ fun extract_reasoning(resp_body) {
     }
 }
 
-# ------------------------------------------------------------
-# Usage tracking — server-reported token counts
-# ------------------------------------------------------------
-# Extract the `usage` block from an OpenAI-compatible response and
-# return it as a map {prompt_tokens, completion_tokens, total_tokens}.
-# Returns nil if the server didn't include usage (e.g. non-streaming
-# endpoints that don't populate it, or older SSE implementations).
 fun extract_usage(resp_body) {
     decoded = json_decode(resp_body)
     if (decoded == nil) { nil }
@@ -845,11 +742,6 @@ fun extract_usage(resp_body) {
     }
 }
 
-# Cache the latest usage numbers in the stats ETS table passed via
-# opts. The agent's budget check reads from here. When the server
-# omits usage entirely we MUST clear the prior values — otherwise a
-# stale prompt_tokens from many turns ago drives the budget check
-# (either triggering premature compaction or skipping a needed one).
 fun record_usage(opts, usage) {
     table = map_get(opts, 'llm_stats_table')
     if (table == nil) { 'ok' }
@@ -863,7 +755,6 @@ fun record_usage(opts, usage) {
             pt = map_get(usage, 'prompt_tokens')
             ct = map_get(usage, 'completion_tokens')
             tt = map_get(usage, 'total_tokens')
-            # Always write — nil entries clear stale data.
             ets_put(table, 'prompt_tokens', pt)
             ets_put(table, 'completion_tokens', ct)
             ets_put(table, 'total_tokens', tt)
@@ -872,16 +763,11 @@ fun record_usage(opts, usage) {
     }
 }
 
-# Read the last server-reported prompt_tokens. Returns nil if we
-# haven't made a successful call yet (first turn of the session).
 fun last_prompt_tokens(opts) {
     table = map_get(opts, 'llm_stats_table')
     if (table == nil) { nil } else { ets_get(table, 'prompt_tokens') }
 }
 
-# Cache the last reasoning_content for empty-content recovery. Stored
-# as a string; cleared (set to nil) on each successful call so stale
-# reasoning from a prior turn isn't mistaken for current.
 fun record_reasoning(opts, reason_text) {
     table = map_get(opts, 'llm_stats_table')
     if (table == nil) { 'ok' }
@@ -892,9 +778,6 @@ fun record_reasoning(opts, reason_text) {
     }
 }
 
-# Read the last reasoning_content. Returns nil if no reasoning was
-# emitted on the most recent call (non-reasoning model, or model spoke
-# directly without thinking).
 fun last_reasoning(opts) {
     table = map_get(opts, 'llm_stats_table')
     if (table == nil) { nil } else { ets_get(table, 'last_reasoning') }
