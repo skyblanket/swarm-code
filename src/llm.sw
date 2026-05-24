@@ -143,10 +143,20 @@ fun build_request_body(messages, opts) {
     max_tokens = map_get(opts, 'max_tokens')
     tool_format = map_get(opts, 'tool_format')
 
+    # Drain any pending image attachments (from read_image) and inject
+    # them into the LAST user message as OpenAI multimodal content
+    # blocks. Cleared from the queue so each image is sent exactly once.
+    pending = Vision.get_pending(opts)
+    messages_with_images = if (length(pending) == 0) { messages }
+                          else {
+                              Vision.clear(opts)
+                              inject_attachments(messages, pending)
+                          }
+
     msg_maps = if (tool_format == 'native') {
-        messages_to_api_native(messages, [])
+        messages_to_api_native(messages_with_images, [])
     } else {
-        messages_to_api_inband(messages, [])
+        messages_to_api_inband(messages_with_images, [])
     }
 
     base = %{
@@ -162,6 +172,76 @@ fun build_request_body(messages, opts) {
         inband_req(base)
     }
     json_encode(final_req)
+}
+
+# ------------------------------------------------------------
+# Attachment injection — turn the last user message in `messages`
+# into a multimodal content list, with image_url blocks before the
+# text block. Called once per outbound request when Vision.get_pending
+# returns a non-empty queue.
+# ------------------------------------------------------------
+fun inject_attachments(messages, attachments) {
+    idx = last_user_idx(messages, length(messages) - 1)
+    if (idx < 0) { messages }
+    else {
+        target = nth(messages, idx)
+        replaced = attach_blocks_to(target, attachments)
+        replace_at(messages, idx, replaced, 0, [])
+    }
+}
+
+fun last_user_idx(messages, i) {
+    if (i < 0) { 0 - 1 }
+    else {
+        m = nth(messages, i)
+        if (map_get(m, 'role') == 'user') { i }
+        else { last_user_idx(messages, i - 1) }
+    }
+}
+
+fun nth(lst, i) {
+    if (i == 0) { hd(lst) }
+    else { nth(tl(lst), i - 1) }
+}
+
+fun replace_at(lst, idx, new_item, i, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        item = if (i == idx) { new_item } else { hd(lst) }
+        replace_at(tl(lst), idx, new_item, i + 1, list_append(acc, item))
+    }
+}
+
+fun attach_blocks_to(msg, attachments) {
+    text = to_string(map_get(msg, 'content'))
+    img_blocks = build_image_blocks(attachments, [])
+    text_block = %{type: "text", text: text}
+    full_content = list_append(img_blocks, text_block)
+    map_put(msg, 'content', full_content)
+}
+
+fun build_image_blocks(attachments, acc) {
+    if (length(attachments) == 0) { acc }
+    else {
+        a = hd(attachments)
+        block = %{
+            type: "image_url",
+            image_url: %{url: to_string(map_get(a, 'data_url'))}
+        }
+        build_image_blocks(tl(attachments), list_append(acc, block))
+    }
+}
+
+# inband mode fallback: pull the text block out of a multimodal
+# content list. Images are dropped silently — inband protocol
+# (Gemma 4 in-band tool calls) is text-only.
+fun extract_text_block(content_list) {
+    if (length(content_list) == 0) { "" }
+    else {
+        b = hd(content_list)
+        if (map_get(b, 'type') == "text") { to_string(map_get(b, 'text')) }
+        else { extract_text_block(tl(content_list)) }
+    }
 }
 
 fun native_req(base, opts) {
@@ -203,7 +283,13 @@ fun one_msg_native(msg) {
         %{role: "system", content: to_string(map_get(msg, 'content'))}
     }
     else { if (role == 'user') {
-        %{role: "user", content: to_string(map_get(msg, 'content'))}
+        # User content may have been transformed by inject_attachments
+        # into a list of multimodal content blocks. Pass it through so
+        # the wire format is [{type:"image_url", …}, {type:"text", …}].
+        # Plain string content stays a string.
+        c = map_get(msg, 'content')
+        if (is_list(c) == 'true') { %{role: "user", content: c} }
+        else { %{role: "user", content: to_string(c)} }
     }
     else { if (role == 'assistant') {
         build_api_assistant_native(msg)
@@ -288,7 +374,14 @@ fun one_msg_inband(msg) {
         %{role: "system", content: to_string(map_get(msg, 'content'))}
     }
     else { if (role == 'user') {
-        %{role: "user", content: to_string(map_get(msg, 'content'))}
+        # Inband mode is text-only (Gemma 4 in-band tool protocol can't
+        # carry images). If content is a multimodal list, flatten to
+        # just the text block — images are silently dropped. Use a
+        # vision-capable profile (kimi) if you need image input.
+        c = map_get(msg, 'content')
+        text_only = if (is_list(c) == 'true') { extract_text_block(c) }
+                    else { to_string(c) }
+        %{role: "user", content: text_only}
     }
     else { if (role == 'assistant') {
         %{role: "assistant", content: inband_assistant_text(msg)}

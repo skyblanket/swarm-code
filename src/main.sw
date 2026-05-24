@@ -38,6 +38,7 @@ import Arthopod
 import Memory
 import Skills
 import SessionSearch
+import Vision
 import Heartbeat
 import Background
 import Telemetry
@@ -158,6 +159,10 @@ fun main() {
     opts3c = map_put(opts3c, 'stream_state_table', stream_state)
     opts3c = map_put(opts3c, 'mcp_table', mcp_table)
     opts3c = map_put(opts3c, 'mcp_schemas', mcp_schemas)
+    # Vision: session-scoped ETS queue. read_image tool appends data
+    # URLs here; llm.sw drains + clears on each outbound request.
+    attachments_table = ets_new()
+    opts3c = map_put(opts3c, 'attachments_table', attachments_table)
     # Autonomy: wake the LLM on bg_done events so the model can react to
     # background activity without a user prompt. Default ON. Disable with
     # SWARM_CODE_AUTONOMY=0.

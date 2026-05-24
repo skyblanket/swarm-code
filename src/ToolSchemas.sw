@@ -24,7 +24,7 @@ fun all_schemas() {
      glob_s(), grep_s(), todo_write_s(), web_search_s(), web_fetch_s(),
      remember_s(), recall_s(), memory_list_s(),
      learn_skill_s(), recall_skill_s(), skill_list_s(), forget_skill_s(),
-     session_search_s(),
+     session_search_s(), read_image_s(),
      task_s(),
      browser_launch_s(), browser_navigate_s(), browser_click_s(),
      browser_type_s(), browser_screenshot_s(), browser_get_text_s(),
@@ -249,6 +249,18 @@ fun forget_skill_s() {
 }
 
 # ---------- session search (FTS5 over journals) ----------
+
+fun read_image_s() {
+    tool("read_image",
+        "Attach a local image file to the NEXT request so you can see it. " ++
+        "Call this when the user references an image path (PNG, JPG, JPEG, " ++
+        "GIF, WEBP). The image is base64-encoded and prepended to your " ++
+        "next user message as a multimodal content block. Continue the " ++
+        "turn with your question after attaching — the image becomes " ++
+        "visible on the request that ends the turn.",
+        obj(%{path: s("Absolute or relative path to the image file")},
+            ["path"]))
+}
 
 fun session_search_s() {
     tool("session_search",

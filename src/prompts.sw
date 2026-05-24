@@ -110,6 +110,7 @@ fun tool_descriptions() {
     skill_list_desc() ++ "\n" ++
     forget_skill_desc() ++ "\n" ++
     session_search_desc() ++ "\n" ++
+    read_image_desc() ++ "\n" ++
     background_desc() ++ "\n" ++
     bg_status_desc() ++ "\n" ++
     bg_result_desc() ++ "\n" ++
@@ -261,6 +262,16 @@ fun forget_skill_desc() {
     "- forget_skill: Delete a skill directory by slug. Use when a skill is " ++
     "wrong or outdated.\n" ++
     "  schema: {\"slug\":\"string\"}"
+}
+
+fun read_image_desc() {
+    "- read_image: Attach a local image (PNG/JPG/JPEG/GIF/WEBP) to your " ++
+    "NEXT request so you can actually see it. Use when the user references " ++
+    "an image path. The file is base64-encoded into a data URL and " ++
+    "prepended to the next user message as a multimodal content block. " ++
+    "After calling, continue the turn with your question — the image " ++
+    "becomes visible on the request that closes the turn.\n" ++
+    "  schema: {\"path\":\"absolute or relative file path\"}"
 }
 
 fun session_search_desc() {

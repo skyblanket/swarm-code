@@ -21,6 +21,7 @@ module Tools
 import Memory
 import Skills
 import SessionSearch
+import Vision
 import Background
 import Heartbeat
 import Telemetry
@@ -86,8 +87,9 @@ fun exec(name, args, opts) {
     else { if (name == 'forget_skill')       { do_forget_skill(args) }
     else { if (name == 'skill_list')         { do_skill_list(args) }
     else { if (name == 'session_search')     { do_session_search(args) }
+    else { if (name == 'read_image')         { do_read_image(args, opts) }
     else { "error: unknown tool '" ++ to_string(name) ++ "'"
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # ------------------------------------------------------------
@@ -1491,5 +1493,37 @@ fun do_session_search(args) {
                   if (n > 30) { 30 } else { if (n < 1) { 1 } else { n }}
               }
         SessionSearch.search_render(to_string(q), cap)
+    }
+}
+
+# ============================================================
+# read_image — attach an image to the next user-message turn
+# ============================================================
+# The model calls this when the user references a local image path.
+# The handler base64-encodes the file and enqueues it in the
+# session attachment table. On the NEXT outbound request, llm.sw
+# transforms the user message into a multimodal content array.
+fun do_read_image(args, opts) {
+    if (Vision.supports(opts) == 'false') {
+        "error: this profile doesn't support vision — switch to one " ++
+        "with vision:true in settings.json (e.g. kimi), or set " ++
+        "SWARM_CODE_VISION=1 to force"
+    }
+    else {
+        path = map_get(args, 'path')
+        if (path == nil || string_length(to_string(path)) == 0) {
+            "error: read_image requires 'path'"
+        }
+        else {
+            entry = Vision.attach(opts, to_string(path))
+            if (entry == nil) {
+                "error: could not read or encode " ++ to_string(path) ++
+                " (file missing, unsupported MIME, or base64 failed)"
+            }
+            else {
+                "ok: image attached — it will appear in your NEXT " ++
+                "request. Continue the turn with your question."
+            }
+        }
     }
 }

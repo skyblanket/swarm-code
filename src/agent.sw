@@ -397,7 +397,12 @@ fun route_input(line, history, opts) {
             print("\e[2m[history reset]\e[0m")
             [hd(history)]
         }
-        else { if (string_starts_with(trimmed, "/") == 'true') {
+        # Only dispatch as a slash command if the first token matches a
+        # known command — that way pasted Unix paths like /Users/sky/foo.png
+        # or /tmp/bar fall through to the chat path instead of getting
+        # rejected as "unknown command".
+        else { if (string_starts_with(trimmed, "/") == 'true' &&
+                   is_known_slash_command(first_token(trimmed)) == 'true') {
             slash_dispatch(trimmed, history, opts)
         }
         else {
@@ -1595,6 +1600,49 @@ fun interpret_picker(idx, table, cache_key) {
 # Tools.exec / dispatch_tool (which compare against atoms).
 # Unknown strings return the string as-is so MCP names (mcp__*) and
 # any future tools still resolve.
+# Return the first whitespace-separated token of `s` (or `s` itself
+# if there's no whitespace). Used to extract the slash command name
+# from a line like `/profile gemma-local`.
+fun first_token(s) {
+    parts = string_split(s, " ")
+    if (length(parts) == 0) { s } else { hd(parts) }
+}
+
+# Is `cmd` (with leading slash) a recognised slash-command name?
+# Filesystem paths like `/Users/...` / `/tmp/...` / `/home/...` aren't
+# in this list, so they fall through route_input to the chat path
+# instead of getting eaten by the dispatcher.
+fun is_known_slash_command(cmd) {
+    if (cmd == "/help") { 'true' }
+    else { if (cmd == "/tools") { 'true' }
+    else { if (cmd == "/status") { 'true' }
+    else { if (cmd == "/clear") { 'true' }
+    else { if (cmd == "/history") { 'true' }
+    else { if (cmd == "/tokens") { 'true' }
+    else { if (cmd == "/model") { 'true' }
+    else { if (cmd == "/profile") { 'true' }
+    else { if (cmd == "/profiles") { 'true' }
+    else { if (cmd == "/profile-clear") { 'true' }
+    else { if (cmd == "/search") { 'true' }
+    else { if (cmd == "/compact") { 'true' }
+    else { if (cmd == "/save") { 'true' }
+    else { if (cmd == "/resume") { 'true' }
+    else { if (cmd == "/sessions") { 'true' }
+    else { if (cmd == "/todos") { 'true' }
+    else { if (cmd == "/cost") { 'true' }
+    else { if (cmd == "/telemetry") { 'true' }
+    else { if (cmd == "/stats") { 'true' }
+    else { if (cmd == "/autonomy") { 'true' }
+    else { if (cmd == "/daemon") { 'true' }
+    else { if (cmd == "/reflect") { 'true' }
+    else { if (cmd == "/buddy") { 'true' }
+    else { if (cmd == "/mcp") { 'true' }
+    else { if (cmd == "/quit") { 'true' }
+    else { if (cmd == "/exit") { 'true' }
+    else { if (cmd == "/reset") { 'true' }
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}
+}
+
 fun string_to_atom(s) {
     if (s == "bash") { 'bash' }
     else { if (s == "read") { 'read' }
@@ -1639,8 +1687,9 @@ fun string_to_atom(s) {
     else { if (s == "forget_skill")       { 'forget_skill' }
     else { if (s == "skill_list")         { 'skill_list' }
     else { if (s == "session_search")     { 'session_search' }
+    else { if (s == "read_image")         { 'read_image' }
     else { s }
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # Truncate string for inline preview.
