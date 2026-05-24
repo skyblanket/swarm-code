@@ -99,6 +99,7 @@ fun apply_override(opts) {
                 b = override_field(a, ov, 'model')
                 c = override_field(b, ov, 'api_key')
                 d = override_field(c, ov, 'tool_format')
+                d = override_field(d, ov, 'vision')
                 # Re-derive temperature when model changes — Kimi K2.x
                 # rejects any temperature other than 1.0.
                 if (map_get(ov, 'model') != nil) {

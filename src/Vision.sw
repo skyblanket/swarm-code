@@ -108,26 +108,58 @@ fun get_table(opts) { map_get(opts, 'attachments_table') }
 # with env var SWARM_CODE_VISION=1 for ad-hoc testing.
 # ------------------------------------------------------------
 fun supports(opts) {
+    # Default ON. The model can always try read_image; if the endpoint
+    # rejects multimodal content the user sees a clean server error and
+    # can switch profiles. Hard-disable a profile with vision:"false"
+    # in settings.json or SWARM_CODE_VISION=0.
+    #
+    # Resolution: env > opts.vision (live override) > profile.vision >
+    # root settings.vision > default true. opts.vision is set by
+    # llm.sw's apply_override when /profile NAME is invoked mid-session,
+    # so vision tracks live profile swaps.
     env_force = getenv("SWARM_CODE_VISION")
     if (env_force == "1") { 'true' }
+    else { if (env_force == "0") { 'false' }
     else {
-        settings = map_get(opts, 'settings')
-        profile_name = map_get(opts, 'profile')
-        if (settings == nil || profile_name == nil) { 'false' }
+        live = map_get(opts, 'vision')
+        if (is_falsy_flag(live) == 'true') { 'false' }
+        else { if (is_truthy_flag(live) == 'true') { 'true' }
         else {
-            profiles = map_get(settings, 'profiles')
-            if (profiles == nil) { 'false' }
+            settings = map_get(opts, 'settings')
+            if (settings == nil) { 'true' }  # no settings → default on
             else {
-                p = profile_lookup(profiles, to_string(profile_name))
-                if (p == nil) { 'false' }
+                profile_name = map_get(opts, 'profile')
+                profile_v = if (profile_name == nil) { nil }
+                            else {
+                                profiles = map_get(settings, 'profiles')
+                                if (profiles == nil) { nil }
+                                else {
+                                    p = profile_lookup(profiles, to_string(profile_name))
+                                    if (p == nil) { nil } else { map_get(p, 'vision') }
+                                }
+                            }
+                if (is_falsy_flag(profile_v) == 'true') { 'false' }
+                else { if (is_truthy_flag(profile_v) == 'true') { 'true' }
                 else {
-                    v = map_get(p, 'vision')
-                    if (v == 'true' || v == "true" || v == 1) { 'true' }
-                    else { 'false' }
-                }
+                    root_v = map_get(settings, 'vision')
+                    if (is_falsy_flag(root_v) == 'true') { 'false' }
+                    else { 'true' }   # default ON
+                }}
             }
-        }
-    }
+        }}
+    }}
+}
+
+fun is_truthy_flag(v) {
+    if (v == nil) { 'false' }
+    else { if (v == 'true' || v == "true" || v == 1) { 'true' }
+    else { 'false' }}
+}
+
+fun is_falsy_flag(v) {
+    if (v == nil) { 'false' }
+    else { if (v == 'false' || v == "false" || v == 0) { 'true' }
+    else { 'false' }}
 }
 
 # JSON-decoded maps have atom keys, so map_get(profiles, "kimi")

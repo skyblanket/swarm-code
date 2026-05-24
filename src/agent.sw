@@ -878,7 +878,8 @@ fun profile_to_override(p) {
     b = profile_field(a, p, 'model')
     c = profile_field(b, p, 'api_key')
     d = profile_field(c, p, 'tool_format')
-    d
+    e = profile_field(d, p, 'vision')
+    e
 }
 
 fun profile_field(acc, p, key) {
