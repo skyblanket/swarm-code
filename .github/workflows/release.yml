@@ -86,6 +86,8 @@ jobs:
 
       - name: Run module tests
         working-directory: swarm-code
+        env:
+          SWARMRT: ${{ github.workspace }}/swarmrt
         run: |
           # 8 module tests built by the parallel test-gen wave. Each
           # is `module Main` that sys_exit(0) on pass. Catches the

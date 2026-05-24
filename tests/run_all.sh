@@ -2,7 +2,13 @@
 # Run every tests/*_test.sw — build to a temp binary, run, check exit code.
 # Each test is `module Main` that sys_exit(0) on pass, non-zero on fail.
 cd "$(dirname "$0")/.."
-SWC=${SWC:-/Users/sky/swarmrt/bin/swc}
+# Resolve swc: explicit $SWC wins, else $SWARMRT/bin/swc, else sibling repo.
+if [ -n "$SWC" ]; then :
+elif [ -n "$SWARMRT" ] && [ -x "$SWARMRT/bin/swc" ]; then SWC="$SWARMRT/bin/swc"
+elif [ -x "../swarmrt/bin/swc" ]; then SWC="../swarmrt/bin/swc"
+elif [ -x "/Users/sky/swarmrt/bin/swc" ]; then SWC="/Users/sky/swarmrt/bin/swc"
+else echo "FAIL: swc not found — set \$SWC or \$SWARMRT"; exit 2
+fi
 PASS=0; FAIL=0
 for f in tests/*_test.sw; do
   m=$(basename "$f" _test.sw)
