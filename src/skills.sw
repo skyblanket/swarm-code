@@ -226,11 +226,19 @@ fun as_prompt_section(token) {
             if (string_length(trimmed) == 0) { "" }
             else {
                 "\n\n=== SKILLS (" ++ skills_dir() ++ ") ===\n" ++
-                "Reusable procedures you have learned. Each skill is a small\n" ++
-                "playbook for a recurring task — invoke when you see a matching\n" ++
-                "trigger phrase in the user's request. Use `recall_skill <slug>`\n" ++
-                "to read a skill's full instructions; save new ones with\n" ++
-                "`learn_skill`.\n\n" ++
+                "Reusable procedures you have learned. Each entry is a small\n" ++
+                "playbook for a recurring task.\n\n" ++
+                "**ACTIVATION RULE — read this carefully:**\n" ++
+                "When a user request matches a skill's description OR triggers,\n" ++
+                "call `recall_skill(slug)` FIRST — read the full playbook BEFORE\n" ++
+                "writing any code, running any other tool, or asking clarifying\n" ++
+                "questions. Skills encode hard-won procedures; ignoring a\n" ++
+                "matching skill = redoing solved work. After recall, follow the\n" ++
+                "playbook end-to-end. If multiple skills match, recall the most\n" ++
+                "specific one first.\n\n" ++
+                "Save new playbooks with `learn_skill` once you've solved a\n" ++
+                "non-trivial recurring task; forget stale ones with " ++
+                "`forget_skill`.\n\n" ++
                 trimmed ++ "\n"
             }
         }

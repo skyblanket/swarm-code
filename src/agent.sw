@@ -31,6 +31,9 @@ import Arthopod
 import Reader
 import Log
 import Mcp
+import Skills
+import SessionSearch
+import Vision
 
 export [run, run_headless]
 
@@ -414,6 +417,11 @@ fun route_input(line, history, opts) {
                     Arthopod.render_with_bubble(user_buddy, bubble)
                 }
             }
+            # Auto-detect image paths in the user's message and queue
+            # them for attachment before sending. Mirrors claude-code's
+            # drag-drop / path-paste pattern — no read_image call needed.
+            attached = Vision.auto_attach(opts, line)
+            print_attachment_summary(attached)
             new_hist = list_append(history, LLM.new_message_user(line))
             pre_turn_hist = if (length(new_hist) > compact_threshold()) {
                 print("\e[2m[auto-compacting " ++ to_string(length(new_hist)) ++ " messages]\e[0m")
@@ -1673,6 +1681,24 @@ fun interpret_picker(idx, table, cache_key) {
 # Tools.exec / dispatch_tool (which compare against atoms).
 # Unknown strings return the string as-is so MCP names (mcp__*) and
 # any future tools still resolve.
+# Print a one-line confirmation per image auto-attached from user
+# input. Quiet when nothing matched (no surprise output on normal
+# chat). Quiet too when a path was found but the profile doesn't
+# support vision — Vision.auto_attach already returned [].
+fun print_attachment_summary(paths) {
+    if (length(paths) == 0) { 'noop' }
+    else { print_attachment_loop(paths) }
+}
+
+fun print_attachment_loop(paths) {
+    if (length(paths) == 0) { 'ok' }
+    else {
+        p = hd(paths)
+        print(UI.grey_text() ++ "  📎 attached: " ++ p ++ UI.reset())
+        print_attachment_loop(tl(paths))
+    }
+}
+
 # Return the first whitespace-separated token of `s` (or `s` itself
 # if there's no whitespace). Used to extract the slash command name
 # from a line like `/profile gemma-local`.
