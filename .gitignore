@@ -7,8 +7,12 @@
 !/Makefile
 !/README.md
 !/LICENSE
+!/CHANGELOG.md
+!/CONTRIBUTING.md
 !/scripts/
 !/src/
+!/docs/
+!/tests/
 
 # Inside scripts/, only install.* belongs to swarm-code; the rest is
 # noise from earlier sessions and stays untracked.

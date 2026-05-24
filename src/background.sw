@@ -1,5 +1,7 @@
 module Background
 
+import Util
+
 # ============================================================
 # Background — async shell tasks (OS-detached, heartbeat-monitored)
 # ============================================================
@@ -71,7 +73,7 @@ fun launch(table, command, label) {
     exit_file = "/tmp/swarm-code-" ++ task_id ++ ".exit"
     wrapped = "(" ++ command ++ "); echo $? > " ++ exit_file
     detach_cmd =
-        "nohup sh -c " ++ shell_q(wrapped) ++
+        "nohup sh -c " ++ Util.shell_q(wrapped) ++
         " > " ++ log_file ++ " 2>&1 & " ++
         "echo $! > " ++ pid_file ++ "; " ++
         "disown"
@@ -94,10 +96,6 @@ fun launch(table, command, label) {
 }
 
 # Shell-escape helper (single-quote wrap, escape embedded quotes).
-fun shell_q(s) {
-    "'" ++ string_replace(s, "'", "'\\''") ++ "'"
-}
-
 # Current status of a task.
 fun status(table, task_id) {
     s = ets_get(table, task_id ++ "/status")
@@ -119,7 +117,7 @@ fun result(table, task_id) {
             log_file = ets_get(table, task_id ++ "/log_file")
             tail = if (log_file == nil) { "" }
                    else {
-                       r = shell("tail -n 40 " ++ shell_q(to_string(log_file)) ++ " 2>&1")
+                       r = shell("tail -n 40 " ++ Util.shell_q(to_string(log_file)) ++ " 2>&1")
                        elem(r, 1)
                    }
             "[" ++ to_string(s) ++ " · exit " ++ to_string(exit_code) ++ "]\n" ++
@@ -138,7 +136,7 @@ fun tail_log(table, task_id, n_lines) {
         "error: task " ++ task_id ++ " has no log file"
     } else {
         cmd = "tail -n " ++ to_string(n_lines) ++ " " ++
-              shell_q(to_string(log_file)) ++ " 2>&1"
+              Util.shell_q(to_string(log_file)) ++ " 2>&1"
         r = shell(cmd)
         out = elem(r, 1)
         if (string_length(out) == 0) { "(log is empty)" } else { out }

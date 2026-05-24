@@ -1,5 +1,7 @@
 module Vision
 
+import Util
+
 # ============================================================
 # Vision — image attachments for the next LLM request
 # ============================================================
@@ -46,7 +48,7 @@ fun read_as_data_url(path) {
         mime = detect_mime(path)
         if (mime == nil) { nil }
         else {
-            r = shell("base64 -i " ++ shell_q(path) ++ " 2>/dev/null | tr -d '\\n'")
+            r = shell("base64 -i " ++ Util.shell_q(path) ++ " 2>/dev/null | tr -d '\\n'")
             code = elem(r, 0)
             b64 = string_trim(elem(r, 1))
             if (code != 0 || string_length(b64) == 0) { nil }
@@ -179,8 +181,6 @@ fun profile_lookup_loop(keys, values, name) {
     }
 }
 
-fun shell_q(s) { "'" ++ string_replace(s, "'", "'\\''") ++ "'" }
-
 # ------------------------------------------------------------
 # Path auto-detection — scan a line of user input for tokens that
 # look like image file paths and exist on disk. Lets users drop a
@@ -311,18 +311,18 @@ fun paste_from_clipboard(opts) {
     tmp_path = "/tmp/swarm_paste_" ++ ts ++ ".png"
     cmd =
         "osascript -e 'set png to the clipboard as «class PNGf»' " ++
-        "        -e 'set fh to open for access POSIX file " ++ shell_q(tmp_path) ++
+        "        -e 'set fh to open for access POSIX file " ++ Util.shell_q(tmp_path) ++
         "                  with write permission' " ++
         "        -e 'set eof of fh to 0' " ++
         "        -e 'write png to fh' " ++
         "        -e 'close access fh' 2>/dev/null || " ++
-        "xclip -selection clipboard -t image/png -o > " ++ shell_q(tmp_path) ++
+        "xclip -selection clipboard -t image/png -o > " ++ Util.shell_q(tmp_path) ++
         " 2>/dev/null"
     r = shell(cmd)
     if (file_exists(tmp_path) == 'false') { nil }
     else {
         # Empty file = clipboard didn't have an image
-        sz_r = shell("wc -c < " ++ shell_q(tmp_path) ++ " 2>/dev/null")
+        sz_r = shell("wc -c < " ++ Util.shell_q(tmp_path) ++ " 2>/dev/null")
         sz = string_trim(elem(sz_r, 1))
         if (sz == "0" || sz == "") {
             file_delete(tmp_path)

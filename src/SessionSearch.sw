@@ -1,5 +1,7 @@
 module SessionSearch
 
+import Util
+
 # ============================================================
 # SessionSearch — SQLite FTS5 over every conversation turn
 # ============================================================
@@ -209,9 +211,4 @@ fun last_part(parts) {
     if (length(parts) == 0) { "?" }
     else { if (length(tl(parts)) == 0) { hd(parts) }
     else { last_part(tl(parts)) }}
-}
-
-fun shell_q(s) {
-    safe = string_replace(s, "'", "'\\''")
-    "'" ++ safe ++ "'"
 }

@@ -37,6 +37,7 @@ import Vision
 import Scheduler
 import ToolRegistry
 import Trajectory
+import Util
 
 export [run, run_headless]
 
@@ -881,7 +882,7 @@ fun apply_model_override(model_name) {
 fun clear_profile_override() {
     p = profile_override_path()
     if (file_exists(p) == 'true') {
-        shell("rm -f " ++ shell_quote(p))
+        shell("rm -f " ++ Util.shell_q(p))
         print("\e[2m✓ override cleared — back to launch profile\e[0m")
     } else {
         print("\e[2m(no override active)\e[0m")
@@ -981,11 +982,6 @@ fun profile_field(acc, p, key) {
     v = map_get(p, key)
     if (v == nil) { acc }
     else { map_put(acc, key, to_string(v)) }
-}
-
-fun shell_quote(s) {
-    safe = string_replace(s, "'", "'\\''")
-    "'" ++ safe ++ "'"
 }
 
 fun show_model_info(opts) {

@@ -27,6 +27,7 @@ import Heartbeat
 import Telemetry
 import Browser
 import Mcp
+import Util
 
 export [exec, max_output_bytes]
 
@@ -150,7 +151,7 @@ fun fetch_timeout_s() { 45 }
 # callers can detect to surface a friendly timeout message.
 fun with_timeout(cmd, seconds) {
     "perl -e 'alarm shift; exec @ARGV' " ++ to_string(seconds) ++
-    " sh -c " ++ shell_quote(to_string(cmd))
+    " sh -c " ++ Util.shell_q(to_string(cmd))
 }
 
 # Given the exit code and output from a shell() call wrapped by
@@ -283,7 +284,7 @@ fun do_read(args) {
 }
 
 fun read_file_capped(path, offset, limit) {
-    pq = shell_quote(to_string(path))
+    pq = Util.shell_q(to_string(path))
     # Check if file is binary before reading — binary content poisons the
     # model's context and causes empty responses.
     file_type = elem(shell("file --brief --mime-type " ++ pq), 1)
@@ -462,15 +463,15 @@ fun do_glob(args) {
     } else {
         base = if (path == nil) { "." } else { to_string(path) }
         pat = to_string(pattern)
-        pat_q = shell_quote(pat)
+        pat_q = Util.shell_q(pat)
         # When base is ".", DON'T pass it to rg — `rg --files . ` emits
         # `./`-prefixed paths, and an anchored glob like `src/**/*.sw`
         # never matches `./src/...`. With no path arg rg emits clean
         # relative paths and anchored globs work.
         base_part = if (base == "." || string_length(string_trim(base)) == 0) {
             ""
-        } else { " " ++ shell_quote(base) }
-        base_q = shell_quote(base)
+        } else { " " ++ Util.shell_q(base) }
+        base_q = Util.shell_q(base)
         # ripgrep `--files -g` gives real glob semantics, but rg is
         # often unavailable to a plain /bin/sh (e.g. when it's only a
         # shell function, not a real binary). So the `find` fallback
@@ -487,9 +488,9 @@ fun do_glob(args) {
         pat_nogs = string_replace(pat, "**/", "")
         pat_find = string_replace(pat_nogs, "**", "*")
         find_expr = if (string_contains(pat_find, "/") == 'true') {
-            "-path " ++ shell_quote("*" ++ pat_find)
+            "-path " ++ Util.shell_q("*" ++ pat_find)
         } else {
-            "-name " ++ shell_quote(pat_find)
+            "-name " ++ Util.shell_q(pat_find)
         }
         # Pipe through `sed s|^\./||` to strip the `./` prefix `find`
         # adds when invoked with `.` — matches ripgrep's clean output
@@ -520,16 +521,16 @@ fun do_grep(args) {
         mode = map_get(args, 'output_mode')
         hl = map_get(args, 'head_limit')
         base = if (path == nil) { "." } else { to_string(path) }
-        pat_q = shell_quote(to_string(pattern))
+        pat_q = Util.shell_q(to_string(pattern))
         # Omit a "." path so rg emits clean (non-`./`-prefixed) paths.
         base_part = if (base == "." || string_length(string_trim(base)) == 0) {
             ""
-        } else { " " ++ shell_quote(base) }
-        base_q = shell_quote(base)
+        } else { " " ++ Util.shell_q(base) }
+        base_q = Util.shell_q(base)
 
         # Optional glob filter (rg --glob / mirrors Claude Code's Grep).
         glob_flag = if (glob_arg == nil) { "" }
-                    else { " -g " ++ shell_quote(to_string(glob_arg)) }
+                    else { " -g " ++ Util.shell_q(to_string(glob_arg)) }
 
         # output_mode: 'content' (default — file:line:text), 'count'
         # (-c), 'files_with_matches' (-l). Earlier do_grep ignored this
@@ -662,11 +663,6 @@ fun join_lines(lst, acc) {
 # with '\'' — close the current single-quoted string, insert an escaped
 # single quote, reopen the single-quoted string. Handles Python source
 # with raw strings, jq filters, anything.
-fun shell_quote(s) {
-    safe = string_replace(s, "'", "'\\''")
-    "'" ++ safe ++ "'"
-}
-
 # Whitelist check: lowercase letters only. Used to vet things we
 # splice into shell as flags (rg --type=<lang>) where the value must
 # never be a shell metachar.
@@ -904,9 +900,9 @@ fun do_web_search(args) {
         max_n = if (max_raw == nil) { 5 } else { max_raw }
         # Python script: read query from env var to avoid shell-quote hell.
         py_script = ddg_python_script()
-        cmd = "SWC_WSQ=" ++ shell_quote(to_string(q)) ++
+        cmd = "SWC_WSQ=" ++ Util.shell_q(to_string(q)) ++
               " SWC_WSN=" ++ to_string(max_n) ++
-              " python3 -c " ++ shell_quote(py_script)
+              " python3 -c " ++ Util.shell_q(py_script)
         result = shell(with_timeout(cmd, fetch_timeout_s()))
         code = elem(result, 0)
         out = elem(result, 1)
@@ -1005,7 +1001,7 @@ fun ddg_python_script() {
 # ------------------------------------------------------------
 fun do_git_status(args) {
     cwd_arg = map_get(args, 'cwd')
-    cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ shell_quote(to_string(cwd_arg)) ++ " " }
+    cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     cmd = "git " ++ cwd_part ++ "status --porcelain --branch 2>&1 | head -n 100"
     r = shell(with_timeout(cmd, git_timeout_s()))
     code = elem(r, 0)
@@ -1023,7 +1019,7 @@ fun do_git_status(args) {
 fun do_git_diff(args) {
     cwd_arg = map_get(args, 'cwd')
     staged = map_get(args, 'staged')
-    cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ shell_quote(to_string(cwd_arg)) ++ " " }
+    cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     flag = if (staged == 'true') { "--staged " } else { "" }
     cmd = "git " ++ cwd_part ++ "diff " ++ flag ++ "--no-color 2>&1"
     r = shell(with_timeout(cmd, git_timeout_s()))
@@ -1050,10 +1046,10 @@ fun do_git_commit(args) {
     if (msg == nil) { "error: git_commit needs 'message'" }
     else {
         stage_list = if (files == nil) { "." } else { join_files(files, "") }
-        cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ shell_quote(to_string(cwd_arg)) ++ " " }
+        cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
         cmd =
             "git " ++ cwd_part ++ "add " ++ stage_list ++
-            " && git " ++ cwd_part ++ "commit -m " ++ shell_quote(to_string(msg)) ++
+            " && git " ++ cwd_part ++ "commit -m " ++ Util.shell_q(to_string(msg)) ++
             " 2>&1 && git " ++ cwd_part ++ "rev-parse --short HEAD"
         r = shell(with_timeout(cmd, git_timeout_s()))
         code = elem(r, 0)
@@ -1073,7 +1069,7 @@ fun join_files(files, acc) {
     if (length(files) == 0) { acc }
     else {
         f = hd(files)
-        quoted = shell_quote(to_string(f))
+        quoted = Util.shell_q(to_string(f))
         new_acc = if (string_length(acc) == 0) { quoted } else { acc ++ " " ++ quoted }
         join_files(tl(files), new_acc)
     }
@@ -1117,12 +1113,12 @@ fun do_code_search(args) {
                         if (is_simple_word(ls) == 'true') { "--type " ++ ls ++ " " }
                         else { "" }
                     }
-        base_q = shell_quote(base)
+        base_q = Util.shell_q(base)
         # Prefer rg (ripgrep) for speed. Fall back to grep -rn if not installed.
         cmd =
             "(command -v rg >/dev/null && rg -n --no-heading --color=never " ++ lang_flag ++
-            shell_quote(rgx) ++ " " ++ base_q ++
-            " || grep -rn --color=never -E " ++ shell_quote(rgx) ++ " " ++ base_q ++
+            Util.shell_q(rgx) ++ " " ++ base_q ++
+            " || grep -rn --color=never -E " ++ Util.shell_q(rgx) ++ " " ++ base_q ++
             ") 2>&1 | head -n 80"
         r = shell(with_timeout(cmd, search_timeout_s()))
         code = elem(r, 0)
@@ -1165,8 +1161,8 @@ fun do_log_wait(args, opts) {
             # instead of GNU `timeout` (which isn't on base macOS).
             # Quote BOTH the pattern and the log path — both reach us
             # from the model.
-            inner = "until grep -q " ++ shell_quote(to_string(pat)) ++
-                    " " ++ shell_quote(log_path) ++ " 2>/dev/null; do sleep 0.5; done"
+            inner = "until grep -q " ++ Util.shell_q(to_string(pat)) ++
+                    " " ++ Util.shell_q(log_path) ++ " 2>/dev/null; do sleep 0.5; done"
             r = shell(with_timeout(inner, timeout_n))
             code = elem(r, 0)
             if (code == 0) {

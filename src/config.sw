@@ -1,5 +1,7 @@
 module Config
 
+import Util
+
 # ============================================================
 # Config — settings.json, SWARM.md, permissions, hooks
 # ============================================================
@@ -293,9 +295,9 @@ fun matches(matcher, tool_name) {
 # with shell_q_local because args_json contains arbitrary JSON
 # (including single quotes inside strings).
 fun run_hook_cmd(cmd, event, tool_name, args_json) {
-    args_safe = shell_q_local(to_string(args_json))
-    full = "export SWARM_CODE_EVENT=" ++ shell_q_local(to_string(event)) ++ "; " ++
-           "export SWARM_CODE_TOOL="  ++ shell_q_local(to_string(tool_name)) ++ "; " ++
+    args_safe = Util.shell_q(to_string(args_json))
+    full = "export SWARM_CODE_EVENT=" ++ Util.shell_q(to_string(event)) ++ "; " ++
+           "export SWARM_CODE_TOOL="  ++ Util.shell_q(to_string(tool_name)) ++ "; " ++
            "export SWARM_CODE_ARGS="  ++ args_safe ++ "; " ++
            cmd
     result = shell(full)
@@ -304,7 +306,3 @@ fun run_hook_cmd(cmd, event, tool_name, args_json) {
 }
 
 # Local single-quote wrap (Config can't import Tools — circular).
-fun shell_q_local(s) {
-    safe = string_replace(s, "'", "'\\''")
-    "'" ++ safe ++ "'"
-}

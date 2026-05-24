@@ -38,6 +38,7 @@ module Skills
 # recall_skill tool when the agent decides a skill matches.
 
 import Memory
+import Util
 
 export [
     load, skills_dir, index_path, skill_dir, skill_file_path,
@@ -203,11 +204,6 @@ fun nth_loop(lst, idx) {
 # Slugify a human name. Defer to Memory.slugify so the rules
 # stay consistent across crumbs.
 fun slugify(s) { Memory.slugify(s) }
-
-fun shell_q(s) {
-    safe = string_replace(s, "'", "'\\''")
-    "'" ++ safe ++ "'"
-}
 
 # ------------------------------------------------------------
 # System-prompt section — injected at session start (like Memory).

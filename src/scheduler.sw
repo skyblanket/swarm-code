@@ -1,5 +1,7 @@
 module Scheduler
 
+import Util
+
 # ============================================================
 # Scheduler — interval-based recurring agent runs
 # ============================================================
@@ -214,9 +216,9 @@ fun dispatch(job) {
     # bash -c lets the outer wrapper see a clean exit immediately while
     # the actual swarm-code -p job keeps running detached.
     inner =
-        "nohup " ++ shell_q(bin) ++ " -p " ++ shell_q(prompt) ++
-        " > " ++ shell_q(out_path) ++ " 2>&1 &"
-    shell("bash -c " ++ shell_q(inner))
+        "nohup " ++ Util.shell_q(bin) ++ " -p " ++ Util.shell_q(prompt) ++
+        " > " ++ Util.shell_q(out_path) ++ " 2>&1 &"
+    shell("bash -c " ++ Util.shell_q(inner))
     'dispatched'
 }
 
@@ -227,8 +229,6 @@ fun swarm_binary_path() {
     if (env_bin != nil && string_length(env_bin) > 0) { env_bin }
     else { "/Users/sky/swarm-code/bin/swarm-code" }
 }
-
-fun shell_q(s) { "'" ++ string_replace(s, "'", "'\\''") ++ "'" }
 
 # Minimal int parser — borrowed from main.sw. Returns 0 on garbage,
 # which causes parse_interval to reject (we require > 0).

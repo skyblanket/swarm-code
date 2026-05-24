@@ -12,7 +12,7 @@ SOURCES := $(wildcard $(SRC_DIR)/*.sw)
 
 TESTBIN := bin/swarm-code-test
 
-.PHONY: all clean run test
+.PHONY: all clean run test smoke
 
 all: $(BIN)
 
@@ -35,6 +35,11 @@ clean:
 
 run: $(BIN)
 	./$(BIN)
+
+# Smoke test — boots the binary in headless mode, runs one bash tool call,
+# verifies the response. Used by tests/smoke.sh.
+smoke: $(BIN)
+	@BIN=./$(BIN) ./tests/smoke.sh
 
 # Handy one-liner for ad hoc testing against a local endpoint.
 run-local: $(BIN)
