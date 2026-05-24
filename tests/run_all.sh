@@ -6,7 +6,7 @@ SWC=${SWC:-/Users/sky/swarmrt/bin/swc}
 PASS=0; FAIL=0
 for f in tests/*_test.sw; do
   m=$(basename "$f" _test.sw)
-  out=$(mktemp -t swarm_test_$m)
+  out=$(mktemp -t swarm_test_${m}.XXXXXX)
   if ! "$SWC" build "$f" -o "$out" >/dev/null 2>&1; then
     echo "  ✗ $m  (build failed)"
     FAIL=$((FAIL+1)); rm -f "$out"; continue
