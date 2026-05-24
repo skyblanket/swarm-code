@@ -300,7 +300,14 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     jdir = session_dir()
     file_mkdir(jdir)
     ap = journal_active_ptr()
-    prev_ptr = if (file_exists(ap) == 'true') { file_read(ap) } else { nil }
+    # --no-resume (or SWARM_CODE_NO_RESUME=1): skip the journal-replay path
+    # entirely. Used by parallel headless agents that would otherwise all
+    # race on the same .active pointer and trigger compaction storms.
+    no_resume = if (map_get(opts, 'no_resume') == 'true') { 'true' }
+                else { if (getenv("SWARM_CODE_NO_RESUME") == "1") { 'true' }
+                else { 'false' }}
+    prev_ptr = if (no_resume == 'true') { nil }
+               else { if (file_exists(ap) == 'true') { file_read(ap) } else { nil }}
     resumed_raw = if (prev_ptr == nil) { [] }
                   else {
                       prev_path = string_trim(prev_ptr)

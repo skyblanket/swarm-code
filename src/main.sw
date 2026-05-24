@@ -61,6 +61,11 @@ fun main() {
                 else { if (has_flag(cli_args, "--print") == 'true') { 'true' }
                 else { 'false' }}
     json_mode = if (has_flag(cli_args, "--json") == 'true') { 'true' } else { 'false' }
+    # --no-resume makes the headless run start fresh instead of resuming
+    # the .active session journal. Critical when firing many parallel
+    # `swarm -p ...` agents — they'd otherwise all race on the same
+    # journal and trigger auto-compaction storms.
+    no_resume = if (has_flag(cli_args, "--no-resume") == 'true') { 'true' } else { 'false' }
     arg_prompt = get_print_arg(cli_args)
     headless = p_present
     headless_prompt = if (p_present == 'false') { nil }
@@ -241,7 +246,8 @@ fun main() {
         buddy_prompt
 
     if (headless == 'true') {
-        Agent.run_headless(opts5, system_prompt_text, headless_prompt, json_mode)
+        Agent.run_headless(map_put(opts5, 'no_resume', no_resume),
+                           system_prompt_text, headless_prompt, json_mode)
     } else {
         Agent.run(opts5, system_prompt_text)
     }
@@ -316,7 +322,11 @@ fun handle_cli_flags(args) {
         print_config()
         sys_exit(0)
     }
-    else { "ok" }}}
+    else { if (has_flag(args, "doctor") == 'true' ||
+              has_flag(args, "--doctor") == 'true') {
+        sys_exit(run_doctor())
+    }
+    else { "ok" }}}}
 }
 
 fun print_usage() {
@@ -328,6 +338,8 @@ fun print_usage() {
     print("  swarm --profile NAME   same, via explicit flag (-P also accepted)")
     print("  swarm -p \"<prompt>\"     run one task headless, then exit")
     print("  swarm -p \"...\" --json   headless + a final JSON result line")
+    print("  swarm -p \"...\" --no-resume   start fresh, ignore .active session")
+    print("  swarm doctor           validate config, endpoint, dirs, version")
     print("  swarm --help, -h       show this help and exit")
     print("  swarm --version, -V    print the version and exit")
     print("  swarm --print-config   show the resolved config and exit")
@@ -754,4 +766,232 @@ fun parse_int_loop(s, i, acc) {
         if (d < 0) { acc }
         else { parse_int_loop(s, i + 1, acc * 10 + d) }
     }
+}
+
+# ============================================================
+# swarm doctor — pre-flight health check
+# ============================================================
+# Validates that everything swarm-code needs is in place + working:
+#   * ~/.swarm-code/ directory tree exists
+#   * settings.json parses + lists at least one profile
+#   * active model / endpoint / api_key resolve via load_opts
+#   * endpoint /v1/models responds with HTTP 200 (catches dead URLs,
+#     bad api keys, expired auth)
+#   * skill + memory + session journal directories present
+#
+# Returns 0 if all green, 1 if any ⚠ warning, 2 if any ✗ error.
+# Designed for `swarm doctor && swarm` chaining.
+fun run_doctor() {
+    print("")
+    print(UI.brand_color() ++ "⏺ swarm-code doctor" ++ UI.reset() ++
+          UI.grey_text() ++ "  " ++ swarm_version() ++ UI.reset())
+    print("")
+
+    errors = 0
+    warnings = 0
+
+    # 1. Binary + version
+    print("\e[1m1. binary\e[0m")
+    print("   ✓ swarm-code " ++ swarm_version())
+    print("")
+
+    # 2. ~/.swarm-code/ tree
+    print("\e[1m2. config tree\e[0m")
+    home = getenv("HOME")
+    if (home == nil) {
+        print("   ✗ $HOME is not set — swarm-code has no place to put state")
+        errors = errors + 1
+    } else {
+        base = home ++ "/.swarm-code"
+        dirs = ["", "/memory", "/skills", "/sessions", "/telemetry", "/exports"]
+        warnings = warnings + check_dirs(base, dirs, 0)
+    }
+    print("")
+
+    # 3. settings.json
+    print("\e[1m3. settings.json\e[0m")
+    settings_path = home ++ "/.swarm-code/settings.json"
+    settings = Config.load()
+    if (settings == nil || length(map_keys(settings)) == 0) {
+        print("   ⚠ no settings.json at " ++ settings_path ++ " — defaults will be used")
+        warnings = warnings + 1
+    } else {
+        print("   ✓ " ++ settings_path ++ " parses OK (" ++
+              to_string(length(map_keys(settings))) ++ " top-level keys)")
+        profiles = map_get(settings, 'profiles')
+        if (profiles == nil) {
+            print("   ⚠ no `profiles` map — only the root model is reachable")
+            warnings = warnings + 1
+        } else {
+            n_profiles = length(map_keys(profiles))
+            print("   ✓ " ++ to_string(n_profiles) ++ " profile(s): " ++
+                  doctor_join_keys(map_keys(profiles), ""))
+        }
+    }
+    print("")
+
+    # 4. Active resolved config
+    print("\e[1m4. active opts\e[0m")
+    opts = load_opts()
+    model = to_string(map_get(opts, 'model'))
+    endpoint = to_string(map_get(opts, 'endpoint'))
+    api_key = map_get(opts, 'api_key')
+    print("   ✓ model:    " ++ model)
+    print("   ✓ endpoint: " ++ endpoint)
+    if (api_key == nil || string_length(to_string(api_key)) == 0) {
+        print("   ⚠ api_key:  (not set — fine for local endpoints, fatal for remote)")
+        warnings = warnings + 1
+    } else {
+        print("   ✓ api_key:  (set, " ++
+              to_string(string_length(to_string(api_key))) ++ " chars)")
+    }
+    print("")
+
+    # 5. Live endpoint check — /v1/models with auth
+    print("\e[1m5. endpoint reachable\e[0m")
+    models_url = if (string_ends_with(endpoint, "/chat/completions") == 'true') {
+        # Strip /chat/completions, replace with /models
+        string_sub(endpoint, 0, string_length(endpoint) - 17) ++ "/models"
+    } else { if (string_ends_with(endpoint, "/v1") == 'true') {
+        endpoint ++ "/models"
+    } else {
+        endpoint ++ "/v1/models"
+    }}
+    hdrs = if (api_key == nil) { [{"Accept", "application/json"}] }
+           else { [{"Accept", "application/json"},
+                   {"Authorization", "Bearer " ++ to_string(api_key)}] }
+    resp = http_get(models_url, hdrs)
+    if (resp == nil) {
+        print("   ✗ " ++ models_url ++ " — no response (network down? endpoint typo?)")
+        errors = errors + 1
+    } else {
+        decoded = json_decode(resp)
+        if (decoded == nil) {
+            print("   ⚠ " ++ models_url ++ " — non-JSON reply (HTML error page?)")
+            print("   " ++ UI.grey_text() ++ preview_doctor(resp, 100) ++ UI.reset())
+            warnings = warnings + 1
+        }
+        else { if (map_get(decoded, 'error') != nil) {
+            err = map_get(decoded, 'error')
+            msg = map_get(err, 'message')
+            print("   ✗ server returned error: " ++ to_string(msg))
+            errors = errors + 1
+        }
+        else {
+            data = map_get(decoded, 'data')
+            if (data == nil) {
+                print("   ⚠ endpoint responded but with no `data` field")
+                warnings = warnings + 1
+            } else {
+                print("   ✓ " ++ models_url ++ " responded — " ++
+                      to_string(length(data)) ++ " model(s) advertised")
+            }
+        }}
+    }
+    print("")
+
+    # 6. Skills / memory inventory
+    print("\e[1m6. inventory\e[0m")
+    sk_dir = home ++ "/.swarm-code/skills"
+    if (file_exists(sk_dir) == 'true') {
+        sk = file_list(sk_dir)
+        n_sk = count_subdirs_with(sk, sk_dir, "/SKILL.md", 0)
+        print("   ✓ skills:   " ++ to_string(n_sk))
+    } else {
+        print("   - skills:   0  (dir not created yet)")
+    }
+    mem_dir = home ++ "/.swarm-code/memory"
+    if (file_exists(mem_dir) == 'true') {
+        ms = file_list(mem_dir)
+        n_m = count_md_excluding(ms, "MEMORY.md", 0)
+        print("   ✓ memories: " ++ to_string(n_m))
+    } else {
+        print("   - memories: 0  (dir not created yet)")
+    }
+    sess_dir = home ++ "/.swarm-code/sessions"
+    if (file_exists(sess_dir) == 'true') {
+        sf = file_list(sess_dir)
+        n_s = count_starting_with(sf, "journal-", 0)
+        print("   ✓ sessions: " ++ to_string(n_s) ++ " journals")
+    }
+    print("")
+
+    # Summary
+    print("\e[1msummary\e[0m")
+    if (errors == 0 && warnings == 0) {
+        print(UI.brand_color() ++ "   ✓ all green — swarm-code is ready" ++ UI.reset())
+        0
+    } else { if (errors == 0) {
+        print(UI.grey_text() ++ "   ⚠ " ++ to_string(warnings) ++
+              " warning(s) — swarm-code will run, but check the items above" ++ UI.reset())
+        1
+    } else {
+        print("\e[31m   ✗ " ++ to_string(errors) ++ " error(s), " ++
+              to_string(warnings) ++ " warning(s) — fix the ✗ items before launching\e[0m")
+        2
+    }}
+}
+
+fun check_dirs(base, dirs, warns) {
+    if (length(dirs) == 0) { warns }
+    else {
+        suffix = hd(dirs)
+        path = base ++ suffix
+        new_warns = if (file_exists(path) == 'true') {
+            print("   ✓ " ++ path)
+            warns
+        } else {
+            file_mkdir(path)
+            if (file_exists(path) == 'true') {
+                print("   ✓ " ++ path ++ UI.grey_text() ++ "  (created)" ++ UI.reset())
+                warns
+            } else {
+                print("   ⚠ " ++ path ++ " — could not create")
+                warns + 1
+            }
+        }
+        check_dirs(base, tl(dirs), new_warns)
+    }
+}
+
+fun doctor_join_keys(keys, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { ", " }
+        doctor_join_keys(tl(keys), acc ++ sep ++ to_string(hd(keys)))
+    }
+}
+
+fun count_subdirs_with(entries, base, suffix, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        new_acc = if (file_exists(base ++ "/" ++ e ++ suffix) == 'true') { acc + 1 }
+                  else { acc }
+        count_subdirs_with(tl(entries), base, suffix, new_acc)
+    }
+}
+
+fun count_md_excluding(entries, skip, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        new_acc = if (string_ends_with(e, ".md") == 'true' && e != skip) { acc + 1 }
+                  else { acc }
+        count_md_excluding(tl(entries), skip, new_acc)
+    }
+}
+
+fun count_starting_with(entries, prefix, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        new_acc = if (string_starts_with(e, prefix) == 'true') { acc + 1 } else { acc }
+        count_starting_with(tl(entries), prefix, new_acc)
+    }
+}
+
+fun preview_doctor(s, n) {
+    if (string_length(s) <= n) { s }
+    else { string_sub(s, 0, n) ++ "…" }
 }

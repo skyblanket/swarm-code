@@ -1,0 +1,52 @@
+name: CI
+
+# Lightweight validation on every push to main + every PR. Builds on
+# linux-x86_64 only (the release.yml matrix re-validates all targets
+# on tag push). Goal: catch breakage before it lands, in under 90s.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout swarm-code
+        uses: actions/checkout@v4
+        with:
+          path: swarm-code
+
+      - name: Checkout swarmrt (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: skyblanket/swarmrt
+          path: swarmrt
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              build-essential libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Build swarmrt
+        working-directory: swarmrt
+        run: make swc libswarmrt
+
+      - name: Build swarm-code
+        working-directory: swarm-code
+        env:
+          SWARMRT: ${{ github.workspace }}/swarmrt
+        run: make
+
+      - name: Smoke + test-all
+        working-directory: swarm-code
+        run: |
+          SWARM_CODE_NO_RESUME=1 make smoke
+          make test-all
