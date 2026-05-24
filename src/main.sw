@@ -34,7 +34,6 @@ import Prompts
 import Agent
 import Config
 import UI
-import Arthopod
 import Memory
 import Skills
 import SessionSearch
@@ -184,40 +183,10 @@ fun main() {
     daemon_env = getenv("SWARM_CODE_DAEMON")
     daemon_on = if (daemon_env == "1") { 'true' } else { 'false' }
     opts3e = map_put(opts3d, 'daemon', daemon_on)
-    opts4 = map_put(opts3e, 'settings', settings)
-
-    # Hatch the arthopod ONLY if explicitly enabled:
-    #   SWARM_CODE_BUDDY=1  — env var
-    #   or settings.json "buddy_enabled": true
-    # Default OFF — the buddy is a toy, not the product.
-    buddy_env = getenv("SWARM_CODE_BUDDY")
-    settings_buddy = map_get(settings, 'buddy_enabled')
-    buddy_enabled = if (headless == 'true') { 'false' }
-                    else { if (buddy_env == "1") { 'true' }
-                    else { if (settings_buddy == 'true') { 'true' }
-                    else { 'false' }}}
-    buddy = if (buddy_enabled == 'true') { Arthopod.hatch(opts4) } else { nil }
-
-    if (buddy != nil) {
-        Arthopod.render(buddy)
-        Arthopod.render_with_bubble(buddy, Arthopod.greet_line(buddy))
-    }
-
-    opts5 = if (buddy == nil) { opts4 } else { map_put(opts4, 'buddy', buddy) }
+    opts5 = map_put(opts3e, 'settings', settings)
 
     # Fire SessionStart hook (if configured).
     Config.run_hooks("SessionStart", 'session', "{}", opts5)
-
-    buddy_prompt = if (buddy == nil) { "" }
-    else {
-        name = to_string(map_get(buddy, 'name'))
-        species = to_string(map_get(buddy, 'species'))
-        "\n\n=== COMPANION ===\n" ++
-        "A small " ++ species ++ " named " ++ name ++ " sits beside the user's " ++
-        "input. You are NOT " ++ name ++ " — it's a separate watcher. If the user " ++
-        "addresses " ++ name ++ " or says 'arthopod', a separate bubble answers. " ++
-        "Stay out of the way: respond briefly or just answer the part meant for you."
-    }
 
     manifesto_section = if (string_length(manifesto_text) == 0) { "" }
         else { "\n\n=== SWARM MANIFESTO (your letter from the previous iteration) ===\n" ++ manifesto_text }
@@ -242,8 +211,7 @@ fun main() {
         skills_section ++
         heartbeat_section ++
         mcp_section ++
-        telemetry_section ++
-        buddy_prompt
+        telemetry_section
 
     if (headless == 'true') {
         Agent.run_headless(map_put(opts5, 'no_resume', no_resume),

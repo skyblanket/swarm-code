@@ -24,7 +24,6 @@
 | `telemetry.sw` | System stats, log collection |
 | `mcp.sw` | MCP (Model Context Protocol) server integration |
 | `scheduler.sw` | Delayed / periodic task scheduling |
-| `arthopod.sw` | Internal sw runtime helpers |
 | `markdown.sw` | Markdown → plain-text stripper |
 | `log.sw` | Structured logging primitives |
 | `trajectory.sw` | Conversation trajectory storage |

@@ -27,7 +27,6 @@ import LLM
 import Tools
 import Config
 import UI
-import Arthopod
 import Reader
 import Log
 import Mcp
@@ -421,13 +420,6 @@ fun route_input(line, history, opts) {
         }
         else {
             Config.run_hooks("UserPromptSubmit", 'user', line, opts)
-            user_buddy = map_get(opts, 'buddy')
-            if (user_buddy != nil) {
-                if (Arthopod.is_addressed(line, user_buddy) == 'true') {
-                    bubble = Arthopod.address_response(user_buddy, line, opts)
-                    Arthopod.render_with_bubble(user_buddy, bubble)
-                }
-            }
             # Auto-detect image paths in the user's message and queue
             # them for attachment before sending. Mirrors claude-code's
             # drag-drop / path-paste pattern — no read_image call needed.
@@ -569,10 +561,6 @@ fun on_bg_done(task_id, exit_code, label, history, opts) {
 
 # EOF / /quit handler.
 fun handle_eof(history, opts) {
-    bye_b = map_get(opts, 'buddy')
-    if (bye_b != nil) {
-        Arthopod.render_with_bubble(bye_b, Arthopod.farewell_line(bye_b))
-    }
     Log.session_end("user_exit")
     Config.run_hooks("Stop", 'session', "{}", opts)
     Mcp.shutdown(map_get(opts, 'mcp_table'))
@@ -773,24 +761,11 @@ fun slash_dispatch(cmd, history, opts) {
         with_reflect = list_append(history, LLM.new_message_user(reflect_msg))
         run_turn(with_reflect, opts, 0)
     }
-    else { if (cmd == "/buddy") {
-        print_inline("buddy is ")
-        current = map_get(opts, 'buddy')
-        if (current == nil) {
-            print("OFF. restart with SWARM_CODE_BUDDY=1 to enable for this session,")
-            print("or add \"buddy_enabled\": true to ~/.swarm-code/settings.json to make it permanent.")
-        } else {
-            name = to_string(map_get(current, 'name'))
-            species = to_string(map_get(current, 'species'))
-            print("ON. " ++ name ++ " (" ++ species ++ ") is watching.")
-        }
-        history
-    }
     else { if (cmd == "/mcp") { print(Mcp.list_servers(map_get(opts, 'mcp_table'))) ; history }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -1919,12 +1894,11 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/autonomy") { 'true' }
     else { if (cmd == "/daemon") { 'true' }
     else { if (cmd == "/reflect") { 'true' }
-    else { if (cmd == "/buddy") { 'true' }
     else { if (cmd == "/mcp") { 'true' }
     else { if (cmd == "/quit") { 'true' }
     else { if (cmd == "/exit") { 'true' }
     else { if (cmd == "/reset") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # String → atom for tool dispatch. Was a ~50-case if/else; now a
