@@ -24,10 +24,13 @@ echo "$OUT" | grep -q "^swarm-code [0-9]" || FAIL "--version: $OUT"
 # 2. --print-config (no LLM call)
 $BIN --print-config >/dev/null 2>&1 || FAIL "--print-config crashed"
 
-# 3. swarm doctor (acceptable exits: 0 green, 1 warn, 2 error — all
-#    sane. Anything outside that is a process crash.)
+# 3. swarm doctor — accept exits 0 (green), 1 (warn), 2 (error).
+#    Disable `set -e` around the call so a non-zero exit doesn't
+#    short-circuit the script before we can inspect $?.
+set +e
 $BIN doctor >/dev/null 2>&1
 RC=$?
+set -e
 if [ "$RC" -gt 2 ]; then FAIL "doctor crashed with exit $RC"; fi
 
 echo "smoke ok"
