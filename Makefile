@@ -39,12 +39,11 @@ run: $(BIN)
 # Smoke test — boots the binary in headless mode, runs one bash tool call,
 # verifies the response. Used by tests/smoke.sh.
 smoke: $(BIN)
+	@BIN=./$(BIN) ./tests/smoke.sh
 
 # Run the auto-generated module tests (24 originally, 8 currently passing).
 test-all:
 	@./tests/run_all.sh
-
-	@BIN=./$(BIN) ./tests/smoke.sh
 
 # Handy one-liner for ad hoc testing against a local endpoint.
 run-local: $(BIN)
