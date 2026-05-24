@@ -257,7 +257,7 @@ fun main() {
 # without starting the agent.
 
 # Keep in sync with the release tag — see .github/workflows/release.yml.
-fun swarm_version() { "0.1.0" }
+fun swarm_version() { "0.2.0" }
 
 # Presence test for a flag anywhere in argv. argv[0] is the binary
 # path; position and order of the rest don't matter.
