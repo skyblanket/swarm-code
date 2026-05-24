@@ -77,10 +77,61 @@ fun new_message_tool(tool_call_id, content) {
 # non-standard path; for those, set SWARM_CODE_ENDPOINT to the full
 # URL ending in `/chat/completions` and we'll use it verbatim.
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# In-session profile override. Slash command /profile NAME writes
+# ~/.swarm-code/.profile_override with {endpoint, model, api_key,
+# tool_format}; every LLM call consults this file and applies the
+# overrides before serialising the request. File-based (rather than
+# threading opts through main_loop) so it's a 5-line touch instead of
+# a deep refactor — `rm ~/.swarm-code/.profile_override` reverts.
+# ------------------------------------------------------------
+fun apply_override(opts) {
+    path = getenv("HOME") ++ "/.swarm-code/.profile_override"
+    if (file_exists(path) == 'false') { opts }
+    else {
+        raw = file_read(path)
+        if (raw == nil) { opts }
+        else {
+            ov = json_decode(raw)
+            if (ov == nil) { opts }
+            else {
+                a = override_field(opts, ov, 'endpoint')
+                b = override_field(a, ov, 'model')
+                c = override_field(b, ov, 'api_key')
+                d = override_field(c, ov, 'tool_format')
+                # Re-derive temperature when model changes — Kimi K2.x
+                # rejects any temperature other than 1.0.
+                if (map_get(ov, 'model') != nil) {
+                    new_model = to_string(map_get(d, 'model'))
+                    new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
+                               else { 0.2 }
+                    map_put(d, 'temperature', new_temp)
+                } else { d }
+            }
+        }
+    }
+}
+
+fun override_field(opts, ov, key) {
+    v = map_get(ov, key)
+    if (v == nil) { opts }
+    else {
+        val = if (key == 'tool_format') {
+            s = to_string(v)
+            if (s == "native") { 'native' } else { 'inband' }
+        } else { to_string(v) }
+        map_put(opts, key, val)
+    }
+}
+
 fun chat_completions_url(endpoint) {
-    if (string_ends_with(endpoint, "/chat/completions") == 'true') {
-        endpoint
-    } else { endpoint ++ "/v1/chat/completions" }
+    # Strip any trailing slash so suffix checks are deterministic.
+    base = if (string_ends_with(endpoint, "/") == 'true') {
+        string_sub(endpoint, 0, string_length(endpoint) - 1)
+    } else { endpoint }
+    if (string_ends_with(base, "/chat/completions") == 'true') { base }
+    else { if (string_ends_with(base, "/v1") == 'true') { base ++ "/chat/completions" }
+    else { base ++ "/v1/chat/completions" }}
 }
 
 # ============================================================
@@ -286,11 +337,12 @@ fun inband_tc_loop(tcs, acc) {
 # chat — public entry, dispatches on tool_format
 # ============================================================
 fun chat(messages, opts) {
-    tool_format = map_get(opts, 'tool_format')
+    eff = apply_override(opts)
+    tool_format = map_get(eff, 'tool_format')
     if (tool_format == 'native') {
-        chat_native_retry(messages, opts, 0)
+        chat_native_retry(messages, eff, 0)
     } else {
-        chat_inband_retry(messages, opts, 0)
+        chat_inband_retry(messages, eff, 0)
     }
 }
 
@@ -579,6 +631,7 @@ fun string_before_first(s, marker) {
 # does its own inband-only parse via parse_inband_tool_calls.
 # ============================================================
 fun chat_silent(messages, opts) {
+    opts = apply_override(opts)
     endpoint = map_get(opts, 'endpoint')
     api_key = map_get(opts, 'api_key')
     url = chat_completions_url(endpoint)
@@ -622,6 +675,7 @@ fun build_request_body_silent(messages, opts) {
 # uniform with main's.
 # ============================================================
 fun chat_for_subagent(messages, opts, target_pid, name) {
+    opts = apply_override(opts)
     endpoint = map_get(opts, 'endpoint')
     api_key = map_get(opts, 'api_key')
     model = map_get(opts, 'model')

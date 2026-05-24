@@ -41,7 +41,7 @@ module Memory
 export [
     load, memory_dir, index_path, memory_file_path,
     save, recall, list_index, forget,
-    as_prompt_section, slugify
+    as_prompt_section, slugify, parse_frontmatter
 ]
 
 fun memory_dir() {

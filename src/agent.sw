@@ -563,6 +563,31 @@ fun slash_dispatch(cmd, history, opts) {
         history
     }
     else { if (cmd == "/model") { show_model_info(opts) ; history }
+    else { if (string_starts_with(cmd, "/model ") == 'true') {
+        new_model = string_trim(string_sub(cmd, 7, string_length(cmd) - 7))
+        apply_model_override(new_model)
+        history
+    }
+    else { if (cmd == "/profile") { show_active_profile() ; history }
+    else { if (cmd == "/profiles") { list_profiles() ; history }
+    else { if (string_starts_with(cmd, "/profile ") == 'true') {
+        name = string_trim(string_sub(cmd, 9, string_length(cmd) - 9))
+        apply_profile_override(name)
+        history
+    }
+    else { if (cmd == "/profile-clear" || cmd == "/profile clear") {
+        clear_profile_override()
+        history
+    }
+    else { if (string_starts_with(cmd, "/search ") == 'true') {
+        query = string_trim(string_sub(cmd, 8, string_length(cmd) - 8))
+        if (string_length(query) == 0) {
+            print("\e[33musage: /search QUERY\e[0m")
+        } else {
+            print(SessionSearch.search_render(query, 10))
+        }
+        history
+    }
     else { if (cmd == "/compact") {
         compacted = compact_history(history, opts)
         print("\e[2m[history compacted: " ++ to_string(length(history)) ++
@@ -654,7 +679,7 @@ fun slash_dispatch(cmd, history, opts) {
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -665,6 +690,12 @@ fun show_help() {
     print("  /todos                show todo list")
     print("  /mcp                  list MCP servers and their tools")
     print("  /model                show active model")
+    print("  /model NAME           swap model name for this session")
+    print("  /profile              show active profile override (if any)")
+    print("  /profiles             list profiles in settings.json")
+    print("  /profile NAME         swap to a profile from settings.json")
+    print("  /profile-clear        drop the override, revert to launch profile")
+    print("  /search QUERY         FTS5 search across all session journals")
     print("  /history              print recent messages")
     print("  /tokens               approximate token count")
     print("  /cost                 session cost (local = $0)")
@@ -689,6 +720,163 @@ fun show_status(history, opts) {
     print("  cwd      : " ++ to_string(map_get(opts, 'cwd')))
     print("  messages : " ++ to_string(length(history)))
     print("  ~tokens  : " ++ to_string(approx_tokens(history)))
+}
+
+# ------------------------------------------------------------
+# Profile / model swap — writes ~/.swarm-code/.profile_override which
+# LLM.apply_override consults before every request. No opts threading
+# required; the change takes effect on the next LLM call.
+# ------------------------------------------------------------
+fun profile_override_path() {
+    getenv("HOME") ++ "/.swarm-code/.profile_override"
+}
+
+fun apply_profile_override(name) {
+    if (string_length(name) == 0) {
+        print("\e[33musage: /profile NAME  (try /profiles to list)\e[0m")
+    }
+    else {
+        settings = Config.load()
+        profiles = if (settings == nil) { nil } else { map_get(settings, 'profiles') }
+        if (profiles == nil) {
+            print("\e[33mno 'profiles' map in ~/.swarm-code/settings.json\e[0m")
+        }
+        else {
+            p = lookup_profile(profiles, name)
+            if (p == nil) {
+                print("\e[33mno profile named '" ++ name ++ "' — try /profiles\e[0m")
+            }
+            else {
+                ov = profile_to_override(p)
+                file_write(profile_override_path(), json_encode(ov))
+                print(UI.brand_color() ++ "✓ profile swapped to " ++ name ++ UI.reset())
+                print(UI.grey_text() ++ "  model    : " ++ to_string(map_get(ov, 'model')) ++ UI.reset())
+                print(UI.grey_text() ++ "  endpoint : " ++ to_string(map_get(ov, 'endpoint')) ++ UI.reset())
+                print(UI.grey_text() ++ "  takes effect on next LLM call. /profile-clear to revert." ++ UI.reset())
+            }
+        }
+    }
+}
+
+fun apply_model_override(model_name) {
+    if (string_length(model_name) == 0) {
+        print("\e[33musage: /model NAME\e[0m")
+    }
+    else {
+        ov = %{ model: model_name }
+        file_write(profile_override_path(), json_encode(ov))
+        print(UI.brand_color() ++ "✓ model swapped to " ++ model_name ++ UI.reset())
+        print(UI.grey_text() ++ "  endpoint/api_key unchanged. /profile-clear to revert." ++ UI.reset())
+    }
+}
+
+fun clear_profile_override() {
+    p = profile_override_path()
+    if (file_exists(p) == 'true') {
+        shell("rm -f " ++ shell_quote(p))
+        print("\e[2m✓ override cleared — back to launch profile\e[0m")
+    } else {
+        print("\e[2m(no override active)\e[0m")
+    }
+}
+
+fun show_active_profile() {
+    p = profile_override_path()
+    if (file_exists(p) == 'false') {
+        print("\e[2m(no override active — using launch profile)\e[0m")
+    } else {
+        raw = file_read(p)
+        ov = if (raw == nil) { nil } else { json_decode(raw) }
+        if (ov == nil) {
+            print("\e[33m(override file present but unreadable: " ++ p ++ ")\e[0m")
+        } else {
+            print("\e[1mactive override\e[0m")
+            show_override_field(ov, 'endpoint')
+            show_override_field(ov, 'model')
+            show_override_field(ov, 'api_key')
+            show_override_field(ov, 'tool_format')
+            print(UI.grey_text() ++ "  (use /profile-clear to revert)" ++ UI.reset())
+        }
+    }
+}
+
+fun show_override_field(ov, key) {
+    v = map_get(ov, key)
+    if (v == nil) { 'skip' }
+    else {
+        shown = if (key == 'api_key') { "(set)" } else { to_string(v) }
+        print("  " ++ to_string(key) ++ " : " ++ shown)
+    }
+}
+
+fun list_profiles() {
+    settings = Config.load()
+    profiles = if (settings == nil) { nil } else { map_get(settings, 'profiles') }
+    if (profiles == nil) {
+        print("\e[2mno profiles defined in ~/.swarm-code/settings.json\e[0m")
+    } else {
+        keys = map_keys(profiles)
+        values = map_values(profiles)
+        print("\e[1mprofiles\e[0m")
+        list_profiles_loop(keys, values)
+        print(UI.grey_text() ++ "  use: /profile NAME" ++ UI.reset())
+    }
+}
+
+fun list_profiles_loop(keys, values) {
+    if (length(keys) == 0) { 'done' }
+    else {
+        k = hd(keys)
+        v = hd(values)
+        model = if (v == nil) { "?" } else {
+            mv = map_get(v, 'model')
+            if (mv == nil) { "?" } else { to_string(mv) }
+        }
+        endpoint = if (v == nil) { "?" } else {
+            ev = map_get(v, 'endpoint')
+            if (ev == nil) { "?" } else { to_string(ev) }
+        }
+        print("  " ++ to_string(k) ++ "  " ++ UI.grey_text() ++ model ++ " @ " ++ endpoint ++ UI.reset())
+        list_profiles_loop(tl(keys), tl(values))
+    }
+}
+
+# Map-by-string-key lookup — JSON-decoded maps carry atom keys, so
+# direct map_get(map, "name") misses entries saved as 'name'.
+fun lookup_profile(profiles, name) {
+    direct = map_get(profiles, name)
+    if (direct != nil) { direct }
+    else { lookup_profile_loop(map_keys(profiles), map_values(profiles), name) }
+}
+
+fun lookup_profile_loop(keys, values, name) {
+    if (length(keys) == 0) { nil }
+    else {
+        if (to_string(hd(keys)) == name) { hd(values) }
+        else { lookup_profile_loop(tl(keys), tl(values), name) }
+    }
+}
+
+# Convert a settings.json profile entry into the override-file shape.
+# Only includes fields actually present in the profile — `apply_override`
+# will leave unset fields alone.
+fun profile_to_override(p) {
+    a = profile_field(map_new(), p, 'endpoint')
+    b = profile_field(a, p, 'model')
+    c = profile_field(b, p, 'api_key')
+    d = profile_field(c, p, 'tool_format')
+    d
+}
+
+fun profile_field(acc, p, key) {
+    v = map_get(p, key)
+    if (v == nil) { acc }
+    else { map_put(acc, key, to_string(v)) }
+}
+
+fun shell_quote(s) {
+    safe = string_replace(s, "'", "'\\''")
+    "'" ++ safe ++ "'"
 }
 
 fun show_model_info(opts) {
@@ -1429,8 +1617,22 @@ fun string_to_atom(s) {
     else { if (s == "code_search") { 'code_search' }
     else { if (s == "log_wait") { 'log_wait' }
     else { if (s == "file_watch") { 'file_watch' }
+    else { if (s == "browser_launch")     { 'browser_launch' }
+    else { if (s == "browser_navigate")   { 'browser_navigate' }
+    else { if (s == "browser_click")      { 'browser_click' }
+    else { if (s == "browser_type")       { 'browser_type' }
+    else { if (s == "browser_screenshot") { 'browser_screenshot' }
+    else { if (s == "browser_get_text")   { 'browser_get_text' }
+    else { if (s == "browser_get_html")   { 'browser_get_html' }
+    else { if (s == "browser_evaluate")   { 'browser_evaluate' }
+    else { if (s == "browser_close")      { 'browser_close' }
+    else { if (s == "learn_skill")        { 'learn_skill' }
+    else { if (s == "recall_skill")       { 'recall_skill' }
+    else { if (s == "forget_skill")       { 'forget_skill' }
+    else { if (s == "skill_list")         { 'skill_list' }
+    else { if (s == "session_search")     { 'session_search' }
     else { s }
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # Truncate string for inline preview.

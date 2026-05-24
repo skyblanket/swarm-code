@@ -19,6 +19,8 @@ module Tools
 # argument is ignored.
 
 import Memory
+import Skills
+import SessionSearch
 import Background
 import Heartbeat
 import Telemetry
@@ -79,8 +81,13 @@ fun exec(name, args, opts) {
     else { if (name == 'browser_get_html')   { do_browser_get_html(args, opts) }
     else { if (name == 'browser_evaluate')   { do_browser_evaluate(args, opts) }
     else { if (name == 'browser_close')      { do_browser_close(args, opts) }
+    else { if (name == 'learn_skill')        { do_learn_skill(args) }
+    else { if (name == 'recall_skill')       { do_recall_skill(args) }
+    else { if (name == 'forget_skill')       { do_forget_skill(args) }
+    else { if (name == 'skill_list')         { do_skill_list(args) }
+    else { if (name == 'session_search')     { do_session_search(args) }
     else { "error: unknown tool '" ++ to_string(name) ++ "'"
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # ------------------------------------------------------------
@@ -1424,5 +1431,65 @@ fun do_browser_close(args, opts) {
             ets_delete(table, 'session')
             "ok: browser session closed (chrome still running for fast re-launch)"
         }
+    }
+}
+
+# ============================================================
+# Skills — Hermes-style reusable procedures
+# ============================================================
+# Wraps the Skills module so the agent can author, look up, and
+# delete its own playbooks. Skills live as SKILL.md files under
+# ~/.swarm-code/skills/<slug>/ — see skills.sw for the layout.
+
+fun do_learn_skill(args) {
+    name = map_get(args, 'name')
+    desc = map_get(args, 'description')
+    triggers = map_get(args, 'triggers')
+    instr = map_get(args, 'instructions')
+    if (name == nil || string_length(to_string(name)) == 0) {
+        "error: learn_skill requires 'name'"
+    }
+    else { if (instr == nil || string_length(to_string(instr)) == 0) {
+        "error: learn_skill requires 'instructions'"
+    }
+    else {
+        d = if (desc == nil) { "" } else { to_string(desc) }
+        t = if (triggers == nil) { "" } else { to_string(triggers) }
+        Skills.save(to_string(name), d, t, to_string(instr))
+    }}
+}
+
+fun do_recall_skill(args) {
+    slug = map_get(args, 'slug')
+    if (slug == nil) { "error: recall_skill requires 'slug'" }
+    else { Skills.recall(to_string(slug)) }
+}
+
+fun do_forget_skill(args) {
+    slug = map_get(args, 'slug')
+    if (slug == nil) { "error: forget_skill requires 'slug'" }
+    else { Skills.forget(to_string(slug)) }
+}
+
+fun do_skill_list(args) {
+    Skills.list_index()
+}
+
+# ============================================================
+# session_search — FTS5 over every past conversation turn
+# ============================================================
+fun do_session_search(args) {
+    q = map_get(args, 'query')
+    if (q == nil || string_length(to_string(q)) == 0) {
+        "error: session_search requires 'query'"
+    } else {
+        limit_v = map_get(args, 'limit')
+        # Cap at 30 so a fishing-expedition match doesn't flood the context.
+        cap = if (limit_v == nil) { 10 }
+              else {
+                  n = limit_v
+                  if (n > 30) { 30 } else { if (n < 1) { 1 } else { n }}
+              }
+        SessionSearch.search_render(to_string(q), cap)
     }
 }

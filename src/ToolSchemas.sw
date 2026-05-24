@@ -23,6 +23,8 @@ fun all_schemas() {
     [bash_s(), read_s(), write_s(), edit_s(), multi_edit_s(),
      glob_s(), grep_s(), todo_write_s(), web_search_s(), web_fetch_s(),
      remember_s(), recall_s(), memory_list_s(),
+     learn_skill_s(), recall_skill_s(), skill_list_s(), forget_skill_s(),
+     session_search_s(),
      task_s(),
      browser_launch_s(), browser_navigate_s(), browser_click_s(),
      browser_type_s(), browser_screenshot_s(), browser_get_text_s(),
@@ -204,6 +206,61 @@ fun memory_list_s() {
         "List all stored memories with their slug, title, and one-line " ++
         "description. Cheap to call at the start of a session.",
         obj(%{}, []))
+}
+
+# ---------- skills (Hermes-style reusable procedures) ----------
+
+fun learn_skill_s() {
+    tool("learn_skill",
+        "Save a reusable procedure as a skill under ~/.swarm-code/skills/. " ++
+        "Use after you solve a non-trivial recurring task so the next " ++
+        "session can re-use the playbook. The skill index lands in your " ++
+        "system prompt at startup; you pull the full body via recall_skill " ++
+        "when a trigger matches.",
+        obj(%{
+            name: s("Short title (becomes slug, e.g. 'Deploy mally-otp')"),
+            description: s("One-line summary shown in the index"),
+            triggers: s("Comma-separated phrases that should activate this skill"),
+            instructions: s("Markdown body: the step-by-step playbook")
+        }, ["name", "description", "instructions"]))
+}
+
+fun recall_skill_s() {
+    tool("recall_skill",
+        "Read a skill's full SKILL.md body by slug. Use when the index " ++
+        "in your system prompt suggests this skill matches the user's " ++
+        "request.",
+        obj(%{slug: s("Skill slug as shown in the index")}, ["slug"]))
+}
+
+fun skill_list_s() {
+    tool("skill_list",
+        "Return the rendered skills index. Same content that's injected " ++
+        "into your system prompt at startup — call this to refresh after " ++
+        "you've used learn_skill mid-session.",
+        obj(%{}, []))
+}
+
+fun forget_skill_s() {
+    tool("forget_skill",
+        "Delete a skill by slug. Use when a skill is wrong, outdated, or " ++
+        "no longer relevant.",
+        obj(%{slug: s("Skill slug")}, ["slug"]))
+}
+
+# ---------- session search (FTS5 over journals) ----------
+
+fun session_search_s() {
+    tool("session_search",
+        "Full-text search over every past conversation turn (user prompts, " ++
+        "assistant responses, tool calls, tool outputs). Use to find a " ++
+        "solution you've already worked out in a prior session — saves " ++
+        "redoing analysis. SQLite FTS5 syntax: bare words for OR; double-" ++
+        "quoted phrases for exact match; trailing * for prefix match.",
+        obj(%{
+            query: s("FTS5 search expression"),
+            limit: s("Max hits to return (default 10, max 30)")
+        }, ["query"]))
 }
 
 # ---------- subagent (Claude-Code-shaped Task tool) ----------

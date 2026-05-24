@@ -36,6 +36,8 @@ import Config
 import UI
 import Arthopod
 import Memory
+import Skills
+import SessionSearch
 import Heartbeat
 import Background
 import Telemetry
@@ -112,6 +114,8 @@ fun main() {
 
     # Phase E features: memory, heartbeat, background tasks
     memory_table = Memory.load()
+    skills_token = Skills.load()
+    SessionSearch.init()
     bg_table = Background.init()
     # Short tick (2s) so bg_done notifications feel real-time. Polling
     # is a cheap file_exists check per pending task. Override with
@@ -199,6 +203,7 @@ fun main() {
         else { "\n\n=== SWARM MANIFESTO (your letter from the previous iteration) ===\n" ++ manifesto_text }
 
     memory_section = Memory.as_prompt_section(memory_table)
+    skills_section = Skills.as_prompt_section(skills_token)
     heartbeat_section = Heartbeat.as_prompt_section(heartbeat_table)
     mcp_section = Mcp.as_prompt_section(mcp_table)
 
@@ -212,6 +217,7 @@ fun main() {
          else { "\n\n=== PROJECT CONTEXT (SWARM.md) ===\n" ++ project_ctx }) ++
         manifesto_section ++
         memory_section ++
+        skills_section ++
         heartbeat_section ++
         mcp_section ++
         telemetry_section ++
@@ -301,6 +307,8 @@ fun print_usage() {
     print("")
     print("USAGE")
     print("  swarm                  start the interactive agent")
+    print("  swarm <profile>        start with a named profile (e.g. swarm gemma)")
+    print("  swarm --profile NAME   same, via explicit flag (-P also accepted)")
     print("  swarm -p \"<prompt>\"     run one task headless, then exit")
     print("  swarm -p \"...\" --json   headless + a final JSON result line")
     print("  swarm --help, -h       show this help and exit")
@@ -309,14 +317,26 @@ fun print_usage() {
     print("")
     print("CONFIG")
     print("  BYOM — bring your own model. Settings are read in priority")
-    print("  order: environment variables, then ~/.swarm-code/settings.json,")
-    print("  then built-in defaults.")
+    print("  order: environment variables, then the selected profile, then")
+    print("  ~/.swarm-code/settings.json root, then built-in defaults.")
     print("")
     print("  SWARM_CODE_ENDPOINT      LLM endpoint (OpenAI-compatible)")
     print("  SWARM_CODE_MODEL         model name (default: kimi-k2.6)")
     print("  SWARM_CODE_API_KEY       API key for a remote provider")
+    print("  SWARM_CODE_TOOL_FORMAT   native | inband (else auto-detected)")
     print("  SWARM_CODE_ALLOW_REMOTE  set to 1 to permit non-local endpoints")
     print("  SWARM_CODE_CWD           working directory shown to the model")
+    print("")
+    print("  Profiles: add a \"profiles\" map to settings.json, e.g.")
+    print("    \"profiles\": {")
+    print("      \"gemma\": {")
+    print("        \"endpoint\": \"https://gemma.otonomy.ai/v1\",")
+    print("        \"model\": \"google/gemma-4-31B-it\",")
+    print("        \"api_key\": \"...\",")
+    print("        \"tool_format\": \"native\"")
+    print("      }")
+    print("    }")
+    print("  Then run `swarm gemma` or `swarm --profile gemma`.")
     print("")
     print("  `swarm --print-config` shows what these resolve to right now.")
     print("")
@@ -332,9 +352,12 @@ fun print_config() {
     ak_shown = if (ak == nil) { "(not set)" }
                else { if (string_length(to_string(ak)) == 0) { "(empty)" }
                else { "(set)" }}
+    prof = map_get(o, 'profile')
+    prof_shown = if (prof == nil) { "(none)" } else { to_string(prof) }
     print("swarm-code " ++ swarm_version() ++ " — resolved configuration")
-    print("  (env overrides ~/.swarm-code/settings.json overrides defaults)")
+    print("  (env > profile > settings.json root > defaults)")
     print("")
+    print("  profile      " ++ prof_shown)
     print("  endpoint     " ++ to_string(map_get(o, 'endpoint')))
     print("  model        " ++ to_string(map_get(o, 'model')))
     print("  api_key      " ++ ak_shown)
@@ -346,35 +369,56 @@ fun print_config() {
 
 fun load_opts() {
     # Settings.json fallback so users can stash endpoint / model /
-    # api_key without re-exporting env vars every session. Env always
-    # wins; settings fills the gaps; built-in default is Kimi K2.6 via
-    # Moonshot's hosted API.
+    # api_key without re-exporting env vars every session.
+    #
+    # Resolution per field: env > selected profile > root settings > built-in default.
+    # A profile is selected via `--profile NAME` / `-P NAME`, or by passing the
+    # profile name as the first positional arg (e.g. `swarm gemma`) when it
+    # matches a key under `profiles` in settings.json.
     settings = Config.load()
+    args = os_args()
+    profiles = if (settings == nil) { nil } else { map_get(settings, 'profiles') }
+    profile_name = resolve_profile_name(args, profiles)
+    profile = if (profile_name == nil) { nil }
+              else { lookup_string_key(profiles, profile_name) }
+
     ep_env = getenv("SWARM_CODE_ENDPOINT")
+    ep_prof = if (profile == nil) { nil } else { map_get(profile, 'endpoint') }
     ep_set = if (settings == nil) { nil } else { map_get(settings, 'endpoint') }
     endpoint = if (ep_env != nil) { ep_env }
+               else { if (ep_prof != nil) { to_string(ep_prof) }
                else { if (ep_set != nil) { to_string(ep_set) }
-               else { "https://api.moonshot.ai/v1/chat/completions" }}
+               else { "https://api.moonshot.ai/v1/chat/completions" }}}
 
     model_env = getenv("SWARM_CODE_MODEL")
+    model_prof = if (profile == nil) { nil } else { map_get(profile, 'model') }
     model_set = if (settings == nil) { nil } else { map_get(settings, 'model') }
     model = if (model_env != nil) { model_env }
+            else { if (model_prof != nil) { to_string(model_prof) }
             else { if (model_set != nil) { to_string(model_set) }
-            else { "kimi-k2.6" }}
+            else { "kimi-k2.6" }}}
 
     api_env = getenv("SWARM_CODE_API_KEY")
+    api_prof = if (profile == nil) { nil } else { map_get(profile, 'api_key') }
     api_set = if (settings == nil) { nil } else { map_get(settings, 'api_key') }
     api_key = if (api_env != nil) { api_env }
+              else { if (api_prof != nil) { to_string(api_prof) }
               else { if (api_set != nil) { to_string(api_set) }
-              else { nil }}
+              else { nil }}}
 
     # Tool format: native (OpenAI-native tool_calls) or inband (Gemma 4
-    # call:NAME{JSON} text). Explicit env wins, else auto-detect from
-    # endpoint. See detect_tool_format/0.
+    # call:NAME{JSON} text). Env wins; profile can override the
+    # endpoint-based auto-detect (e.g. self-hosted vLLM with
+    # --enable-auto-tool-choice serves native tool_calls).
     tf_env = getenv("SWARM_CODE_TOOL_FORMAT")
+    tf_prof = if (profile == nil) { nil } else { map_get(profile, 'tool_format') }
     tool_format = if (tf_env == "native") { 'native' }
                   else { if (tf_env == "inband") { 'inband' }
-                  else { detect_tool_format(endpoint) }}
+                  else { if (tf_prof != nil) {
+                      tfs = to_string(tf_prof)
+                      if (tfs == "native") { 'native' } else { 'inband' }
+                  }
+                  else { detect_tool_format(endpoint) }}}
 
     # max_tokens = maximum output tokens the model will generate per call.
     # Default 32768 assumes a multi-GPU server (e.g. sushi's 2x RTX PRO
@@ -399,7 +443,78 @@ fun load_opts() {
         api_key: api_key,
         temperature: temperature,
         max_tokens: max_tokens,
-        tool_format: tool_format
+        tool_format: tool_format,
+        profile: profile_name
+    }
+}
+
+# Find the selected profile name from argv. Explicit `--profile NAME` /
+# `-P NAME` wins; otherwise the first non-flag positional arg counts if
+# it matches a key in `profiles`. If the first positional isn't a known
+# profile, stop scanning — subsequent positionals are user content
+# (e.g. the headless prompt).
+fun resolve_profile_name(args, profiles) {
+    pn1 = get_flag_value(args, "--profile")
+    pn2 = if (pn1 != nil) { pn1 } else { get_flag_value(args, "-P") }
+    if (pn2 != nil) { pn2 }
+    else { if (profiles == nil) { nil }
+    else {
+        rest = if (length(args) == 0) { args } else { tl(args) }
+        find_positional_profile(rest, profiles)
+    }}
+}
+
+fun find_positional_profile(args, profiles) {
+    if (length(args) == 0) { nil }
+    else {
+        a = hd(args)
+        if (string_starts_with(a, "-") == 'true') {
+            rest = tl(args)
+            value_taking = if (a == "-p") { 'true' }
+                           else { if (a == "--print") { 'true' }
+                           else { if (a == "--profile") { 'true' }
+                           else { if (a == "-P") { 'true' }
+                           else { 'false' }}}}
+            if (value_taking == 'true' && length(rest) > 0) {
+                find_positional_profile(tl(rest), profiles)
+            } else {
+                find_positional_profile(rest, profiles)
+            }
+        } else {
+            if (lookup_string_key(profiles, a) != nil) { a } else { nil }
+        }
+    }
+}
+
+# Return the value following `flag` in argv, or nil if absent.
+fun get_flag_value(args, flag) {
+    if (length(args) == 0) { nil }
+    else {
+        h = hd(args)
+        rest = tl(args)
+        if (h == flag && length(rest) > 0) { hd(rest) }
+        else { get_flag_value(rest, flag) }
+    }
+}
+
+# JSON-decoded maps have atom keys, so map_get(m, "gemma") on a map
+# saved as {"gemma": ...} won't match. Try direct first, then walk keys
+# and compare string forms.
+fun lookup_string_key(m, key_string) {
+    if (m == nil) { nil }
+    else {
+        direct = map_get(m, key_string)
+        if (direct != nil) { direct }
+        else { find_key_by_string(map_keys(m), map_values(m), key_string) }
+    }
+}
+
+fun find_key_by_string(keys, values, target) {
+    if (length(keys) == 0) { nil }
+    else {
+        k = hd(keys)
+        if (to_string(k) == target) { hd(values) }
+        else { find_key_by_string(tl(keys), tl(values), target) }
     }
 }
 

@@ -105,6 +105,11 @@ fun tool_descriptions() {
     recall_desc() ++ "\n" ++
     memory_list_desc() ++ "\n" ++
     forget_desc() ++ "\n" ++
+    learn_skill_desc() ++ "\n" ++
+    recall_skill_desc() ++ "\n" ++
+    skill_list_desc() ++ "\n" ++
+    forget_skill_desc() ++ "\n" ++
+    session_search_desc() ++ "\n" ++
     background_desc() ++ "\n" ++
     bg_status_desc() ++ "\n" ++
     bg_result_desc() ++ "\n" ++
@@ -227,6 +232,44 @@ fun forget_desc() {
     "deletion. Use this when the user says \"forget\" something, or when a " ++
     "memory has become stale/incorrect.\n" ++
     "  schema: {\"slug\":\"string\"}"
+}
+
+fun learn_skill_desc() {
+    "- learn_skill: Save a reusable procedure as a skill under " ++
+    "~/.swarm-code/skills/<slug>/SKILL.md. Use after you solve a non-trivial " ++
+    "recurring task (deploys, builds, scrapes) so a future session can replay " ++
+    "the playbook. Triggers are comma-separated phrases that should make you " ++
+    "consider invoking the skill on a future user request.\n" ++
+    "  schema: {\"name\":\"short title\",\"description\":\"one-line summary\"," ++
+    "\"triggers\":\"deploy mally, ship otp\",\"instructions\":\"markdown playbook\"}"
+}
+
+fun recall_skill_desc() {
+    "- recall_skill: Read a skill's full SKILL.md body by slug. The skills " ++
+    "index lives in your system prompt; pull the full body via this tool " ++
+    "when a trigger matches the user's request.\n" ++
+    "  schema: {\"slug\":\"string\"}"
+}
+
+fun skill_list_desc() {
+    "- skill_list: Return the rendered SKILLS.md index. Same content " ++
+    "injected at startup; call to refresh after learn_skill mid-session.\n" ++
+    "  schema: {}"
+}
+
+fun forget_skill_desc() {
+    "- forget_skill: Delete a skill directory by slug. Use when a skill is " ++
+    "wrong or outdated.\n" ++
+    "  schema: {\"slug\":\"string\"}"
+}
+
+fun session_search_desc() {
+    "- session_search: Full-text search (SQLite FTS5) across every past " ++
+    "conversation turn — user prompts, assistant responses, tool calls, " ++
+    "tool outputs. Use to find a solution you've worked out in a prior " ++
+    "session before redoing the analysis. Query syntax: bare words OR-ed; " ++
+    "double-quoted phrases for exact match; trailing * for prefix.\n" ++
+    "  schema: {\"query\":\"string\",\"limit\":\"number (default 10, max 30)\"}"
 }
 
 fun background_desc() {
