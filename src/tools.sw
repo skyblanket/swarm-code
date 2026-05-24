@@ -34,62 +34,89 @@ export [exec, max_output_bytes]
 # a big bash stdout doesn't push the KV cache over. 6 KB ≈ ~1500 tokens.
 fun max_output_bytes() { 6000 }
 
-# Dispatch a tool call by name.
-#
-# MCP tools (mcp__server__tool) are checked FIRST and routed to their
-# owning server subprocess via Mcp.call_tool. This is the single
-# dispatch chokepoint — it covers the main agent and subagents alike
-# (subagents call exec directly, bypassing agent.sw's dispatch_tool).
-# The result is truncated like any other tool's output.
+# Dispatch a tool call by name. The big if/else used to live here;
+# now it's a registry lookup. MCP tools still front-load because
+# their name is dynamic (mcp__server__tool) and they route through
+# Mcp.call_tool rather than a static handler.
 fun exec(name, args, opts) {
     if (string_starts_with(to_string(name), "mcp__") == 'true') {
         truncate_output(Mcp.call_tool(to_string(name), args, opts), max_output_bytes())
     }
-    else { if (name == 'bash') { do_bash(args) }
-    else { if (name == 'read') { do_read(args) }
-    else { if (name == 'write') { do_write(args) }
-    else { if (name == 'edit') { do_edit(args) }
-    else { if (name == 'multi_edit') { do_multi_edit(args) }
-    else { if (name == 'glob') { do_glob(args) }
-    else { if (name == 'grep') { do_grep(args) }
-    else { if (name == 'todo_write') { do_todo_write(args, opts) }
-    else { if (name == 'web_fetch') { do_web_fetch(args) }
-    else { if (name == 'remember') { do_remember(args, opts) }
-    else { if (name == 'recall') { do_recall(args, opts) }
-    else { if (name == 'memory_list') { do_memory_list(args, opts) }
-    else { if (name == 'forget') { do_forget(args, opts) }
-    else { if (name == 'background') { do_background(args, opts) }
-    else { if (name == 'bg_status') { do_bg_status(args, opts) }
-    else { if (name == 'bg_result') { do_bg_result(args, opts) }
-    else { if (name == 'bg_server') { do_bg_server(args, opts) }
-    else { if (name == 'bg_tail') { do_bg_tail(args, opts) }
-    else { if (name == 'bg_kill') { do_bg_kill(args, opts) }
-    else { if (name == 'sys_stats') { Telemetry.sys_stats() }
-    else { if (name == 'heartbeat_status') { do_heartbeat_status(opts) }
-    else { if (name == 'web_search') { do_web_search(args) }
-    else { if (name == 'git_status') { do_git_status(args) }
-    else { if (name == 'git_diff') { do_git_diff(args) }
-    else { if (name == 'git_commit') { do_git_commit(args) }
-    else { if (name == 'code_search') { do_code_search(args) }
-    else { if (name == 'log_wait') { do_log_wait(args, opts) }
-    else { if (name == 'file_watch') { do_file_watch(args) }
-    else { if (name == 'browser_launch')     { do_browser_launch(args, opts) }
-    else { if (name == 'browser_navigate')   { do_browser_navigate(args, opts) }
-    else { if (name == 'browser_click')      { do_browser_click(args, opts) }
-    else { if (name == 'browser_type')       { do_browser_type(args, opts) }
-    else { if (name == 'browser_screenshot') { do_browser_screenshot(args, opts) }
-    else { if (name == 'browser_get_text')   { do_browser_get_text(args, opts) }
-    else { if (name == 'browser_get_html')   { do_browser_get_html(args, opts) }
-    else { if (name == 'browser_evaluate')   { do_browser_evaluate(args, opts) }
-    else { if (name == 'browser_close')      { do_browser_close(args, opts) }
-    else { if (name == 'learn_skill')        { do_learn_skill(args) }
-    else { if (name == 'recall_skill')       { do_recall_skill(args) }
-    else { if (name == 'forget_skill')       { do_forget_skill(args) }
-    else { if (name == 'skill_list')         { do_skill_list(args) }
-    else { if (name == 'session_search')     { do_session_search(args) }
-    else { if (name == 'read_image')         { do_read_image(args, opts) }
-    else { "error: unknown tool '" ++ to_string(name) ++ "'"
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else {
+        handler = find_handler(all_tools(), name)
+        if (handler == nil) {
+            "error: unknown tool '" ++ to_string(name) ++ "'"
+        } else {
+            handler(args, opts)
+        }
+    }
+}
+
+fun find_handler(entries, name) {
+    if (length(entries) == 0) { nil }
+    else {
+        e = hd(entries)
+        if (map_get(e, 'atom') == name) { map_get(e, 'handler') }
+        else { find_handler(tl(entries), name) }
+    }
+}
+
+# ============================================================
+# Tool registry — single source of truth for handler dispatch.
+#
+# Each entry: %{atom, handler}. Handler is a lambda normalised to
+# (args, opts) — wrappers ignore opts for arity-1 do_* fns.
+#
+# This is what used to be a 50-case if/else in exec(). New tools:
+# add ONE entry below and an entry in ToolRegistry.all_tools() —
+# atom dispatch is now data, not control flow.
+# ============================================================
+fun all_tools() {
+    [
+        %{atom: 'bash',               handler: fun(args, opts) { do_bash(args) }},
+        %{atom: 'read',               handler: fun(args, opts) { do_read(args) }},
+        %{atom: 'write',              handler: fun(args, opts) { do_write(args) }},
+        %{atom: 'edit',               handler: fun(args, opts) { do_edit(args) }},
+        %{atom: 'multi_edit',         handler: fun(args, opts) { do_multi_edit(args) }},
+        %{atom: 'glob',               handler: fun(args, opts) { do_glob(args) }},
+        %{atom: 'grep',               handler: fun(args, opts) { do_grep(args) }},
+        %{atom: 'todo_write',         handler: fun(args, opts) { do_todo_write(args, opts) }},
+        %{atom: 'web_fetch',          handler: fun(args, opts) { do_web_fetch(args) }},
+        %{atom: 'web_search',         handler: fun(args, opts) { do_web_search(args) }},
+        %{atom: 'remember',           handler: fun(args, opts) { do_remember(args, opts) }},
+        %{atom: 'recall',             handler: fun(args, opts) { do_recall(args, opts) }},
+        %{atom: 'memory_list',        handler: fun(args, opts) { do_memory_list(args, opts) }},
+        %{atom: 'forget',             handler: fun(args, opts) { do_forget(args, opts) }},
+        %{atom: 'learn_skill',        handler: fun(args, opts) { do_learn_skill(args) }},
+        %{atom: 'recall_skill',       handler: fun(args, opts) { do_recall_skill(args) }},
+        %{atom: 'forget_skill',       handler: fun(args, opts) { do_forget_skill(args) }},
+        %{atom: 'skill_list',         handler: fun(args, opts) { do_skill_list(args) }},
+        %{atom: 'session_search',     handler: fun(args, opts) { do_session_search(args) }},
+        %{atom: 'read_image',         handler: fun(args, opts) { do_read_image(args, opts) }},
+        %{atom: 'background',         handler: fun(args, opts) { do_background(args, opts) }},
+        %{atom: 'bg_status',          handler: fun(args, opts) { do_bg_status(args, opts) }},
+        %{atom: 'bg_result',          handler: fun(args, opts) { do_bg_result(args, opts) }},
+        %{atom: 'bg_server',          handler: fun(args, opts) { do_bg_server(args, opts) }},
+        %{atom: 'bg_tail',            handler: fun(args, opts) { do_bg_tail(args, opts) }},
+        %{atom: 'bg_kill',            handler: fun(args, opts) { do_bg_kill(args, opts) }},
+        %{atom: 'sys_stats',          handler: fun(args, opts) { Telemetry.sys_stats() }},
+        %{atom: 'heartbeat_status',   handler: fun(args, opts) { do_heartbeat_status(opts) }},
+        %{atom: 'git_status',         handler: fun(args, opts) { do_git_status(args) }},
+        %{atom: 'git_diff',           handler: fun(args, opts) { do_git_diff(args) }},
+        %{atom: 'git_commit',         handler: fun(args, opts) { do_git_commit(args) }},
+        %{atom: 'code_search',        handler: fun(args, opts) { do_code_search(args) }},
+        %{atom: 'log_wait',           handler: fun(args, opts) { do_log_wait(args, opts) }},
+        %{atom: 'file_watch',         handler: fun(args, opts) { do_file_watch(args) }},
+        %{atom: 'browser_launch',     handler: fun(args, opts) { do_browser_launch(args, opts) }},
+        %{atom: 'browser_navigate',   handler: fun(args, opts) { do_browser_navigate(args, opts) }},
+        %{atom: 'browser_click',      handler: fun(args, opts) { do_browser_click(args, opts) }},
+        %{atom: 'browser_type',       handler: fun(args, opts) { do_browser_type(args, opts) }},
+        %{atom: 'browser_screenshot', handler: fun(args, opts) { do_browser_screenshot(args, opts) }},
+        %{atom: 'browser_get_text',   handler: fun(args, opts) { do_browser_get_text(args, opts) }},
+        %{atom: 'browser_get_html',   handler: fun(args, opts) { do_browser_get_html(args, opts) }},
+        %{atom: 'browser_evaluate',   handler: fun(args, opts) { do_browser_evaluate(args, opts) }},
+        %{atom: 'browser_close',      handler: fun(args, opts) { do_browser_close(args, opts) }}
+    ]
 }
 
 # ------------------------------------------------------------
