@@ -7,10 +7,15 @@ PASS=0; FAIL=0
 for f in tests/*_test.sw; do
   m=$(basename "$f" _test.sw)
   out=$(mktemp -t swarm_test_${m}.XXXXXX)
-  if ! "$SWC" build "$f" -o "$out" >/dev/null 2>&1; then
+  BUILD_LOG=$(mktemp -t swarm_test_build.XXXXXX)
+  if ! "$SWC" build "$f" -o "$out" >"$BUILD_LOG" 2>&1; then
     echo "  ✗ $m  (build failed)"
-    FAIL=$((FAIL+1)); rm -f "$out"; continue
+    # Print last 5 lines of build error so CI can be diagnosed.
+    sed 's/^/      /' "$BUILD_LOG" | tail -5
+    rm -f "$out" "$BUILD_LOG"
+    FAIL=$((FAIL+1)); continue
   fi
+  rm -f "$BUILD_LOG"
   if perl -e 'alarm 5; exec @ARGV' "$out" >/dev/null 2>&1; then
     echo "  ✓ $m"
     PASS=$((PASS+1))
