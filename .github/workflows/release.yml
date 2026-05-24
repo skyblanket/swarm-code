@@ -38,12 +38,12 @@ jobs:
 
     steps:
       - name: Checkout swarm-code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: swarm-code
 
       - name: Checkout swarmrt (sibling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: skyblanket/swarmrt
           path: swarmrt
@@ -108,7 +108,7 @@ jobs:
           ls -lh dist/swarm-${{ matrix.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: swarm-${{ matrix.target }}
           path: swarm-code/dist/swarm-${{ matrix.target }}
@@ -118,10 +118,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
