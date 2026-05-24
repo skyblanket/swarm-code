@@ -560,30 +560,58 @@ fun resolve_path_arg(args) {
 }
 
 # Truncate long output to prevent context blowup.
+#
+# Old version kept ONLY the head — exactly wrong for long builds where
+# the useful bits (errors, final status) land at the END. New version
+# keeps both ends: 40% from the head (setup context) + 60% from the
+# tail (where the action is), separated by a `[N bytes elided]` marker.
 fun truncate_output(s, cap) {
-    if (string_length(s) <= cap) {
-        s
-    } else {
-        head = string_sub(s, 0, cap)
-        head ++ "\n...[truncated — output exceeded " ++ to_string(cap) ++
-        " bytes. Use a tighter query (head/grep/sed) to get specific info.]"
+    n = string_length(s)
+    if (n <= cap) { s }
+    else {
+        head_bytes = cap * 4 / 10
+        tail_bytes = cap - head_bytes
+        elided = n - head_bytes - tail_bytes
+        head_part = string_sub(s, 0, head_bytes)
+        tail_part = string_sub(s, n - tail_bytes, tail_bytes)
+        head_part ++
+        "\n\n...[" ++ to_string(elided) ++ " bytes elided — " ++
+        "use a tighter query (grep/head/tail/sed) for a specific slice]...\n\n" ++
+        tail_part
     }
 }
 
-# Truncate output to a maximum number of lines. Keeps the first N lines
-# and appends a marker telling the model how many lines were dropped.
+# Truncate output to a maximum number of lines. Keeps the first 30%
+# and last 70% with an elision marker between — the tail usually has
+# the error / final status from a long build.
 fun truncate_output_lines(s, max_lines) {
     lines = string_split(s, "\n")
     total = length(lines)
-    if (total <= max_lines) {
-        s
-    } else {
-        kept = take_first_lines(lines, max_lines, [])
-        head = join_lines(kept, "")
-        dropped = total - max_lines
-        head ++ "\n...[truncated — " ++ to_string(dropped) ++
-        " more lines dropped. Use head/grep/find -maxdepth for a tighter view.]"
+    if (total <= max_lines) { s }
+    else {
+        head_lines = max_lines * 3 / 10
+        tail_lines = max_lines - head_lines
+        elided = total - head_lines - tail_lines
+        head_part = take_first_lines(lines, head_lines, [])
+        tail_part = take_last_lines(lines, tail_lines)
+        join_lines(head_part, "") ++
+        "\n...[" ++ to_string(elided) ++ " more lines elided — " ++
+        "tail kept for error/status context]...\n" ++
+        join_lines(tail_part, "")
     }
+}
+
+# Take the last `n` items from a list. O(len) but called once per
+# truncation so the cost is negligible.
+fun take_last_lines(lst, n) {
+    total = length(lst)
+    if (n >= total) { lst }
+    else { drop_first(lst, total - n) }
+}
+
+fun drop_first(lst, n) {
+    if (n <= 0 || length(lst) == 0) { lst }
+    else { drop_first(tl(lst), n - 1) }
 }
 
 fun take_first_lines(lst, n, acc) {

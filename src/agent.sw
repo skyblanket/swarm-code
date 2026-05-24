@@ -34,6 +34,9 @@ import Mcp
 import Skills
 import SessionSearch
 import Vision
+import Scheduler
+import ToolRegistry
+import Trajectory
 
 export [run, run_headless]
 
@@ -436,6 +439,12 @@ fun route_input(line, history, opts) {
 fun pulse_interval() { 30 }
 
 fun on_heartbeat_tick(count, history, opts) {
+    # Every tick, give the scheduler a chance to dispatch any due
+    # recurring jobs. Cheap — it's a JSON read + a few timestamp
+    # comparisons unless something is due. Fire-and-forget, no
+    # blocking, output goes to telemetry/ files.
+    Scheduler.tick(opts)
+
     daemon = map_get(opts, 'daemon')
     if (daemon != 'true') { history }
     else {
@@ -609,6 +618,79 @@ fun slash_dispatch(cmd, history, opts) {
         }
         history
     }
+    else { if (cmd == "/schedules") {
+        show_schedules()
+        history
+    }
+    else { if (string_starts_with(cmd, "/schedule ") == 'true') {
+        # /schedule "EXPR" "PROMPT"  — quoted args required
+        rest = string_trim(string_sub(cmd, 10, string_length(cmd) - 10))
+        parsed = parse_schedule_args(rest)
+        if (parsed == nil) {
+            print("\e[33musage: /schedule \"EXPR\" \"PROMPT\"  " ++
+                  "(EXPR is 30s/5m/2h/1d or 'hourly'/'daily HH:MM')\e[0m")
+        } else {
+            expr = hd(parsed)
+            prompt = hd(tl(parsed))
+            id = Scheduler.add(expr, prompt)
+            if (id == nil) {
+                print("\e[33minvalid EXPR — try 30s, 5m, 2h, 1d, hourly, daily 09:00\e[0m")
+            } else {
+                print(UI.brand_color() ++ "✓ scheduled job " ++ id ++
+                      " (" ++ expr ++ "): " ++ prompt ++ UI.reset())
+            }
+        }
+        history
+    }
+    else { if (string_starts_with(cmd, "/unschedule ") == 'true') {
+        id = string_trim(string_sub(cmd, 12, string_length(cmd) - 12))
+        if (Scheduler.remove(id) == 'true') {
+            print("\e[2m✓ unscheduled " ++ id ++ "\e[0m")
+        } else {
+            print("\e[33mno job with id " ++ id ++ "\e[0m")
+        }
+        history
+    }
+    else { if (cmd == "/export-trajectory" || cmd == "/export-trajectories" ||
+              string_starts_with(cmd, "/export-trajectory ") == 'true' ||
+              string_starts_with(cmd, "/export-trajectories ") == 'true') {
+        # Optional --current flag exports just this session.
+        # Optional path arg overrides the default ~/.swarm-code/exports/...
+        rest = string_trim(if (string_starts_with(cmd, "/export-trajectories ") == 'true') {
+            string_sub(cmd, 21, string_length(cmd) - 21)
+        } else { if (string_starts_with(cmd, "/export-trajectory ") == 'true') {
+            string_sub(cmd, 19, string_length(cmd) - 19)
+        } else { "" }})
+        current_only = string_contains(rest, "--current") == 'true'
+        path_arg = string_trim(string_replace(rest, "--current", ""))
+        out_path = if (string_length(path_arg) == 0) { Trajectory.default_path() }
+                   else { path_arg }
+        result = if (current_only == 'true') {
+            Trajectory.export_current(out_path, history)
+        } else { Trajectory.export_all(out_path) }
+        kept = map_get(result, 'kept')
+        actual_path = map_get(result, 'path')
+        print(UI.brand_color() ++ "✓ exported " ++ to_string(kept) ++
+              " session(s) → " ++ to_string(actual_path) ++ UI.reset())
+        history
+    }
+    else { if (cmd == "/paste" || string_starts_with(cmd, "/paste ") == 'true') {
+        # Grab the clipboard image (osascript on macOS, xclip on linux),
+        # attach via Vision.attach, then send the trailing prose (if any)
+        # as the user message so the image rides the next request.
+        prose = if (cmd == "/paste") { "what's in this?" }
+                else { string_trim(string_sub(cmd, 7, string_length(cmd) - 7)) }
+        msg = if (string_length(prose) == 0) { "what's in this?" } else { prose }
+        tmp = Vision.paste_from_clipboard(opts)
+        if (tmp == nil) {
+            print("\e[33m(clipboard has no image — copy a screenshot first)\e[0m")
+            history
+        } else {
+            print(UI.grey_text() ++ "  📎 attached: " ++ tmp ++ UI.reset())
+            new_hist = list_append(history, LLM.new_message_user(msg))
+            run_turn(new_hist, opts, 0)
+        }
+    }
     else { if (cmd == "/compact") {
         compacted = compact_history(history, opts)
         print("\e[2m[history compacted: " ++ to_string(length(history)) ++
@@ -700,7 +782,7 @@ fun slash_dispatch(cmd, history, opts) {
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -717,6 +799,11 @@ fun show_help() {
     print("  /profile NAME         swap to a profile from settings.json")
     print("  /profile-clear        drop the override, revert to launch profile")
     print("  /search QUERY         FTS5 search across all session journals")
+    print("  /paste [prompt]       attach clipboard image (Cmd+V from a screenshot)")
+    print("  /schedule \"EXPR\" \"PROMPT\"  schedule a recurring agent run")
+    print("  /schedules            list scheduled jobs")
+    print("  /unschedule ID        remove a scheduled job")
+    print("  /export-trajectory [--current] [path]  dump sessions as fine-tuning JSONL")
     print("  /history              print recent messages")
     print("  /tokens               approximate token count")
     print("  /cost                 session cost (local = $0)")
@@ -1681,6 +1768,67 @@ fun interpret_picker(idx, table, cache_key) {
 # Tools.exec / dispatch_tool (which compare against atoms).
 # Unknown strings return the string as-is so MCP names (mcp__*) and
 # any future tools still resolve.
+# ---------- /schedule helpers --------------------------------
+
+fun show_schedules() {
+    jobs = Scheduler.list_all()
+    if (length(jobs) == 0) {
+        print("\e[2m(no scheduled jobs — see /help for /schedule usage)\e[0m")
+    } else {
+        print("\e[1mscheduled jobs\e[0m")
+        show_schedule_loop(jobs)
+    }
+}
+
+fun show_schedule_loop(jobs) {
+    if (length(jobs) == 0) { 'ok' }
+    else {
+        j = hd(jobs)
+        id = to_string(map_get(j, 'id'))
+        expr = to_string(map_get(j, 'expr'))
+        prompt = to_string(map_get(j, 'prompt'))
+        runs_v = map_get(j, 'runs')
+        runs = if (runs_v == nil) { 0 } else { runs_v }
+        print("  [" ++ id ++ "] " ++ expr ++ "  →  " ++
+              preview_string(prompt, 70) ++
+              UI.grey_text() ++ "  (" ++ to_string(runs) ++ " runs)" ++ UI.reset())
+        show_schedule_loop(tl(jobs))
+    }
+}
+
+# Parse `"EXPR" "PROMPT"` — both must be double-quoted. Returns
+# (expr, prompt) tuple or nil on parse error.
+fun parse_schedule_args(s) {
+    if (string_length(s) < 5) { nil }
+    else { if (string_sub(s, 0, 1) != "\"") { nil }
+    else {
+        # Find closing quote of first arg.
+        end1 = find_quote(s, 1)
+        if (end1 < 0) { nil }
+        else {
+            expr = string_sub(s, 1, end1 - 1)
+            rest = string_trim(string_sub(s, end1 + 1, string_length(s) - end1 - 1))
+            if (string_length(rest) < 2 || string_sub(rest, 0, 1) != "\"") { nil }
+            else {
+                end2 = find_quote(rest, 1)
+                if (end2 < 0) { nil }
+                else {
+                    prompt = string_sub(rest, 1, end2 - 1)
+                    [expr, prompt]
+                }
+            }
+        }
+    }}
+}
+
+fun find_quote(s, from) {
+    if (from >= string_length(s)) { 0 - 1 }
+    else {
+        if (string_sub(s, from, 1) == "\"") { from }
+        else { find_quote(s, from + 1) }
+    }
+}
+
 # Print a one-line confirmation per image auto-attached from user
 # input. Quiet when nothing matched (no surprise output on normal
 # chat). Quiet too when a path was found but the profile doesn't
@@ -1723,6 +1871,12 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/profiles") { 'true' }
     else { if (cmd == "/profile-clear") { 'true' }
     else { if (cmd == "/search") { 'true' }
+    else { if (cmd == "/paste") { 'true' }
+    else { if (cmd == "/schedule") { 'true' }
+    else { if (cmd == "/schedules") { 'true' }
+    else { if (cmd == "/unschedule") { 'true' }
+    else { if (cmd == "/export-trajectory") { 'true' }
+    else { if (cmd == "/export-trajectories") { 'true' }
     else { if (cmd == "/compact") { 'true' }
     else { if (cmd == "/save") { 'true' }
     else { if (cmd == "/resume") { 'true' }
@@ -1739,56 +1893,15 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/quit") { 'true' }
     else { if (cmd == "/exit") { 'true' }
     else { if (cmd == "/reset") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
+# String → atom for tool dispatch. Was a ~50-case if/else; now a
+# one-liner that walks the central ToolRegistry. Unknown names pass
+# through as strings (MCP tools have the mcp__* prefix and resolve
+# in tools.sw exec).
 fun string_to_atom(s) {
-    if (s == "bash") { 'bash' }
-    else { if (s == "read") { 'read' }
-    else { if (s == "write") { 'write' }
-    else { if (s == "edit") { 'edit' }
-    else { if (s == "multi_edit") { 'multi_edit' }
-    else { if (s == "glob") { 'glob' }
-    else { if (s == "grep") { 'grep' }
-    else { if (s == "todo_write") { 'todo_write' }
-    else { if (s == "web_fetch") { 'web_fetch' }
-    else { if (s == "task") { 'task' }
-    else { if (s == "remember") { 'remember' }
-    else { if (s == "recall") { 'recall' }
-    else { if (s == "memory_list") { 'memory_list' }
-    else { if (s == "forget") { 'forget' }
-    else { if (s == "background") { 'background' }
-    else { if (s == "bg_status") { 'bg_status' }
-    else { if (s == "bg_result") { 'bg_result' }
-    else { if (s == "bg_server") { 'bg_server' }
-    else { if (s == "bg_tail") { 'bg_tail' }
-    else { if (s == "bg_kill") { 'bg_kill' }
-    else { if (s == "sys_stats") { 'sys_stats' }
-    else { if (s == "heartbeat_status") { 'heartbeat_status' }
-    else { if (s == "web_search") { 'web_search' }
-    else { if (s == "git_status") { 'git_status' }
-    else { if (s == "git_diff") { 'git_diff' }
-    else { if (s == "git_commit") { 'git_commit' }
-    else { if (s == "code_search") { 'code_search' }
-    else { if (s == "log_wait") { 'log_wait' }
-    else { if (s == "file_watch") { 'file_watch' }
-    else { if (s == "browser_launch")     { 'browser_launch' }
-    else { if (s == "browser_navigate")   { 'browser_navigate' }
-    else { if (s == "browser_click")      { 'browser_click' }
-    else { if (s == "browser_type")       { 'browser_type' }
-    else { if (s == "browser_screenshot") { 'browser_screenshot' }
-    else { if (s == "browser_get_text")   { 'browser_get_text' }
-    else { if (s == "browser_get_html")   { 'browser_get_html' }
-    else { if (s == "browser_evaluate")   { 'browser_evaluate' }
-    else { if (s == "browser_close")      { 'browser_close' }
-    else { if (s == "learn_skill")        { 'learn_skill' }
-    else { if (s == "recall_skill")       { 'recall_skill' }
-    else { if (s == "forget_skill")       { 'forget_skill' }
-    else { if (s == "skill_list")         { 'skill_list' }
-    else { if (s == "session_search")     { 'session_search' }
-    else { if (s == "read_image")         { 'read_image' }
-    else { s }
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    ToolRegistry.atom_for(s)
 }
 
 # Truncate string for inline preview.

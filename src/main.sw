@@ -39,6 +39,7 @@ import Memory
 import Skills
 import SessionSearch
 import Vision
+import Scheduler
 import Heartbeat
 import Background
 import Telemetry
@@ -120,6 +121,7 @@ fun main() {
         print_inline(UI.grey_text() ++ " ⏳ indexing past sessions…" ++ UI.reset())
     }
     SessionSearch.init()
+    Scheduler.load()
     if (headless == 'false') {
         # Wipe the loader line in-place so the banner-to-prompt transition stays clean.
         print_inline("\r\e[K")

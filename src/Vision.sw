@@ -30,7 +30,8 @@ module Vision
 
 export [
     read_as_data_url, attach, get_pending, clear, supports,
-    detect_mime, extract_image_paths, auto_attach
+    detect_mime, extract_image_paths, auto_attach,
+    paste_from_clipboard
 ]
 
 # ------------------------------------------------------------
@@ -295,5 +296,40 @@ fun auto_attach_loop(opts, paths, acc) {
         entry = attach(opts, p)
         new_acc = if (entry == nil) { acc } else { list_append(acc, p) }
         auto_attach_loop(opts, tl(paths), new_acc)
+    }
+}
+
+# ------------------------------------------------------------
+# Clipboard paste — extract a PNG from the system clipboard and
+# stuff it through the normal attach pipeline. Cross-platform via
+# osascript on darwin, xclip on linux. Returns the temp path on
+# success, nil on failure (empty clipboard, no image, unsupported
+# platform).
+# ------------------------------------------------------------
+fun paste_from_clipboard(opts) {
+    ts = to_string(timestamp())
+    tmp_path = "/tmp/swarm_paste_" ++ ts ++ ".png"
+    cmd =
+        "osascript -e 'set png to the clipboard as «class PNGf»' " ++
+        "        -e 'set fh to open for access POSIX file " ++ shell_q(tmp_path) ++
+        "                  with write permission' " ++
+        "        -e 'set eof of fh to 0' " ++
+        "        -e 'write png to fh' " ++
+        "        -e 'close access fh' 2>/dev/null || " ++
+        "xclip -selection clipboard -t image/png -o > " ++ shell_q(tmp_path) ++
+        " 2>/dev/null"
+    r = shell(cmd)
+    if (file_exists(tmp_path) == 'false') { nil }
+    else {
+        # Empty file = clipboard didn't have an image
+        sz_r = shell("wc -c < " ++ shell_q(tmp_path) ++ " 2>/dev/null")
+        sz = string_trim(elem(sz_r, 1))
+        if (sz == "0" || sz == "") {
+            file_delete(tmp_path)
+            nil
+        } else {
+            entry = attach(opts, tmp_path)
+            if (entry == nil) { nil } else { tmp_path }
+        }
     }
 }
