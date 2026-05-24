@@ -207,11 +207,16 @@ fun dispatch(job) {
     ts = to_string(timestamp())
     out_path = jobs_dir() ++ "/scheduled-" ++ id ++ "-" ++ ts ++ ".out"
     bin = swarm_binary_path()
-    # nohup + & detaches; redirect stdout+stderr to the per-run file.
-    cmd =
+    # We wrap with `bash -c '… &'` because swarmrt's shell() builtin
+    # itself appends `; echo $? > exitf` to whatever we pass — putting
+    # a bare `&` at the end of our own command produces `& ; echo …`
+    # which is a bash syntax error. Backgrounding INSIDE the inner
+    # bash -c lets the outer wrapper see a clean exit immediately while
+    # the actual swarm-code -p job keeps running detached.
+    inner =
         "nohup " ++ shell_q(bin) ++ " -p " ++ shell_q(prompt) ++
         " > " ++ shell_q(out_path) ++ " 2>&1 &"
-    shell(cmd)
+    shell("bash -c " ++ shell_q(inner))
     'dispatched'
 }
 
