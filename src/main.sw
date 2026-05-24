@@ -115,7 +115,14 @@ fun main() {
     # Phase E features: memory, heartbeat, background tasks
     memory_table = Memory.load()
     skills_token = Skills.load()
+    if (headless == 'false') {
+        print_inline(UI.grey_text() ++ " ⏳ indexing past sessions…" ++ UI.reset())
+    }
     SessionSearch.init()
+    if (headless == 'false') {
+        # Wipe the loader line in-place so the banner-to-prompt transition stays clean.
+        print_inline("\r\e[K")
+    }
     bg_table = Background.init()
     # Short tick (2s) so bg_done notifications feel real-time. Polling
     # is a cheap file_exists check per pending task. Override with
@@ -207,10 +214,12 @@ fun main() {
     heartbeat_section = Heartbeat.as_prompt_section(heartbeat_table)
     mcp_section = Mcp.as_prompt_section(mcp_table)
 
-    # Capture a system-stats snapshot at startup so Swarm sees the host
-    # without having to call sys_stats for basic context.
-    telemetry_snapshot = Telemetry.sys_stats()
-    telemetry_section = "\n\n=== HOST SNAPSHOT (startup) ===\n" ++ telemetry_snapshot
+    # Host snapshot is left to the agent — it has a sys_stats tool and can
+    # call it when relevant. Capturing at startup costs ~6 swarmrt shell()
+    # calls (uptime / uname / vm_stat / df / uptime / free), and each shell()
+    # imposes a 1s poll. Eating 6s of startup just for a snapshot the model
+    # rarely needs at turn-zero is a bad UX trade.
+    telemetry_section = ""
 
     system_prompt_text = Prompts.system_prompt(cwd, to_string(map_get(base_opts, 'tool_format'))) ++
         (if (string_length(project_ctx) == 0) { "" }

@@ -41,7 +41,7 @@ module Memory
 export [
     load, memory_dir, index_path, memory_file_path,
     save, recall, list_index, forget,
-    as_prompt_section, slugify, parse_frontmatter
+    as_prompt_section, slugify, parse_frontmatter, find_substring
 ]
 
 fun memory_dir() {
@@ -135,20 +135,38 @@ fun update_index(new_slug, new_name, new_desc, new_type) {
 # fresh index sorted newest-first.
 fun rebuild_index() {
     dir = memory_dir()
-    # List all .md files except MEMORY.md, newest first (ls -t).
-    result = shell("ls -t " ++ dir ++ "/*.md 2>/dev/null | grep -v '/MEMORY.md$'")
-    code = elem(result, 0)
-    out = elem(result, 1)
     header =
         "# Swarm Memory Index\n\n" ++
         "Auto-maintained pointer list for ~/.swarm-code/memory/. Each line\n" ++
-        "links to a topic file with full content. Newest first.\n\n"
-    body = if (code == 0 && string_length(string_trim(out)) > 0) {
-        lines = string_split(string_trim(out), "\n")
-        render_index_lines(lines, "")
-    } else { "(no memories yet)\n" }
-    file_write(index_path(), header ++ body)
-    'ok'
+        "links to a topic file with full content.\n\n"
+    # file_list is an in-process readdir — was shell("ls -t ... | grep -v")
+    # which cost a full second per call (swarmrt's shell() polls every 1s).
+    # We lose mtime-sort, but the index is short and frontmatter order is
+    # what readers scan anyway.
+    if (file_exists(dir) == 'false') {
+        file_write(index_path(), header ++ "(no memories yet)\n")
+        'ok'
+    } else {
+        entries = file_list(dir)
+        paths = collect_md_paths(entries, dir, [])
+        body = if (length(paths) == 0) { "(no memories yet)\n" }
+               else { render_index_lines(paths, "") }
+        file_write(index_path(), header ++ body)
+        'ok'
+    }
+}
+
+# Filter file_list entries to memory crumb paths — *.md, excluding the
+# auto-generated MEMORY.md index itself.
+fun collect_md_paths(entries, dir, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        new_acc = if (string_ends_with(e, ".md") == 'true' && e != "MEMORY.md") {
+            list_append(acc, dir ++ "/" ++ e)
+        } else { acc }
+        collect_md_paths(tl(entries), dir, new_acc)
+    }
 }
 
 fun render_index_lines(paths, acc) {

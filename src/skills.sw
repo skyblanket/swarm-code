@@ -51,7 +51,9 @@ fun skill_dir(slug)          { skills_dir() ++ "/" ++ slug }
 fun skill_file_path(slug)    { skill_dir(slug) ++ "/SKILL.md" }
 
 fun load() {
-    shell("mkdir -p " ++ skills_dir())
+    # swarmrt's shell() builtin polls every 1s, so we avoid it on the
+    # hot startup path. file_mkdir is a direct mkdir() syscall — free.
+    file_mkdir(skills_dir())
     'skills_ready'
 }
 
@@ -62,7 +64,7 @@ fun load() {
 fun save(name, description, triggers, instructions) {
     slug = slugify(to_string(name))
     dir = skill_dir(slug)
-    shell("mkdir -p " ++ dir)
+    file_mkdir(dir)
     body =
         "---\n" ++
         "name: " ++ to_string(name) ++ "\n" ++
@@ -100,39 +102,59 @@ fun list_index() {
 }
 
 fun forget(slug) {
-    d = skill_dir(slug)
-    if (file_exists(d ++ "/SKILL.md") == 'false') {
+    p = skill_file_path(slug)
+    if (file_exists(p) == 'false') {
         "error: no skill named '" ++ slug ++ "'"
     } else {
-        result = shell("rm -rf " ++ shell_q(d))
-        if (elem(result, 0) == 0) {
+        # Delete just SKILL.md — that's what the index keys on. Any
+        # helper scripts beside it are left for the user to inspect.
+        rc = file_delete(p)
+        if (rc == 'ok' || rc == 'true' || rc == nil) {
             rebuild_index()
-            "ok: forgot " ++ slug
+            "ok: forgot " ++ slug ++ " (helper files in " ++ skill_dir(slug) ++ " left in place)"
         } else {
-            "error: could not remove " ++ d
+            "error: could not delete " ++ p
         }
     }
 }
 
 # ------------------------------------------------------------
-# Index — rebuilt from filesystem on save/forget/load.
+# Index — rebuilt from the filesystem on save/forget/load. Uses
+# file_list (in-process syscall) instead of shell glob to avoid
+# the 1s-per-shell penalty on the hot startup path.
 # ------------------------------------------------------------
 fun rebuild_index() {
     dir = skills_dir()
-    # List all SKILL.md files inside skill subdirs, newest-first.
-    result = shell("ls -t " ++ dir ++ "/*/SKILL.md 2>/dev/null")
-    code = elem(result, 0)
-    out = elem(result, 1)
     header =
         "# Swarm Skills Index\n\n" ++
         "Auto-maintained list of skills in ~/.swarm-code/skills/.\n" ++
         "Each skill is a directory with SKILL.md + optional scripts.\n\n"
-    body = if (code == 0 && string_length(string_trim(out)) > 0) {
-        lines = string_split(string_trim(out), "\n")
-        render_index_lines(lines, "")
-    } else { "(no skills yet)\n" }
-    file_write(index_path(), header ++ body)
-    'ok'
+    if (file_exists(dir) == 'false') {
+        file_write(index_path(), header ++ "(no skills yet)\n")
+        'ok'
+    } else {
+        entries = file_list(dir)
+        paths = collect_skill_paths(entries, dir, [])
+        body = if (length(paths) == 0) { "(no skills yet)\n" }
+               else { render_index_lines(paths, "") }
+        file_write(index_path(), header ++ body)
+        'ok'
+    }
+}
+
+# For each entry in skills_dir, if it's a subdir with a SKILL.md, add
+# that path to the accumulator. We skip SKILLS.md itself + anything
+# without the marker file.
+fun collect_skill_paths(entries, dir, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        skill_md = dir ++ "/" ++ e ++ "/SKILL.md"
+        new_acc = if (file_exists(skill_md) == 'true') {
+            list_append(acc, skill_md)
+        } else { acc }
+        collect_skill_paths(tl(entries), dir, new_acc)
+    }
 }
 
 fun render_index_lines(paths, acc) {

@@ -141,9 +141,14 @@ fun journal_sync(opts, history) {
     jp = map_get(opts, 'journal_path')
     if (jp == nil) { 'ok' }
     else {
-        tmp = jp ++ ".tmp"
-        file_write(tmp, encode_journal(history))
-        shell("mv " ++ tmp ++ " " ++ jp)
+        # Direct write — the original code did file_write(tmp) + shell(mv)
+        # for crash-atomicity, but swarmrt's shell() builtin polls every
+        # 1s, making each journal sync (and we sync after every turn) feel
+        # awful. The replay_journal parser already tolerates corrupt /
+        # truncated lines (json_decode of a partial line returns nil and
+        # is skipped), so a torn write at most loses the last turn — same
+        # as the rename approach would on a power-cut anyway.
+        file_write(jp, encode_journal(history))
         'ok'
     }
 }
@@ -234,8 +239,11 @@ fun run(opts, system_prompt_text) {
     register('main_agent', self())
 
     # Crash-recovery journal: set up / resume.
+    # file_mkdir is a direct mkdir() syscall — was shell("mkdir -p") which
+    # cost a full second per session start because swarmrt's shell() polls
+    # every 1s.
     jdir = session_dir()
-    shell("mkdir -p " ++ jdir)
+    file_mkdir(jdir)
     ap = journal_active_ptr()
     prev_ptr = if (file_exists(ap) == 'true') { file_read(ap) } else { nil }
     resumed_raw = if (prev_ptr == nil) { [] }

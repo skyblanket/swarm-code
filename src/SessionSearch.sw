@@ -35,72 +35,86 @@ fun db_path()      { sessions_dir() ++ "/index.db" }
 # Idempotent. Called from main.sw at session start.
 # ------------------------------------------------------------
 fun init() {
-    shell("mkdir -p " ++ sessions_dir())
+    file_mkdir(sessions_dir())
     db = db_open(db_path())
     db_exec(db,
         "CREATE VIRTUAL TABLE IF NOT EXISTS journals USING fts5(" ++
         "session UNINDEXED, role UNINDEXED, content)")
     db_exec(db,
         "CREATE TABLE IF NOT EXISTS meta(" ++
-        "session TEXT PRIMARY KEY, mtime TEXT, indexed_at INTEGER)")
+        "session TEXT PRIMARY KEY, indexed_at INTEGER)")
     reindex(db)
     db_close(db)
     'session_search_ready'
 }
 
 # ------------------------------------------------------------
-# reindex — walk journal-*.jsonl, reindex any whose mtime changed
-# (or that aren't in the cache yet). Per-file mtime is the unit;
-# when it bumps we wipe and re-insert that file's rows.
+# reindex — enumerate journals via the file_list builtin (no shell)
+# and index any that aren't in the meta cache yet. The currently-
+# active session (per the .active marker) is always re-indexed,
+# since its turns grow during a run.
+#
+# Why no mtime check: swarmrt's shell() polls every 1s, so 60 files
+# × 1 stat call each = 60s startup. file_list is in-process and free,
+# but doesn't surface mtimes — so we trade per-file freshness for
+# instant boot. The active session is the only one that mutates
+# during a run, and we always refresh it.
 # ------------------------------------------------------------
 fun reindex(db) {
-    result = shell("ls -t " ++ sessions_dir() ++ "/journal-*.jsonl 2>/dev/null")
-    code = elem(result, 0)
-    out = elem(result, 1)
-    if (code != 0 || string_length(string_trim(out)) == 0) { 'ok' }
-    else {
-        files = string_split(string_trim(out), "\n")
-        reindex_loop(db, files)
-    }
+    active = read_active_marker()
+    names = file_list(sessions_dir())
+    reindex_loop(db, names, active)
 }
 
-fun reindex_loop(db, files) {
-    if (length(files) == 0) { 'ok' }
+fun reindex_loop(db, names, active) {
+    if (length(names) == 0) { 'ok' }
     else {
-        path = hd(files)
-        mtime = file_mtime(path)
-        cached = cached_mtime(db, path)
-        if (cached != nil && cached == mtime) {
-            reindex_loop(db, tl(files))
-        } else {
-            # swarmrt's db_exec() doesn't bind params — only db_query does.
-            # Use db_query for parameterised writes; the empty result list
-            # is harmless.
-            db_query(db, "DELETE FROM journals WHERE session = ?", [path])
-            content = file_read(path)
-            if (content != nil) {
-                lines = string_split(content, "\n")
-                ingest_lines(db, path, lines)
-            }
-            db_query(db,
-                "INSERT OR REPLACE INTO meta(session, mtime, indexed_at) VALUES (?, ?, ?)",
-                [path, mtime, timestamp()])
-            reindex_loop(db, tl(files))
+        n = hd(names)
+        if (is_journal_name(n) == 'true') {
+            path = sessions_dir() ++ "/" ++ n
+            needs = if (path == active) { 'true' }
+                    else { if (is_indexed(db, path) == 'true') { 'false' }
+                    else { 'true' }}
+            if (needs == 'true') { index_one(db, path) }
         }
+        reindex_loop(db, tl(names), active)
     }
 }
 
-# Best-effort: works on darwin (`stat -f %m`) and linux (`stat -c %Y`).
-fun file_mtime(path) {
-    r = shell("stat -f %m " ++ shell_q(path) ++ " 2>/dev/null || " ++
-              "stat -c %Y " ++ shell_q(path) ++ " 2>/dev/null")
-    string_trim(elem(r, 1))
+fun is_journal_name(n) {
+    string_starts_with(n, "journal-") == 'true' &&
+    string_ends_with(n, ".jsonl") == 'true'
 }
 
-fun cached_mtime(db, path) {
-    rows = db_query(db, "SELECT mtime FROM meta WHERE session = ?", [path])
-    if (length(rows) == 0) { nil }
-    else { to_string(map_get(hd(rows), "mtime")) }
+fun is_indexed(db, path) {
+    rows = db_query(db, "SELECT 1 FROM meta WHERE session = ?", [path])
+    if (length(rows) == 0) { 'false' } else { 'true' }
+}
+
+# Read the .active pointer to know which journal is the currently
+# running session (the only one that may have grown since last index).
+fun read_active_marker() {
+    p = sessions_dir() ++ "/.active"
+    if (file_exists(p) == 'false') { nil }
+    else {
+        c = file_read(p)
+        if (c == nil) { nil } else { string_trim(c) }
+    }
+}
+
+fun index_one(db, path) {
+    # swarmrt's db_exec() doesn't bind params — only db_query does.
+    # Use db_query for parameterised writes; empty result is harmless.
+    db_query(db, "DELETE FROM journals WHERE session = ?", [path])
+    content = file_read(path)
+    if (content != nil) {
+        clines = string_split(content, "\n")
+        ingest_lines(db, path, clines)
+    }
+    db_query(db,
+        "INSERT OR REPLACE INTO meta(session, indexed_at) VALUES (?, ?)",
+        [path, timestamp()])
+    'ok'
 }
 
 fun ingest_lines(db, path, lines) {
