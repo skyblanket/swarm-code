@@ -202,24 +202,51 @@ fun parse_interval(s) {
 # Dispatch a job — spawn `swarm-code -p "<prompt>"` in the background,
 # output to ~/.swarm-code/telemetry/scheduled-<id>-<ts>.out. Doesn't
 # block the agent loop; we never wait on the child.
+#
+# Two hard-learned safety rules:
+#   1. ALWAYS pass --no-resume. Cron children are one-shot ephemeral
+#      sessions; they must never inherit the parent's .active journal,
+#      or a polluted history can loop them indefinitely on tool calls.
+#   2. Back-pressure: write the child PID to a pidfile and skip the
+#      next dispatch if the previous child is still alive. Without
+#      this, a slow LLM + 5s cron piles up hundreds of stuck children
+#      ("swarm-bomb"). Caps concurrency at 1 per job.
 # ------------------------------------------------------------
 fun dispatch(job) {
     id = to_string(map_get(job, 'id'))
-    prompt = to_string(map_get(job, 'prompt'))
-    ts = to_string(timestamp())
-    out_path = jobs_dir() ++ "/scheduled-" ++ id ++ "-" ++ ts ++ ".out"
-    bin = swarm_binary_path()
-    # We wrap with `bash -c '… &'` because swarmrt's shell() builtin
-    # itself appends `; echo $? > exitf` to whatever we pass — putting
-    # a bare `&` at the end of our own command produces `& ; echo …`
-    # which is a bash syntax error. Backgrounding INSIDE the inner
-    # bash -c lets the outer wrapper see a clean exit immediately while
-    # the actual swarm-code -p job keeps running detached.
-    inner =
-        "nohup " ++ Util.shell_q(bin) ++ " -p " ++ Util.shell_q(prompt) ++
-        " > " ++ Util.shell_q(out_path) ++ " 2>&1 &"
-    shell("bash -c " ++ Util.shell_q(inner))
-    'dispatched'
+    pid_file = jobs_dir() ++ "/scheduled-" ++ id ++ ".pid"
+    if (previous_fire_alive(pid_file) == 'true') { 'skipped_busy' }
+    else {
+        prompt = to_string(map_get(job, 'prompt'))
+        ts = to_string(timestamp())
+        out_path = jobs_dir() ++ "/scheduled-" ++ id ++ "-" ++ ts ++ ".out"
+        bin = swarm_binary_path()
+        # bash -c '... &' so the outer shell exits immediately and the
+        # actual swarm-code -p job keeps running detached. We capture
+        # the child PID via $! into pid_file so the next tick can skip.
+        inner =
+            "nohup " ++ Util.shell_q(bin) ++ " --no-resume -p " ++ Util.shell_q(prompt) ++
+            " > " ++ Util.shell_q(out_path) ++ " 2>&1 & echo $! > " ++ Util.shell_q(pid_file)
+        shell("bash -c " ++ Util.shell_q(inner))
+        'dispatched'
+    }
+}
+
+# Has the previous fire's child exited? Cheap kill(pid, 0) check via
+# the pid_alive builtin — no shell() overhead. Returns 'true' if the
+# previous child is still alive (so we should back off), 'false'
+# otherwise (no pidfile, parse fail, or process gone).
+fun previous_fire_alive(pid_file) {
+    if (file_exists(pid_file) == 'false') { 'false' }
+    else {
+        pid_content = file_read(pid_file)
+        if (pid_content == nil) { 'false' }
+        else {
+            pid_str = string_trim(to_string(pid_content))
+            if (string_length(pid_str) == 0) { 'false' }
+            else { pid_alive(pid_str) }
+        }
+    }
 }
 
 # Resolve the swarm-code binary. SWARM_CODE_BIN env override wins,

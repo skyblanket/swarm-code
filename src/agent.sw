@@ -323,7 +323,12 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
         file_write(jp_new, "")
         jp_new
     }
-    file_write(ap, journal_path)
+    # Only update .active when this session is resumable. With --no-resume
+    # we're explicitly ephemeral (cron child, headless one-shot); writing
+    # our path to .active would mean the next interactive launch resumes
+    # US, polluting future sessions. This was the swarm-bomb root cause.
+    if (no_resume == 'false') { file_write(ap, journal_path) }
+    else { 'skip_active_pointer' }
     opts_journal = map_put(opts, 'journal_path', journal_path)
 
     history = if (length(resumed) > 0) {
