@@ -35,19 +35,19 @@ export [
     tail_recent, summarize
 ]
 
-# Ensure the telemetry directory exists and return today's log path.
+# Ensure the telemetry directory exists and return the log path.
 fun init() {
-    dir = getenv("HOME") ++ "/.swarm-code/telemetry"
-    shell("mkdir -p " ++ dir)
+    file_mkdir(getenv("HOME") ++ "/.swarm-code/telemetry")
     path()
 }
 
+# Flat events.jsonl — no daily rotation. The old version date-stamped
+# files (events-2026-05-24.jsonl), but computing the date required a
+# shell("date") on every event, and swarmrt's shell() polls every 1s
+# (~1s per Log.* call). Going flat trades pretty-rotation for instant
+# logging. Rotate externally with logrotate if you actually need it.
 fun path() {
-    dir = getenv("HOME") ++ "/.swarm-code/telemetry"
-    # Use date -u for consistency. We pre-create the dir in init().
-    r = shell("date -u +%Y-%m-%d 2>/dev/null")
-    date_str = string_trim(elem(r, 1))
-    dir ++ "/" ++ date_str ++ ".jsonl"
+    getenv("HOME") ++ "/.swarm-code/telemetry/events.jsonl"
 }
 
 # Core writer: serialize a map to JSON + write a single line.

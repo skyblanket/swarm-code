@@ -291,7 +291,7 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     register('main_agent', self())
 
     jdir = session_dir()
-    shell("mkdir -p " ++ jdir)
+    file_mkdir(jdir)
     ap = journal_active_ptr()
     prev_ptr = if (file_exists(ap) == 'true') { file_read(ap) } else { nil }
     resumed_raw = if (prev_ptr == nil) { [] }
@@ -1079,7 +1079,7 @@ fun format_for_summary(msgs, acc) {
 # ------------------------------------------------------------
 fun save_session(history, opts) {
     dir = session_dir()
-    shell("mkdir -p " ++ dir)
+    file_mkdir(dir)
     ts = to_string(timestamp())
     path = dir ++ "/session-" ++ ts ++ ".json"
     file_write(path, encode_history(history))
@@ -1099,15 +1099,34 @@ fun history_to_objects(msgs, acc) {
 
 fun load_latest_session(opts) {
     dir = session_dir()
-    list_cmd = "ls -t " ++ dir ++ "/session-*.json 2>/dev/null | head -1"
-    result = shell(list_cmd)
-    out = string_trim(elem(result, 1))
-    if (string_length(out) == 0) { [] }
+    # file_list is an in-process readdir. session-*.json names embed a
+    # unix timestamp, so reverse-lex sort is equivalent to newest-first
+    # (same digit count, monotonic). Avoids the 1s-per-shell penalty
+    # the old `ls -t` paid.
+    names = file_list(dir)
+    latest = latest_session_name(names, nil)
+    if (latest == nil) { [] }
     else {
-        content = file_read(out)
+        content = file_read(dir ++ "/" ++ latest)
         if (content == nil) { [] }
         else { decode_history(content) }
     }
+}
+
+fun latest_session_name(names, best) {
+    if (length(names) == 0) { best }
+    else {
+        n = hd(names)
+        new_best = if (is_session_file(n) == 'true' &&
+                       (best == nil || n > best)) { n }
+                   else { best }
+        latest_session_name(tl(names), new_best)
+    }
+}
+
+fun is_session_file(n) {
+    string_starts_with(n, "session-") == 'true' &&
+    string_ends_with(n, ".json") == 'true'
 }
 
 fun decode_history(json_str) {
@@ -1135,11 +1154,64 @@ fun string_to_role(s) {
 
 fun list_sessions() {
     dir = session_dir()
-    cmd = "ls -t " ++ dir ++ "/session-*.json 2>/dev/null | head -20"
-    result = shell(cmd)
-    out = elem(result, 1)
-    if (string_length(out) == 0) { print("(no sessions)") }
-    else { print(out) }
+    names = file_list(dir)
+    sessions = collect_session_names(names, [])
+    if (length(sessions) == 0) { print("(no sessions)") }
+    else {
+        # Reverse-lex sort = newest-first because filenames embed a
+        # monotonic unix timestamp. Cap at 20 to match the old `head -20`.
+        sorted = sort_desc(sessions)
+        print_session_lines(sorted, dir, 0, 20)
+    }
+}
+
+fun collect_session_names(names, acc) {
+    if (length(names) == 0) { acc }
+    else {
+        n = hd(names)
+        new_acc = if (is_session_file(n) == 'true') { list_append(acc, n) }
+                  else { acc }
+        collect_session_names(tl(names), new_acc)
+    }
+}
+
+# Simple in-place-ish reverse-sort by string comparison. Fine for the
+# session-list use case (typically <100 files).
+fun sort_desc(lst) {
+    if (length(lst) <= 1) { lst }
+    else {
+        pivot = hd(lst)
+        rest = tl(lst)
+        greater = filter_gt(rest, pivot, [])
+        lesser = filter_le(rest, pivot, [])
+        sort_desc(greater) ++ [pivot] ++ sort_desc(lesser)
+    }
+}
+
+fun filter_gt(lst, p, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        new_acc = if (h > p) { list_append(acc, h) } else { acc }
+        filter_gt(tl(lst), p, new_acc)
+    }
+}
+
+fun filter_le(lst, p, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        new_acc = if (h > p) { acc } else { list_append(acc, h) }
+        filter_le(tl(lst), p, new_acc)
+    }
+}
+
+fun print_session_lines(names, dir, i, cap) {
+    if (length(names) == 0 || i >= cap) { 'ok' }
+    else {
+        print(dir ++ "/" ++ hd(names))
+        print_session_lines(tl(names), dir, i + 1, cap)
+    }
 }
 
 # ------------------------------------------------------------

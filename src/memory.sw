@@ -60,7 +60,7 @@ fun memory_file_path(slug) {
 # opaque token used by callers (kept for API parity with the old
 # table-based version).
 fun load() {
-    shell("mkdir -p " ++ memory_dir())
+    file_mkdir(memory_dir())
     # Migrate the old flat JSON file if it still exists.
     migrate_legacy()
     'memory_ready'
