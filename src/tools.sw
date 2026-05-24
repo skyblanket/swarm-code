@@ -901,7 +901,7 @@ fun do_web_search(args) {
         # Python script: read query from env var to avoid shell-quote hell.
         py_script = ddg_python_script()
         cmd = "SWC_WSQ=" ++ Util.shell_q(to_string(q)) ++
-              " SWC_WSN=" ++ to_string(max_n) ++
+              " SWC_WSN=" ++ Util.shell_q(to_string(max_n)) ++
               " python3 -c " ++ Util.shell_q(py_script)
         result = shell(with_timeout(cmd, fetch_timeout_s()))
         code = elem(result, 0)
@@ -1146,7 +1146,7 @@ fun do_log_wait(args, opts) {
         task_id = map_get(args, 'task_id')
         path_arg = map_get(args, 'path')
         timeout = map_get(args, 'timeout_sec')
-        timeout_n = if (timeout == nil) { 60 } else { timeout }
+        timeout_n = if (timeout == nil) { 60 } else { parse_int_safe(to_string(timeout), 60) }
 
         # Resolve log path: explicit path, or task_id's log file
         log_path = if (path_arg != nil) { to_string(path_arg) }
@@ -1187,7 +1187,7 @@ fun do_file_watch(args) {
     else {
         path = to_string(path_arg)
         timeout = map_get(args, 'timeout_sec')
-        timeout_n = if (timeout == nil) { 60 } else { timeout }
+        timeout_n = if (timeout == nil) { 60 } else { to_int(timeout) }
 
         # Capture initial mtime, then poll every 0.5s until it changes.
         # Timeout via perl alarm (with_timeout) so we don't depend on GNU

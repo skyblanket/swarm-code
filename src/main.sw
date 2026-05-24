@@ -144,7 +144,8 @@ fun main() {
     mcp_schemas = Mcp.all_schemas(mcp_table)
 
     # Load the SWARM_MANIFESTO.md if present — Swarm's letter to itself
-    manifesto_path = getenv("HOME") ++ "/.swarm-code/SWARM_MANIFESTO.md"
+    home_env = getenv("HOME")
+    manifesto_path = if (home_env == nil) { "" } else { home_env ++ "/.swarm-code/SWARM_MANIFESTO.md" }
     manifesto_text = if (file_exists(manifesto_path) == 'true') {
         m = file_read(manifesto_path)
         if (m == nil) { "" } else { m }

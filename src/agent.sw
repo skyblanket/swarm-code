@@ -1569,6 +1569,13 @@ fun collect_tool_result(name, pending) {
         {'EXIT', _, ex_reason} ->
             if (pending == nil) { tool_crash_msg(name, ex_reason) }
             else { pending }
+        after 600000 {
+            if (pending == nil) {
+                "error: tool '" ++ to_string(name) ++ "' timed out (worker did not respond)"
+            } else {
+                pending
+            }
+        }
     }
 }
 
@@ -1619,11 +1626,31 @@ fun subagent_system_prompt(stype) {
     }}
 }
 
+fun subagent_llm_worker(token, parent, history, opts) {
+    result = LLM.chat(history, opts)
+    send(parent, {'llm_result', token, result})
+}
+
+fun subagent_await_llm(token, deadline) {
+    wait = deadline - timestamp()
+    if (wait <= 0) { nil }
+    else {
+        receive {
+            {'llm_result', t, r} ->
+                if (t == token) { r }
+                else { subagent_await_llm(token, deadline) }
+            after wait { nil }
+        }
+    }
+}
+
 fun run_subagent_loop(history, opts, step) {
     if (step >= subagent_max_steps()) {
         "[subagent hit max steps without final answer]"
     } else {
-        result = LLM.chat(history, opts)
+        token = to_string(timestamp())
+        spawn(subagent_llm_worker(token, self(), history, opts))
+        result = subagent_await_llm(token, timestamp() + 300000)
         if (result == nil) {
             "[subagent llm call failed]"
         } else {
@@ -1745,6 +1772,7 @@ fun ask_via_reader(name, opts, table, cache_key) {
         send(reader_pid, {'picker_ask', header, options, self()})
         idx = receive {
             {'picker_answer', i} -> i
+            after 30000 { -1 }
         }
         interpret_picker(idx, table, cache_key)
     }

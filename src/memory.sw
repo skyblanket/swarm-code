@@ -1,5 +1,7 @@
 module Memory
 
+import Util
+
 # ============================================================
 # Memory — Claude-Code-style crumbs store
 # ============================================================
@@ -81,7 +83,7 @@ fun migrate_legacy() {
                 vals = map_values(m)
                 migrate_entries(keys, vals)
                 # Move legacy file aside so it's clearly one-shot.
-                shell("mv " ++ legacy ++ " " ++ legacy ++ ".migrated")
+                shell("mv " ++ Util.shell_q(legacy) ++ " " ++ Util.shell_q(legacy ++ ".migrated"))
             }
         }
     }

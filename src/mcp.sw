@@ -66,7 +66,8 @@ fun mcp_reset()  { "\e[0m" }
 # Per-server stderr log — keeps npm/npx chatter and the server's own
 # logging off the JSON-RPC stdout stream and out of the terminal.
 fun mcp_log_path(server) {
-    getenv("HOME") ++ "/.swarm-code/mcp-" ++ server ++ ".log"
+    safe = string_replace(string_replace(server, "/", "_"), "\\", "_")
+    getenv("HOME") ++ "/.swarm-code/mcp-" ++ safe ++ ".log"
 }
 
 # ============================================================
@@ -112,9 +113,9 @@ fun init(settings) {
     }
 }
 
-# Overall boot budget — a worker self-limits each server to
-# mcp_handshake_timeout_ms; this is that plus margin.
-fun mcp_boot_deadline_ms() { mcp_handshake_timeout_ms() + 15000 }
+# Overall boot budget — init + tools/list each take up to
+# mcp_handshake_timeout_ms; this is twice that plus margin.
+fun mcp_boot_deadline_ms() { mcp_handshake_timeout_ms() * 2 + 15000 }
 
 fun mcp_spawn_boot_workers(table, names, specs, parent) {
     if (length(names) == 0) { 'ok' }

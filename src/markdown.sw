@@ -524,17 +524,8 @@ fun render_inline(text) {
 fun inline_loop(s, i, acc) {
     if (i >= string_length(s)) { acc }
     else {
-        # Try to match `**...**` first (longer marker has priority).
-        if (peek2(s, i) == "**") {
-            bold_close = find_close(s, i + 2, "**")
-            if (bold_close < 0) {
-                # No closer — emit literal "**" and continue.
-                inline_loop(s, i + 2, acc ++ "**")
-            } else {
-                bold_inner = string_sub(s, i + 2, bold_close - (i + 2))
-                inline_loop(s, bold_close + 2, acc ++ "\e[1m" ++ bold_inner ++ UI.reset())
-            }
-        } else { if (peek1(s, i) == "`") {
+        # Try to match `` `...` `` first (code spans have priority over emphasis).
+        if (peek1(s, i) == "`") {
             code_close = find_close(s, i + 1, "`")
             if (code_close < 0) {
                 inline_loop(s, i + 1, acc ++ "`")
@@ -542,6 +533,15 @@ fun inline_loop(s, i, acc) {
                 code_inner = string_sub(s, i + 1, code_close - (i + 1))
                 colored = UI.brand_color() ++ code_inner ++ UI.reset()
                 inline_loop(s, code_close + 1, acc ++ colored)
+            }
+        } else { if (peek2(s, i) == "**") {
+            bold_close = find_close(s, i + 2, "**")
+            if (bold_close < 0) {
+                # No closer — emit literal "**" and continue.
+                inline_loop(s, i + 2, acc ++ "**")
+            } else {
+                bold_inner = string_sub(s, i + 2, bold_close - (i + 2))
+                inline_loop(s, bold_close + 2, acc ++ "\e[1m" ++ bold_inner ++ UI.reset())
             }
         } else {
             ch = string_sub(s, i, 1)

@@ -521,7 +521,8 @@ fun chat_native(messages, opts) {
     body = build_request_body(messages, opts)
     body_chars = string_length(body)
 
-    file_write("/tmp/swarm-code-last-body.json", body)
+    file_mkdir(getenv("HOME") ++ "/.swarm-code")
+    file_write(getenv("HOME") ++ "/.swarm-code/last-body.json", body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     start_ms = timestamp()
 
@@ -851,12 +852,14 @@ fun extract_content_impl(resp_body, silent) {
             nil
         } else {
             choices = map_get(decoded, 'choices')
-            if (length(choices) == 0) { nil }
+            if (choices == nil) { nil }
+            else { if (length(choices) == 0) { nil }
             else {
                 choice0 = hd(choices)
                 msg_obj = map_get(choice0, 'message')
-                map_get(msg_obj, 'content')
-            }
+                if (msg_obj == nil) { nil }
+                else { map_get(msg_obj, 'content') }
+            }}
         }
     }
 }

@@ -1,5 +1,7 @@
 module Log
 
+import Util
+
 # ============================================================
 # Log — append-only JSONL telemetry for swarm-code
 # ============================================================
@@ -179,19 +181,19 @@ fun summarize() {
         cmd =
             "echo '  session summary for today'; " ++
             "echo '  --------------------------'; " ++
-            "printf '  sessions     : '; grep -c '\"session_start\"' " ++ p ++ "; " ++
-            "printf '  user inputs  : '; grep -c '\"user_input\"' " ++ p ++ "; " ++
-            "printf '  llm requests : '; grep -c '\"llm_request\"' " ++ p ++ "; " ++
-            "printf '  llm errors   : '; grep -c '\"llm_error\"' " ++ p ++ "; " ++
-            "printf '  tool calls   : '; grep -c '\"tool_call\"' " ++ p ++ "; " ++
-            "printf '  tool errors  : '; grep -c '\"tool_result\".*\"error\":true' " ++ p ++ "; " ++
-            "printf '  bg_done      : '; grep -c '\"bg_done\"' " ++ p ++ "; " ++
+            "printf '  sessions     : '; grep -c '\"session_start\"' " ++ Util.shell_q(p) ++ "; " ++
+            "printf '  user inputs  : '; grep -c '\"user_input\"' " ++ Util.shell_q(p) ++ "; " ++
+            "printf '  llm requests : '; grep -c '\"llm_request\"' " ++ Util.shell_q(p) ++ "; " ++
+            "printf '  llm errors   : '; grep -c '\"llm_error\"' " ++ Util.shell_q(p) ++ "; " ++
+            "printf '  tool calls   : '; grep -c '\"tool_call\"' " ++ Util.shell_q(p) ++ "; " ++
+            "printf '  tool errors  : '; grep -c '\"tool_result\".*\"error\":true' " ++ Util.shell_q(p) ++ "; " ++
+            "printf '  bg_done      : '; grep -c '\"bg_done\"' " ++ Util.shell_q(p) ++ "; " ++
             "echo; " ++
             "echo '  most-used tools:'; " ++
-            "grep -o '\"tool_call\",[^}]*' " ++ p ++ " | sed 's/.*\"name\":\"\\([^\"]*\\)\".*/  \\1/' | sort | uniq -c | sort -rn | head -10; " ++
+            "grep -o '\"tool_call\",[^}]*' " ++ Util.shell_q(p) ++ " | sed 's/.*\"name\":\"\\([^\"]*\\)\".*/  \\1/' | sort | uniq -c | sort -rn | head -10; " ++
             "echo; " ++
             "echo '  recent errors:'; " ++
-            "grep '\"llm_error\\|tool_result\".*\"error\":true' " ++ p ++ " | tail -5 | sed 's/^/  /'"
+            "grep '\"llm_error\\|tool_result\".*\"error\":true' " ++ Util.shell_q(p) ++ " | tail -5 | sed 's/^/  /'"
         r = shell(cmd)
         elem(r, 1)
     }

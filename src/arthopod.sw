@@ -198,7 +198,9 @@ fun generate_soul(bones, soul_path, opts) {
     } else { parsed }
 
     # Persist.
-    file_mkdir(getenv("HOME") ++ "/.swarm-code")
+    home = getenv("HOME")
+    dir = if (home == nil) { "" } else { home }
+    file_mkdir(dir ++ "/.swarm-code")
     file_write(soul_path, json_encode(final_soul))
     final_soul
 }

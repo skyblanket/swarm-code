@@ -121,11 +121,7 @@ fun cdp_call_with_timeout(session, method, params, timeout_ms) {
 }
 
 fun next_msg_id(session) {
-    cur = ets_get(session, 'next_id')
-    cur_n = if (cur == nil) { 0 } else { cur }
-    nx = cur_n + 1
-    ets_put(session, 'next_id', nx)
-    nx
+    random_int(1, 2147483647)
 }
 
 # Pull frames off the WS until we see one whose id matches. Drops
