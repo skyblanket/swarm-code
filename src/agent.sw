@@ -1370,20 +1370,45 @@ fun run_turn(history, opts, step) {
                     if (last_pt2 != nil && last_pt2 > context_budget_tokens() - 2000) {
                         print("  \e[38;5;240m(empty response — context near budget at " ++
                               to_string(last_pt2) ++ " tokens. Try /reset or a tighter query.)\e[0m")
+                        print("")
+                        with_assistant
                     } else {
                         prior_reasoning = LLM.last_reasoning(opts)
                         if (prior_reasoning != nil) {
+                            # Model reasoned but said nothing. Surface that and
+                            # leave it — auto-retry risks burning a long chain
+                            # of "think harder" requests for no real gain.
                             r_chars = string_length(to_string(prior_reasoning))
                             print("  \e[38;5;240m(model reasoned " ++ to_string(r_chars) ++
                                   " chars but emitted no spoken content. " ++
                                   "Type 'continue' to nudge it, or rephrase.)\e[0m")
+                            print("")
+                            with_assistant
                         } else {
-                            print("  \e[38;5;240m(assistant returned empty response — try rephrasing)\e[0m")
+                            # Truly empty (no content, no tools, no reasoning):
+                            # Kimi quirk after a chain of file reads. Nudge once
+                            # in-band. Guarded by 'empty_retry' flag so we never
+                            # loop more than a single nudge per turn.
+                            already_retried = map_get(opts, 'empty_retry')
+                            if (already_retried == 'true') {
+                                print("  \e[38;5;240m(still empty after nudge — try rephrasing)\e[0m")
+                                print("")
+                                with_assistant
+                            } else {
+                                print("  \e[38;5;240m(empty response — nudging once…)\e[0m")
+                                nudge = "Your previous turn was empty. Based on what you've " ++
+                                        "read so far, please respond — either a short summary, " ++
+                                        "a question, or your next tool call. Don't stay silent."
+                                with_nudge = list_append(with_assistant, LLM.new_message_user(nudge))
+                                retry_opts = map_put(opts, 'empty_retry', 'true')
+                                run_turn(with_nudge, retry_opts, step + 1)
+                            }
                         }
                     }
+                } else {
+                    print("")
+                    with_assistant
                 }
-                print("")
-                with_assistant
             } else {
                 post_exec = execute_all(tool_calls, with_assistant, opts)
                 run_turn(post_exec, opts, step + 1)
