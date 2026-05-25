@@ -424,15 +424,31 @@ fun load_opts() {
     # turn without hitting finish_reason=length. If your server is
     # single-GPU / quantized / tight on VRAM, lower it via
     # SWARM_CODE_MAX_OUTPUT_TOKENS=8192 (or whatever fits).
+    # max_tokens: env > profile > settings > 32768 default.
+    # Default fits a 131K-context server (Gemma 4 31B on sushi). For
+    # 32K-context backends (Qwen3.x default), lower this in the profile.
     mt_env = getenv("SWARM_CODE_MAX_OUTPUT_TOKENS")
-    max_tokens = if (mt_env == nil) { 32768 }
-                 else { parse_max_tokens_env(mt_env, 0, 0, 'false') }
+    mt_prof = if (profile == nil) { nil } else { map_get(profile, 'max_tokens') }
+    mt_set  = if (settings == nil) { nil } else { map_get(settings, 'max_tokens') }
+    max_tokens = if (mt_env != nil) { parse_max_tokens_env(mt_env, 0, 0, 'false') }
+                 else { if (mt_prof != nil) { mt_prof }
+                 else { if (mt_set != nil) { mt_set }
+                 else { 32768 }}}
 
     # Kimi K2.x rejects any temperature other than 1.0 — Moonshot
     # hard-codes their RLHF to one setting. For other providers we keep
     # the snappier 0.2 default that suits coding workflows.
     temperature = if (string_starts_with(model, "kimi") == 'true') { 1.0 }
                   else { 0.2 }
+
+    # Optional passthrough: arbitrary map merged into every request body.
+    # Profiles use this to set provider-specific knobs (e.g. Qwen3.x's
+    # `chat_template_kwargs: {enable_thinking: false}` to suppress the
+    # internal monologue). Profile > settings > nil.
+    eb_prof = if (profile == nil) { nil } else { map_get(profile, 'chat_template_kwargs') }
+    eb_set  = if (settings == nil) { nil } else { map_get(settings, 'chat_template_kwargs') }
+    chat_template_kwargs = if (eb_prof != nil) { eb_prof }
+                           else { if (eb_set != nil) { eb_set } else { nil }}
 
     %{
         endpoint: endpoint,
@@ -441,6 +457,7 @@ fun load_opts() {
         temperature: temperature,
         max_tokens: max_tokens,
         tool_format: tool_format,
+        chat_template_kwargs: chat_template_kwargs,
         profile: profile_name
     }
 }

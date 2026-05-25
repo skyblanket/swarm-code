@@ -100,6 +100,12 @@ fun apply_override(opts) {
                 c = override_field(b, ov, 'api_key')
                 d = override_field(c, ov, 'tool_format')
                 d = override_field(d, ov, 'vision')
+                # chat_template_kwargs is a map (not a string), so it
+                # bypasses override_field's to_string coercion. Always
+                # replace, even with nil, so switching to a profile that
+                # doesn't set thinking-off actually clears it.
+                ct_v = map_get(ov, 'chat_template_kwargs')
+                d = map_put(d, 'chat_template_kwargs', ct_v)
                 # Re-derive temperature when model changes — Kimi K2.x
                 # rejects any temperature other than 1.0.
                 if (map_get(ov, 'model') != nil) {
@@ -167,10 +173,17 @@ fun build_request_body(messages, opts) {
         messages: msg_maps
     }
 
+    # Profile-supplied chat_template_kwargs (e.g. Qwen3.x's enable_thinking:
+    # false). Merged in only when present — keeps the wire shape clean for
+    # providers that don't recognise the field.
+    ct = map_get(opts, 'chat_template_kwargs')
+    base_with_ct = if (ct == nil) { base }
+                   else { map_put(base, 'chat_template_kwargs', ct) }
+
     final_req = if (tool_format == 'native') {
-        native_req(base, opts)
+        native_req(base_with_ct, opts)
     } else {
-        inband_req(base)
+        inband_req(base_with_ct)
     }
     json_encode(final_req)
 }
