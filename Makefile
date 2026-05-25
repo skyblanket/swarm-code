@@ -1,6 +1,6 @@
 # swarm-code — terminal coding agent built in sw on the swarmrt runtime
 
-SWARMRT ?= /Users/sky/swarmrt
+SWARMRT ?= ../swarmrt
 SWC     := $(SWARMRT)/bin/swc
 
 SRC_DIR := src

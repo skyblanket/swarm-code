@@ -419,9 +419,9 @@ fun bash_desc() {
     "instead of jq '\"\\(.name)\"'. For complex formatting, pipe jq output to awk/paste " ++
     "or write a temp script.\n" ++
     "  GOOD EXAMPLES:\n" ++
-    "    find /Users/sky -maxdepth 3 -type d -name \"*openear*\" 2>/dev/null\n" ++
-    "    grep -rn \"fn main\" /Users/sky/swarm-code/src\n" ++
-    "    ls -la /Users/sky/OpenEar\n" ++
+    "    find . -maxdepth 3 -type d -name \".git\" 2>/dev/null\n" ++
+    "    grep -rn \"fn main\" src/\n" ++
+    "    ls -la ./README.md\n" ++
     "  schema: {\"command\":\"string\",\"timeout_ms\":\"number (optional, default 120000, max 600000)\"}"
 }
 
