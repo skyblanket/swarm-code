@@ -640,8 +640,8 @@ fun t_subagent_blocked_tool() {
 
 # The passive context-status injection replaces the old explicit
 # context_meter tool. Verify the wire body for a basic native-mode
-# request actually carries the <context_status> block on the last
-# user message, with the "% room until compaction" wording.
+# request carries the `[ctx ...]` bracketed block with the
+# "% used" wording on the last user message.
 fun t_context_status_injected() {
     msgs = [
         LLM.new_message_system("you are a test"),
@@ -649,10 +649,10 @@ fun t_context_status_injected() {
     ]
     body = LLM.build_request_body(msgs, native_opts())
     ok = bool_and3(
-        string_contains(body, "context_status"),
-        string_contains(body, "room until compaction"),
-        string_contains(body, "msgs"))
-    check("context_status injected into last user msg of wire body", ok)
+        string_contains(body, "ctx "),
+        string_contains(body, "% used"),
+        string_contains(body, "msg"))
+    check("[ctx N% used · ...] block injected into last user msg", ok)
 }
 
 # ------------------------------------------------------------

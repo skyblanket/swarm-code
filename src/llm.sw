@@ -437,8 +437,10 @@ fun inject_context_status(messages, opts) {
                 status = build_status_string(messages, opts)
                 if (string_length(status) == 0) { messages }
                 else {
-                    new_content = to_string(content) ++
-                        "\n\n<context_status>" ++ status ++ "</context_status>"
+                    # Bracketed marker (not XML) — avoids any future
+                    # JSON-escape weirdness on `<`/`>` and reads cleaner
+                    # to humans glancing at /tmp/swarm-code-last-body.json.
+                    new_content = to_string(content) ++ "\n\n[" ++ status ++ "]"
                     new_msg = map_put(last_msg, 'content', new_content)
                     replace_at(messages, last_idx, new_msg, 0, [])
                 }
@@ -460,20 +462,21 @@ fun build_status_string(messages, opts) {
     tok_used = if (last_pt != nil) { last_pt }
                else { rough_token_estimate(messages, 0) }
 
-    # Room left until each trigger. Clamp at 0 so an over-budget
-    # state shows "0% room" rather than a negative.
-    msg_room_pct = ((msg_threshold - msg_count) * 100) / msg_threshold
-    tok_room_pct = ((tok_budget - tok_used) * 100) / tok_budget
+    # % used (not remaining) — universal mental model: 0% empty,
+    # 100% full. The TIGHTER trigger (whichever is closer to firing
+    # compaction) gets shown, so a 95%-on-messages run still reads
+    # as "95% used" even if tokens are only 30% in.
+    msg_used_pct = (msg_count * 100) / msg_threshold
+    tok_used_pct = (tok_used * 100) / tok_budget
 
-    msg_clamped = if (msg_room_pct < 0) { 0 } else { msg_room_pct }
-    tok_clamped = if (tok_room_pct < 0) { 0 } else { tok_room_pct }
+    msg_clamped = if (msg_used_pct > 100) { 100 } else { msg_used_pct }
+    tok_clamped = if (tok_used_pct > 100) { 100 } else { tok_used_pct }
 
-    # The tighter of the two is the one the agent should care about.
-    pct = if (msg_clamped < tok_clamped) { msg_clamped } else { tok_clamped }
+    pct = if (msg_clamped > tok_clamped) { msg_clamped } else { tok_clamped }
 
-    to_string(pct) ++ "% room until compaction · " ++
-    to_string(msg_count) ++ "/" ++ to_string(msg_threshold) ++ " msgs · " ++
-    fmt_k(tok_used) ++ "/" ++ fmt_k(tok_budget) ++ " tokens"
+    "ctx " ++ to_string(pct) ++ "% used · " ++
+    to_string(msg_count) ++ "/" ++ to_string(msg_threshold) ++ " msg · " ++
+    fmt_k(tok_used) ++ "/" ++ fmt_k(tok_budget) ++ " tok"
 }
 
 # Estimate token count from char count (≈4 chars/token) for use on
