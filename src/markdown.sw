@@ -722,9 +722,14 @@ fun repaint_streamed_prose(prose) {
                 # \r jumps to col 0 of the cursor's current row.
                 # \e[K clears from cursor to end of line.
                 # Then \e[1A moves cursor up one row, \e[K clears it.
-                # Repeated rows-1 times so the entire prose region is wiped.
+                # We clear `rows` lines upward (one MORE than the math
+                # says) — the C streamer adds a trailing newline between
+                # reasoning_content and content that isn't in `prose`,
+                # so the cursor sits one row below the last visible
+                # prose line. Without the extra clear, the top row of
+                # the prose region (typically the H1/H2 heading) leaks.
                 print_inline("\r\e[K")
-                clear_rows_up(rows - 1)
+                clear_rows_up(rows)
                 print(render(prose, w))
             }
         }
@@ -735,18 +740,21 @@ fun repaint_streamed_prose(prose) {
 # eating a frame for "hi" and similar trivial replies, and keeps the
 # UX identical for non-markdown content.
 fun has_markdown(s) {
+    # `# ` catches ANY heading depth — `## A`, `### B`, etc. all
+    # contain `# ` somewhere (position 1 for ##, etc). Previously
+    # we anchored only `starts_with("# ")` and missed ##/### at
+    # the start, so the repaint never fired on H2/H3-only prose.
     if (string_contains(s, "**") == 'true') { 'true' }
     else { if (string_contains(s, "`") == 'true') { 'true' }
-    else { if (string_contains(s, "\n# ") == 'true') { 'true' }
-    else { if (string_starts_with(s, "# ") == 'true') { 'true' }
-    else { if (string_contains(s, "\n## ") == 'true') { 'true' }
-    else { if (string_contains(s, "\n### ") == 'true') { 'true' }
+    else { if (string_contains(s, "# ") == 'true') { 'true' }
     else { if (string_contains(s, "\n- ") == 'true') { 'true' }
+    else { if (string_starts_with(s, "- ") == 'true') { 'true' }
     else { if (string_contains(s, "\n* ") == 'true') { 'true' }
+    else { if (string_starts_with(s, "* ") == 'true') { 'true' }
     else { if (string_contains(s, "\n> ") == 'true') { 'true' }
     else { if (string_contains(s, "\n|") == 'true') { 'true' }
     else { if (string_contains(s, "```") == 'true') { 'true' }
-    else { 'false' }}}}}}}}}}}
+    else { 'false' }}}}}}}}}}
 }
 
 # Total terminal rows the prose occupies — sum of ceil(len/width)
