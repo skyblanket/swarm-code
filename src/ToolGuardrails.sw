@@ -1,16 +1,23 @@
 module ToolGuardrails
 
 # ============================================================
-# ToolGuardrails — per-turn loop / failure / no-progress brakes
+# ToolGuardrails — per-turn loop / failure brakes
 # ============================================================
 #
-# Tracks tool-call patterns within a single user turn so the
-# agent can't burn through cost on a runaway loop.
+# Tracks tool-call patterns within a single user turn so the agent
+# can't burn through cost on a runaway loop.
 #
-# Three thresholds:
-#   1. identical-call:   5  consecutive calls with the same name+args
-#   2. same-tool-fail:   8  consecutive failing results from the same tool
-#   3. no-progress:      5  consecutive read-only calls with no mutation
+# Two thresholds — these catch *pathological* behaviour, not normal
+# exploration:
+#   1. identical-call:  5  consecutive calls with the same name+args
+#   2. same-tool-fail:  8  consecutive failing results from the same tool
+#
+# The earlier "no-progress" check (5 consecutive idempotent reads
+# without a mutation) was removed after it kept firing on legitimate
+# research turns — reading 5 different files to understand a feature
+# is not a loop, it's how the agent gathers context. The identical-call
+# check is still the right catch for real loops (same tool + same
+# args repeated), and the failure-halt covers cascading errors.
 #
 # State is an ETS table created by init() and stashed on
 # opts['guardrails_table'] at boot in main.sw. Keys:
@@ -18,7 +25,6 @@ module ToolGuardrails
 #   'sig_count'   — consecutive identical-sig count
 #   'last_tool'   — last tool name string | nil
 #   'fail_count'  — consecutive failures of last_tool
-#   'idem_streak' — consecutive read/glob/grep/... calls
 #   'halt_reason' — string if a fatal halt fired (cleared on next turn)
 #
 # Public entry points:
@@ -27,30 +33,12 @@ module ToolGuardrails
 #   observe_after(opts, name_str, result_str)  → 'ok'
 #   reset(opts)                                → 'ok' (call per turn)
 
-export [init, observe_before, observe_after, reset,
-        IDEMPOTENT_TOOLS, MUTATING_TOOLS, in_list]
+export [init, observe_before, observe_after, reset, in_list]
 
 fun init() { ets_new() }
 
-# Read-only tools — calls here advance the no-progress streak.
-fun IDEMPOTENT_TOOLS() {
-    ["read", "glob", "grep", "memory_list", "skill_list",
-     "bg_status", "bg_tail", "git_status", "git_diff",
-     "code_search", "session_search", "sys_stats", "heartbeat_status"]
-}
-
-# Mutating tools — calls here RESET the no-progress streak.
-fun MUTATING_TOOLS() {
-    ["write", "edit", "multi_edit", "bash", "background",
-     "bg_kill", "git_commit", "remember", "forget",
-     "todo_write", "browser_navigate", "browser_click",
-     "browser_type", "browser_evaluate", "learn_skill",
-     "forget_skill", "read_image"]
-}
-
 fun threshold_identical()    { 5 }
 fun threshold_same_failure() { 8 }
-fun threshold_no_progress()  { 5 }
 
 # Called BEFORE dispatching a tool. Returns 'ok' or an error string
 # describing which guardrail tripped. agent.sw should turn a non-ok
@@ -73,23 +61,7 @@ fun observe_before(opts, name_str, args_raw) {
             " with identical args " ++ to_string(new_count) ++
             " times in a row. Stop, reflect on whether the call is achieving anything, and try a different approach or report findings to the user."
         }
-        else {
-            # Check idempotent streak.
-            idem = ets_get(table, 'idem_streak')
-            cur_idem = if (idem == nil) { 0 } else { idem }
-            if (in_list(IDEMPOTENT_TOOLS(), to_string(name_str)) == 'true') {
-                new_idem = cur_idem + 1
-                ets_put(table, 'idem_streak', new_idem)
-                if (new_idem >= threshold_no_progress()) {
-                    "error: guardrail — you've made " ++ to_string(new_idem) ++
-                    " consecutive read-only calls (read/glob/grep/etc.) without any mutating action. Either take a concrete step (write, edit, bash) or summarize what you've found to the user."
-                } else { 'ok' }
-            } else {
-                # Mutating (or unknown-category) tool resets the streak.
-                ets_put(table, 'idem_streak', 0)
-                'ok'
-            }
-        }
+        else { 'ok' }
     }
 }
 
@@ -132,7 +104,6 @@ fun reset(opts) {
         ets_put(table, 'sig_count', 0)
         ets_put(table, 'last_tool', nil)
         ets_put(table, 'fail_count', 0)
-        ets_put(table, 'idem_streak', 0)
         ets_put(table, 'halt_reason', nil)
         'ok'
     }

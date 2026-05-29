@@ -65,10 +65,10 @@ fun main() {
         t_repair_history_collapses_users(),
         t_repair_history_keeps_matched_tool(),
         t_guardrail_identical_blocks(),
-        t_guardrail_idempotent_streak(),
-        t_guardrail_resets_on_mutation(),
+        t_guardrail_research_allowed(),
         t_guardrail_failure_halt(),
         t_subagent_blocked_tool(),
+        t_context_meter(),
         t_scheduler_units_ms(),
         t_scheduler_daily_parses(),
         t_scheduler_daily_rejects_garbage(),
@@ -584,39 +584,27 @@ fun t_guardrail_identical_blocks() {
     check("guardrail blocks 5 identical calls in a row", ok)
 }
 
-# 5 consecutive idempotent reads (different args, so identical-sig
-# doesn't trip) must trigger the no-progress brake on the 5th.
-fun t_guardrail_idempotent_streak() {
+# Reading 10 different files in a row must NOT trip the guardrail —
+# that's legitimate research, not a loop. The earlier no-progress
+# check fired on the 5th and was wrong; with that gone, only true
+# loops (same name+args repeated) should block.
+fun t_guardrail_research_allowed() {
     opts = guardrail_opts()
     r1 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/a\"}")
     r2 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/b\"}")
-    r3 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/c\"}")
-    r4 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/d\"}")
-    r5 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/e\"}")
-    ok = bool_and(
+    r3 = ToolGuardrails.observe_before(opts, "grep", "{\"pattern\":\"foo\"}")
+    r4 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/c\"}")
+    r5 = ToolGuardrails.observe_before(opts, "glob", "{\"pattern\":\"*.sw\"}")
+    r6 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/d\"}")
+    r7 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/e\"}")
+    r8 = ToolGuardrails.observe_before(opts, "code_search", "{\"pattern\":\"bar\"}")
+    r9 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/f\"}")
+    r10 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/g\"}")
+    ok = bool_and3(
         if (r1 == 'ok' && r2 == 'ok' && r3 == 'ok' && r4 == 'ok') { 'true' } else { 'false' },
-        if (r5 != 'ok' && string_contains(to_string(r5), "consecutive read-only") == 'true') { 'true' } else { 'false' })
-    check("guardrail blocks 5 consecutive read-only calls", ok)
-}
-
-# 4 reads, then a write (which resets the streak), then 4 more
-# reads — none should trip. The mutation must clear the counter.
-fun t_guardrail_resets_on_mutation() {
-    opts = guardrail_opts()
-    r1 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/a\"}")
-    r2 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/b\"}")
-    r3 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/c\"}")
-    r4 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/d\"}")
-    w  = ToolGuardrails.observe_before(opts, "write", "{\"path\":\"/x\",\"content\":\"y\"}")
-    r5 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/f\"}")
-    r6 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/g\"}")
-    r7 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/h\"}")
-    r8 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/i\"}")
-    all_ok = bool_and3(
-        if (r1 == 'ok' && r2 == 'ok' && r3 == 'ok' && r4 == 'ok') { 'true' } else { 'false' },
-        if (w == 'ok') { 'true' } else { 'false' },
-        if (r5 == 'ok' && r6 == 'ok' && r7 == 'ok' && r8 == 'ok') { 'true' } else { 'false' })
-    check("guardrail: mutating call resets idempotent streak", all_ok)
+        if (r5 == 'ok' && r6 == 'ok' && r7 == 'ok') { 'true' } else { 'false' },
+        if (r8 == 'ok' && r9 == 'ok' && r10 == 'ok') { 'true' } else { 'false' })
+    check("guardrail allows 10 distinct reads (research, not a loop)", ok)
 }
 
 # 8 consecutive error results from the same tool must set the
@@ -648,6 +636,21 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+fun t_context_meter() {
+    # Build opts with fake history stats.
+    fake_opts = map_put(map_put(map_put(map_new(),
+        'history_len', 42),
+        'history_chars', 8000),
+        'context_budget', 100000)
+    fake_opts2 = map_put(fake_opts, 'compact_thr', 120)
+    out = Tools.exec('context_meter', %{}, fake_opts2)
+    has_msgs = string_contains(out, "messages")
+    has_budget = string_contains(out, "budget")
+    has_remaining = string_contains(out, "remaining")
+    ok = bool_and3(has_msgs, has_budget, has_remaining)
+    check("context_meter returns usage stats", ok)
 }
 
 # ------------------------------------------------------------
