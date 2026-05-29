@@ -719,18 +719,39 @@ fun repaint_streamed_prose(prose) {
             else {
                 w = UI.term_width()
                 rows = count_terminal_rows(prose, w)
-                # \r jumps to col 0 of the cursor's current row.
-                # \e[K clears from cursor to end of line.
-                # Then \e[1A moves cursor up one row, \e[K clears it.
-                # We clear `rows` lines upward (one MORE than the math
-                # says) — the C streamer adds a trailing newline between
-                # reasoning_content and content that isn't in `prose`,
-                # so the cursor sits one row below the last visible
-                # prose line. Without the extra clear, the top row of
-                # the prose region (typically the H1/H2 heading) leaks.
-                print_inline("\r\e[K")
-                clear_rows_up(rows)
-                print(render(prose, w))
+                # The cursor-up clear (`\e[1A\e[K`) can only walk back
+                # as far as the top of the terminal's visible region.
+                # If the streamed response was longer than that, the
+                # earlier rows scrolled into the scrollback buffer and
+                # can't be wiped — so the rendered version would end
+                # up sandwiched between raw text above (scrolled off-
+                # then-back-on as the user looks at it) and rendered
+                # below.
+                #
+                # For long messages we switch strategy: leave the raw
+                # stream alone, print a visible separator, and emit the
+                # rendered version below as the "final" view. The user
+                # gets clean formatting at the end of the buffer (where
+                # their eyes are) and the raw stream still serves as
+                # the live transcript.
+                threshold = max_clearable_rows()
+                if (rows > threshold) {
+                    print("")
+                    print("  " ++ UI.grey_border() ++
+                          "─── rendered (long response) ───" ++ UI.reset())
+                    print("")
+                    print(render(prose, w))
+                } else {
+                    # Short message — the cursor-clear works cleanly.
+                    # Clear `rows` lines upward (one more than the math
+                    # says) to absorb the C-side trailing newline
+                    # between reasoning_content and content; otherwise
+                    # the topmost prose row (usually the H1/H2 heading)
+                    # leaks past the clear.
+                    print_inline("\r\e[K")
+                    clear_rows_up(rows)
+                    print(render(prose, w))
+                }
             }
         }
     }
@@ -756,6 +777,14 @@ fun has_markdown(s) {
     else { if (string_contains(s, "```") == 'true') { 'true' }
     else { 'false' }}}}}}}}}}
 }
+
+# Conservative ceiling on how many rows we'll attempt to clear via
+# the cursor-up sequence. Anything beyond this risks the cursor
+# bumping into the top of the visible region before the clear
+# completes, leaving partial raw text on screen. macOS Terminal and
+# iTerm typically run 35-60 rows; we cap below the smallest common
+# default to be safe across different setups.
+fun max_clearable_rows() { 25 }
 
 # Total terminal rows the prose occupies — sum of ceil(len/width)
 # for each hard-newline-delimited line, with empty lines counted as 1.
