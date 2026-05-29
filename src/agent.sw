@@ -37,8 +37,9 @@ import Scheduler
 import ToolRegistry
 import Trajectory
 import Util
+import ToolGuardrails
 
-export [run, run_headless]
+export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -425,6 +426,9 @@ fun route_input(line, history, opts) {
         }
         else {
             Config.run_hooks("UserPromptSubmit", 'user', line, opts)
+            # Reset per-turn guardrail counters — fresh user message
+            # = fresh budget for loops, no-progress, and failure streaks.
+            ToolGuardrails.reset(opts)
             # Auto-detect image paths in the user's message and queue
             # them for attachment before sending. Mirrors claude-code's
             # drag-drop / path-paste pattern — no read_image call needed.
@@ -1326,6 +1330,18 @@ fun run_turn(history, opts, step) {
         print("\e[33m[warn] max tool steps reached\e[0m")
         history
     } else {
+        # Fatal guardrail halt — set by ToolGuardrails.observe_after
+        # when the same tool has failed 8 times in a row. Surface it
+        # to the user, clear the flag so the next user turn isn't
+        # blocked, and bail without another LLM call.
+        guard_table = map_get(opts, 'guardrails_table')
+        halt = if (guard_table == nil) { nil }
+               else { ets_get(guard_table, 'halt_reason') }
+        if (halt != nil) {
+            print("\e[31m[guardrail halt] " ++ to_string(halt) ++ "\e[0m")
+            ets_put(guard_table, 'halt_reason', nil)
+            history
+        } else {
         last_pt = LLM.last_prompt_tokens(opts)
         budget_t = context_budget_tokens()
         over_budget = if (last_pt != nil) {
@@ -1413,6 +1429,7 @@ fun run_turn(history, opts, step) {
                 post_exec = execute_all(tool_calls, with_assistant, opts)
                 run_turn(post_exec, opts, step + 1)
             }
+        }
         }
     }
 }
@@ -1682,20 +1699,40 @@ fun run_subagent_loop(history, opts, step) {
     }
 }
 
+# Tools the main agent can use but subagents cannot. Anything that
+# affects long-lived host state (memory, skills, background servers,
+# git commits, nested task spawns) is locked to the main agent so a
+# subagent can't quietly mutate the user's environment.
+fun SUBAGENT_BLOCKED_TOOLS() {
+    ["task", "remember", "forget", "learn_skill", "forget_skill",
+     "bg_server", "browser_launch", "git_commit"]
+}
+
+fun subagent_blocked(name) {
+    ToolGuardrails.in_list(SUBAGENT_BLOCKED_TOOLS(), name)
+}
+
 fun subagent_exec_all(tool_calls, history, opts) {
     if (length(tool_calls) == 0) { history }
     else {
         tc = hd(tool_calls)
         id = to_string(map_get(tc, 'id'))
         name_str = to_string(map_get(tc, 'name'))
-        name_atom = string_to_atom(name_str)
-        args_raw = to_string(map_get(tc, 'arguments'))
-        args_map = json_decode(args_raw)
-        args_map_safe = if (args_map == nil) { map_new() } else { args_map }
-        sub_result = dispatch_tool(name_atom, args_map_safe, opts)
-        tool_msg = LLM.new_message_tool(id, sub_result)
-        new_hist = list_append(history, tool_msg)
-        subagent_exec_all(tl(tool_calls), new_hist, opts)
+        if (subagent_blocked(name_str) == 'true') {
+            blocked = "error: tool '" ++ name_str ++ "' is not available to subagents — only the main agent can use it"
+            tool_msg = LLM.new_message_tool(id, blocked)
+            new_hist = list_append(history, tool_msg)
+            subagent_exec_all(tl(tool_calls), new_hist, opts)
+        } else {
+            name_atom = string_to_atom(name_str)
+            args_raw = to_string(map_get(tc, 'arguments'))
+            args_map = json_decode(args_raw)
+            args_map_safe = if (args_map == nil) { map_new() } else { args_map }
+            sub_result = dispatch_tool(name_atom, args_map_safe, opts)
+            tool_msg = LLM.new_message_tool(id, sub_result)
+            new_hist = list_append(history, tool_msg)
+            subagent_exec_all(tl(tool_calls), new_hist, opts)
+        }
     }
 }
 
@@ -1715,6 +1752,17 @@ fun execute_all(tool_calls, history, opts) {
         UI.tool_header(name_atom, format_tool_args(name_atom, args_map_safe, args_raw))
         Log.tool_call(name_atom, args_raw)
 
+        # Pre-dispatch guardrail check. Returns 'ok' or an error
+        # string when a loop / no-progress threshold trips. On trip
+        # we synthesize a tool_result and skip the real dispatch so
+        # the model sees the brake feedback in-band.
+        guard = ToolGuardrails.observe_before(opts, name_str, args_raw)
+        if (guard != 'ok') {
+            UI.tool_result(guard)
+            hist_g = list_append(history, LLM.new_message_tool(id, guard))
+            journal_sync(opts, hist_g)
+            execute_all(tl(tool_calls), hist_g, opts)
+        } else {
         decision = resolve_permission(name_atom, args_map_safe, opts)
         if (decision == 'deny') {
             denial = "error: permission denied for tool '" ++ name_str ++ "'"
@@ -1735,6 +1783,7 @@ fun execute_all(tool_calls, history, opts) {
                 UI.tool_result(result)
                 had_err = if (string_starts_with(result, "error:") == 'true') { 'true' } else { 'false' }
                 Log.tool_result(name_atom, string_length(result), had_err)
+                ToolGuardrails.observe_after(opts, name_str, result)
 
                 Config.run_hooks("PostToolUse", name_atom, args_raw, opts)
 
@@ -1742,6 +1791,7 @@ fun execute_all(tool_calls, history, opts) {
                 journal_sync(opts, hist_ok)
                 execute_all(tl(tool_calls), hist_ok, opts)
             }
+        }
         }
     }
 }

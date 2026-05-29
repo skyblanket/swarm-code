@@ -14,39 +14,49 @@ import Util
 #         "id": "1",
 #         "expr": "1h",                # interval or daily HH:MM
 #         "prompt": "review open PRs",
-#         "created_at": 1779635000,
+#         "created_at": 1779635000000, # ms since epoch
 #         "last_run": 0,
 #         "runs": 0
 #       },
 #       ...
 #     ]
 #
-# Supported expressions (kept tiny on purpose — extend later):
+# Supported expressions (all interpreted internally as milliseconds
+# because timestamp() — and therefore every comparison here — is ms):
 #
-#   30s, 5m, 2h, 1d     interval (seconds, minutes, hours, days)
+#   30s, 5m, 2h, 1d     interval
 #   daily HH:MM         fire once per day at the given UTC time
 #   hourly              every hour on the hour (alias for 1h)
+#   daily               every 24h (alias for 1d)
 #
-# Dispatcher: hooked off the Heartbeat. Every N ticks the heartbeat
+# Dispatcher: hooked off the Heartbeat. Every tick the heartbeat
 # calls Scheduler.tick(opts), which walks jobs, computes "is this due
 # now?", and shells out `swarm-code -p "<prompt>"` in the background
-# for any matches. Successful dispatch updates last_run + runs.
+# for any matches. Successful dispatch updates last_run + runs and
+# schedule.json gets rewritten — but only when a job actually fired,
+# so quiet ticks don't thrash the disk.
 #
 # Jobs are fire-and-forget. Output goes to ~/.swarm-code/telemetry/
 # scheduled-<id>-<ts>.out so the user can `tail` later.
 
 export [
     load, add, remove, list_all, tick,
-    schedule_path, jobs_dir
+    schedule_path, jobs_dir,
+    parse_expr, parse_interval, daily_time_ms, compute_next_fire,
+    swarm_binary_path
 ]
 
 fun schedule_path() { getenv("HOME") ++ "/.swarm-code/schedule.json" }
 fun jobs_dir()      { getenv("HOME") ++ "/.swarm-code/telemetry" }
 
 fun load() {
-    file_mkdir(getenv("HOME") ++ "/.swarm-code")
-    file_mkdir(jobs_dir())
-    'scheduler_ready'
+    home = getenv("HOME")
+    if (home == nil) { 'scheduler_skipped' }
+    else {
+        file_mkdir(home ++ "/.swarm-code")
+        file_mkdir(jobs_dir())
+        'scheduler_ready'
+    }
 }
 
 # ------------------------------------------------------------
@@ -71,17 +81,19 @@ fun save_all(jobs) {
 }
 
 # ------------------------------------------------------------
-# Add a new job. Returns the assigned id (string). expr must
-# parse via parse_expr/1; otherwise returns nil.
+# Add a new job. Returns the assigned id (string), or nil if expr
+# doesn't parse.
 # ------------------------------------------------------------
 fun add(expr, prompt) {
-    if (parse_expr(string_trim(to_string(expr))) == nil) { nil }
+    expr_str = string_trim(to_string(expr))
+    # Validate: either a known interval OR a daily HH:MM form.
+    if (parse_expr(expr_str) == nil && daily_time_ms(expr_str) == nil) { nil }
     else {
         jobs = list_all()
         id = to_string(next_id(jobs, 0))
         job = %{
             id: id,
-            expr: to_string(expr),
+            expr: expr_str,
             prompt: to_string(prompt),
             created_at: timestamp(),
             last_run: 0,
@@ -123,63 +135,100 @@ fun remove_loop(jobs, target, acc) {
 
 # ------------------------------------------------------------
 # Tick — called from Heartbeat. Walks jobs, dispatches any due.
-# `now` is a unix epoch in seconds.
+# Only writes schedule.json back to disk when at least one job
+# actually fired (the dirty-flag gate). Previously this rewrote on
+# every tick because tick_loop always rebuilt a same-length list.
 # ------------------------------------------------------------
 fun tick(opts) {
     jobs = list_all()
     if (length(jobs) == 0) { 'noop' }
     else {
         now = timestamp()
-        updated = tick_loop(jobs, now, [])
-        if (length(updated) > 0) { save_all(updated) }
+        r = tick_loop(jobs, now, [], 'false')
+        updated = elem(r, 0)
+        dirty = elem(r, 1)
+        if (dirty == 'true') { save_all(updated) }
         'ok'
     }
 }
 
-fun tick_loop(jobs, now, acc) {
-    if (length(jobs) == 0) { acc }
+fun tick_loop(jobs, now, acc, dirty) {
+    if (length(jobs) == 0) { {acc, dirty} }
     else {
-        j = hd(jobs)
-        new_j = maybe_fire(j, now)
-        tick_loop(tl(jobs), now, list_append(acc, new_j))
+        result = maybe_fire(hd(jobs), now)
+        new_job = elem(result, 0)
+        fired = elem(result, 1)
+        new_dirty = if (fired == 'true') { 'true' } else { dirty }
+        tick_loop(tl(jobs), now, list_append(acc, new_job), new_dirty)
     }
 }
 
+# maybe_fire returns {job, fired_atom} so tick_loop can track whether
+# anything actually changed. When no fire: returns the input job
+# unchanged (no mutation). When fire: dispatches and returns a new
+# job with last_run + runs bumped.
 fun maybe_fire(job, now) {
     expr = to_string(map_get(job, 'expr'))
     last = map_get(job, 'last_run')
     last_run = if (last == nil) { 0 } else { last }
-    next_fire = compute_next_fire(expr, last_run)
-    if (next_fire == nil || next_fire > now) { job }
+    next_fire = compute_next_fire(expr, last_run, now)
+    if (next_fire == nil || next_fire > now) { {job, 'false'} }
     else {
         dispatch(job)
         runs = map_get(job, 'runs')
         new_runs = if (runs == nil) { 1 } else { runs + 1 }
-        map_put(map_put(job, 'last_run', now), 'runs', new_runs)
+        new_job = map_put(map_put(job, 'last_run', now), 'runs', new_runs)
+        {new_job, 'true'}
     }
 }
 
-# Compute the next fire time given an expression and the prior run's
-# epoch second. Returns nil for unparseable expressions.
-fun compute_next_fire(expr, last_run) {
-    secs = parse_expr(expr)
-    if (secs == nil) { nil }
-    else { last_run + secs }
+# ------------------------------------------------------------
+# compute_next_fire — when (in ms-since-epoch) the next fire is
+# scheduled for, given the expression and the prior fire's epoch ms.
+# Two semantics:
+#   * "daily HH:MM" — wallclock. Compute today's HH:MM slot in UTC.
+#     If that's already past last_run, fire then. Otherwise wait
+#     for tomorrow's slot.
+#   * intervals (30s/5m/2h/1d/hourly/daily) — last_run + interval_ms.
+# Returns nil if the expression is unparseable.
+# ------------------------------------------------------------
+fun compute_next_fire(expr, last_run, now) {
+    daily_ms_offset = daily_time_ms(expr)
+    if (daily_ms_offset != nil) {
+        day_ms = 86400000
+        today_midnight = (now / day_ms) * day_ms
+        today_slot = today_midnight + daily_ms_offset
+        # If today's slot still hasn't fired this scheduling cycle,
+        # aim for it; otherwise schedule tomorrow's.
+        if (today_slot > last_run) { today_slot }
+        else { today_slot + day_ms }
+    }
+    else {
+        interval_ms = parse_expr(expr)
+        if (interval_ms == nil) { nil }
+        else { last_run + interval_ms }
+    }
 }
 
-# parse_expr — return the interval in seconds (number) for supported
-# expression forms. Currently only intervals; daily HH:MM falls back
-# to "24h since last run" which is close enough for most use cases.
+# parse_expr — return the interval in MILLISECONDS for supported
+# expression forms. Returns nil for unparseable, including the
+# "daily HH:MM" form (callers route those through daily_time_ms +
+# compute_next_fire's wallclock branch). "daily" alone is the 24h
+# interval; "daily HH:MM" returns 86400000 here too so add()'s
+# validation accepts both shapes uniformly.
 fun parse_expr(s) {
     trimmed = string_trim(s)
     if (string_length(trimmed) == 0) { nil }
-    else { if (trimmed == "hourly") { 3600 }
-    else { if (trimmed == "daily") { 86400 }
-    else { if (string_starts_with(trimmed, "daily ") == 'true') { 86400 }
+    else { if (trimmed == "hourly") { 3600000 }
+    else { if (trimmed == "daily") { 86400000 }
+    else { if (daily_time_ms(trimmed) != nil) { 86400000 }
     else { parse_interval(trimmed) }}}}
 }
 
-# parse_interval — `30s`, `5m`, `2h`, `1d` → seconds.
+# parse_interval — `30s`, `5m`, `2h`, `1d` → MILLISECONDS.
+# Previously this returned seconds, which silently mismatched
+# timestamp()'s ms units and made every interval fire ~3.6 seconds
+# after creation (with back-pressure masking it). Fixed: ms throughout.
 fun parse_interval(s) {
     n = string_length(s)
     if (n < 2) { nil }
@@ -189,28 +238,47 @@ fun parse_interval(s) {
         num = parse_int_simple(num_str)
         if (num <= 0) { nil }
         else {
-            if (suffix == "s") { num }
-            else { if (suffix == "m") { num * 60 }
-            else { if (suffix == "h") { num * 3600 }
-            else { if (suffix == "d") { num * 86400 }
+            if (suffix == "s") { num * 1000 }
+            else { if (suffix == "m") { num * 60000 }
+            else { if (suffix == "h") { num * 3600000 }
+            else { if (suffix == "d") { num * 86400000 }
             else { nil }}}}
         }
     }
 }
 
+# daily_time_ms — parse "daily HH:MM" → ms since midnight, or nil
+# if the expression isn't a daily-with-time form. Used by
+# compute_next_fire to schedule wallclock-aligned fires.
+fun daily_time_ms(s) {
+    if (string_starts_with(s, "daily ") == 'false') { nil }
+    else {
+        time_part = string_trim(string_sub(s, 6, string_length(s) - 6))
+        parts = string_split(time_part, ":")
+        if (length(parts) != 2) { nil }
+        else {
+            h_str = string_trim(hd(parts))
+            m_str = string_trim(hd(tl(parts)))
+            h = parse_int_simple(h_str)
+            m = parse_int_simple(m_str)
+            if (h < 0 || h > 23 || m < 0 || m > 59) { nil }
+            else { (h * 3600 + m * 60) * 1000 }
+        }
+    }
+}
+
 # ------------------------------------------------------------
-# Dispatch a job — spawn `swarm-code -p "<prompt>"` in the background,
-# output to ~/.swarm-code/telemetry/scheduled-<id>-<ts>.out. Doesn't
+# Dispatch a job — spawn `swarm-code -p "<prompt>"` in the background.
+# Output to ~/.swarm-code/telemetry/scheduled-<id>-<ts>.out. Doesn't
 # block the agent loop; we never wait on the child.
 #
-# Two hard-learned safety rules:
-#   1. ALWAYS pass --no-resume. Cron children are one-shot ephemeral
-#      sessions; they must never inherit the parent's .active journal,
-#      or a polluted history can loop them indefinitely on tool calls.
-#   2. Back-pressure: write the child PID to a pidfile and skip the
-#      next dispatch if the previous child is still alive. Without
-#      this, a slow LLM + 5s cron piles up hundreds of stuck children
-#      ("swarm-bomb"). Caps concurrency at 1 per job.
+# Two safety rules baked in:
+#   1. ALWAYS pass --no-resume so cron children never inherit the
+#      parent's .active journal (a polluted history would loop them
+#      indefinitely on tool calls).
+#   2. Per-job back-pressure via a pidfile — if the previous fire's
+#      child is still alive, skip this fire instead of piling another
+#      on top ("swarm-bomb").
 # ------------------------------------------------------------
 fun dispatch(job) {
     id = to_string(map_get(job, 'id'))
@@ -221,9 +289,6 @@ fun dispatch(job) {
         ts = to_string(timestamp())
         out_path = jobs_dir() ++ "/scheduled-" ++ id ++ "-" ++ ts ++ ".out"
         bin = swarm_binary_path()
-        # bash -c '... &' so the outer shell exits immediately and the
-        # actual swarm-code -p job keeps running detached. We capture
-        # the child PID via $! into pid_file so the next tick can skip.
         inner =
             "nohup " ++ Util.shell_q(bin) ++ " --no-resume -p " ++ Util.shell_q(prompt) ++
             " > " ++ Util.shell_q(out_path) ++ " 2>&1 & echo $! > " ++ Util.shell_q(pid_file)
@@ -249,16 +314,44 @@ fun previous_fire_alive(pid_file) {
     }
 }
 
-# Resolve the swarm-code binary. SWARM_CODE_BIN env override wins,
-# else fall back to the canonical install path.
+# Resolve the swarm-code binary path. Tried in order:
+#   1. SWARM_CODE_BIN env override (operator escape hatch).
+#   2. os_args()[0] if it's an absolute-ish path that still exists.
+#      This catches the canonical case: cron children inherit
+#      the same binary path the parent agent was invoked with.
+#   3. ~/.local/bin/swarm — installer default.
+#   4. `command -v swarm` / `command -v swarm-code` — PATH lookup
+#      (one shell() call with a ~1s poll, only on miss).
+#   5. Last resort: "swarm" — relies on the child shell's PATH.
+#
+# Previously this hardcoded /Users/sky/swarm-code/bin/swarm-code as
+# the fallback, which broke any non-Sky install.
 fun swarm_binary_path() {
     env_bin = getenv("SWARM_CODE_BIN")
     if (env_bin != nil && string_length(env_bin) > 0) { env_bin }
-    else { "/Users/sky/swarm-code/bin/swarm-code" }
+    else {
+        args = os_args()
+        a0 = if (length(args) == 0) { "" } else { to_string(hd(args)) }
+        if (string_length(a0) > 0
+            && string_contains(a0, "/") == 'true'
+            && file_exists(a0) == 'true') { a0 }
+        else {
+            home = getenv("HOME")
+            local = if (home == nil) { "" } else { home ++ "/.local/bin/swarm" }
+            if (string_length(local) > 0 && file_exists(local) == 'true') { local }
+            else {
+                r = shell("command -v swarm 2>/dev/null || command -v swarm-code 2>/dev/null")
+                which_path = string_trim(elem(r, 1))
+                if (string_length(which_path) > 0) { which_path }
+                else { "swarm" }
+            }
+        }
+    }
 }
 
-# Minimal int parser — borrowed from main.sw. Returns 0 on garbage,
-# which causes parse_interval to reject (we require > 0).
+# Minimal int parser — returns 0 on garbage. parse_interval / next_id
+# treat 0 as rejection, so a bad expression like "abch" is caught
+# upstream via the num <= 0 guard.
 fun parse_int_simple(s) { parse_int_loop(s, 0, 0) }
 
 fun parse_int_loop(s, i, acc) {

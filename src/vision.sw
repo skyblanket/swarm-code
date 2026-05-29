@@ -318,8 +318,13 @@ fun paste_from_clipboard(opts) {
         "        -e 'close access fh' 2>/dev/null || " ++
         "xclip -selection clipboard -t image/png -o > " ++ Util.shell_q(tmp_path) ++
         " 2>/dev/null"
-    r = shell(cmd)
-    if (file_exists(tmp_path) == 'false') { nil }
+    # 8s timeout via perl alarm — a wedged X server on a remote Linux
+    # session would otherwise hang xclip (and the REPL) indefinitely.
+    guarded = "perl -e 'alarm shift; exec @ARGV' 8 sh -c " ++ Util.shell_q(cmd)
+    r = shell(guarded)
+    code = elem(r, 0)
+    if (code == 142) { file_delete(tmp_path) ; nil }
+    else { if (file_exists(tmp_path) == 'false') { nil }
     else {
         # Empty file = clipboard didn't have an image
         sz_r = shell("wc -c < " ++ Util.shell_q(tmp_path) ++ " 2>/dev/null")
@@ -331,5 +336,5 @@ fun paste_from_clipboard(opts) {
             entry = attach(opts, tmp_path)
             if (entry == nil) { nil } else { tmp_path }
         }
-    }
+    }}
 }

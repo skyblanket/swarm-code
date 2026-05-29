@@ -44,6 +44,7 @@ import Background
 import Telemetry
 import Log
 import Mcp
+import ToolGuardrails
 
 fun main() {
     # CLI flags (--help / --version / --print-config) print and exit
@@ -170,6 +171,16 @@ fun main() {
     # URLs here; llm.sw drains + clears on each outbound request.
     attachments_table = ets_new()
     opts3c = map_put(opts3c, 'attachments_table', attachments_table)
+    # Tool guardrails: per-turn loop/failure/no-progress detector.
+    # agent.sw's execute_all consults this table before every
+    # dispatch; main.sw owns the lifecycle. Dormant (no-op) if the
+    # table key is missing, so subagent contexts that don't share
+    # opts inherit the safe-by-default behaviour.
+    opts3c = map_put(opts3c, 'guardrails_table', ToolGuardrails.init())
+    # Drop a .gitignore into ~/.swarm-code if missing so users who
+    # version-control their config don't accidentally commit api_key,
+    # session journals, or the live profile override.
+    ensure_gitignore()
     # Autonomy: wake the LLM on bg_done events so the model can react to
     # background activity without a user prompt. Default ON. Disable with
     # SWARM_CODE_AUTONOMY=0.
@@ -229,6 +240,36 @@ fun main() {
 # variables (see load_opts/0). The only command-line flags are the
 # three every CLI is expected to answer; each prints and exits
 # without starting the agent.
+
+# Write a default .gitignore into ~/.swarm-code if one isn't already
+# there. Power users sometimes track ~/.swarm-code in git (skills,
+# memories, manifesto, settings.json template); without this they'd
+# leak api_key / session content / the live profile override on
+# the next commit.
+fun ensure_gitignore() {
+    home = getenv("HOME")
+    if (home == nil) { 'ok' }
+    else {
+        gi = home ++ "/.swarm-code/.gitignore"
+        if (file_exists(gi) == 'true') { 'ok' }
+        else {
+            body =
+                "# swarm-code default ignore — keep secrets and session\n" ++
+                "# state out of version control.\n" ++
+                "settings.json\n" ++
+                ".profile_override\n" ++
+                "last-body.json\n" ++
+                "sessions/\n" ++
+                "telemetry/\n" ++
+                "exports/\n" ++
+                "schedule.json\n" ++
+                "mcp-*.log\n" ++
+                "arthopod.json\n"
+            file_write(gi, body)
+            'ok'
+        }
+    }
+}
 
 # Keep in sync with the release tag — see .github/workflows/release.yml.
 fun swarm_version() { "0.2.0" }

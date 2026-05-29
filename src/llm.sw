@@ -38,11 +38,12 @@ export [
     build_request_body, chat_completions_url,
     last_prompt_tokens, last_reasoning,
     record_usage, record_reasoning, extract_usage, extract_reasoning,
-    extract_content,
+    extract_content, extract_finish_reason,
     new_message_system, new_message_user,
     new_message_assistant, new_message_tool,
     parse_inband_tool_calls, inband_assistant_text,
-    api_tool_calls_to_internal
+    api_tool_calls_to_internal,
+    repair_history, apply_override
 ]
 
 # ============================================================
@@ -86,34 +87,38 @@ fun new_message_tool(tool_call_id, content) {
 # a deep refactor — `rm ~/.swarm-code/.profile_override` reverts.
 # ------------------------------------------------------------
 fun apply_override(opts) {
-    path = getenv("HOME") ++ "/.swarm-code/.profile_override"
-    if (file_exists(path) == 'false') { opts }
+    home = getenv("HOME")
+    if (home == nil) { opts }
     else {
-        raw = file_read(path)
-        if (raw == nil) { opts }
+        path = home ++ "/.swarm-code/.profile_override"
+        if (file_exists(path) == 'false') { opts }
         else {
-            ov = json_decode(raw)
-            if (ov == nil) { opts }
+            raw = file_read(path)
+            if (raw == nil) { opts }
             else {
-                a = override_field(opts, ov, 'endpoint')
-                b = override_field(a, ov, 'model')
-                c = override_field(b, ov, 'api_key')
-                d = override_field(c, ov, 'tool_format')
-                d = override_field(d, ov, 'vision')
-                # chat_template_kwargs is a map (not a string), so it
-                # bypasses override_field's to_string coercion. Always
-                # replace, even with nil, so switching to a profile that
-                # doesn't set thinking-off actually clears it.
-                ct_v = map_get(ov, 'chat_template_kwargs')
-                d = map_put(d, 'chat_template_kwargs', ct_v)
-                # Re-derive temperature when model changes — Kimi K2.x
-                # rejects any temperature other than 1.0.
-                if (map_get(ov, 'model') != nil) {
-                    new_model = to_string(map_get(d, 'model'))
-                    new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
-                               else { 0.2 }
-                    map_put(d, 'temperature', new_temp)
-                } else { d }
+                ov = json_decode(raw)
+                if (ov == nil) { opts }
+                else {
+                    a = override_field(opts, ov, 'endpoint')
+                    b = override_field(a, ov, 'model')
+                    c = override_field(b, ov, 'api_key')
+                    d = override_field(c, ov, 'tool_format')
+                    d = override_field(d, ov, 'vision')
+                    # chat_template_kwargs is a map (not a string), so it
+                    # bypasses override_field's to_string coercion. Always
+                    # replace, even with nil, so switching to a profile that
+                    # doesn't set thinking-off actually clears it.
+                    ct_v = map_get(ov, 'chat_template_kwargs')
+                    d = map_put(d, 'chat_template_kwargs', ct_v)
+                    # Re-derive temperature when model changes — Kimi K2.x
+                    # rejects any temperature other than 1.0.
+                    if (map_get(ov, 'model') != nil) {
+                        new_model = to_string(map_get(d, 'model'))
+                        new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
+                                   else { 0.2 }
+                        map_put(d, 'temperature', new_temp)
+                    } else { d }
+                }
             }
         }
     }
@@ -142,6 +147,147 @@ fun chat_completions_url(endpoint) {
 }
 
 # ============================================================
+# repair_history — pre-flight cleanup before every outbound request
+# ============================================================
+# Three repairs, in order:
+#   1. Drop orphan role:'tool' messages whose tool_call_id has no
+#      matching assistant.tool_calls entry currently "open". Open set
+#      resets at every assistant message (the id space is per-turn).
+#   2. Drop a trailing role:'assistant' with non-empty tool_calls that
+#      has NO tool messages after it — that's a crashed-mid-turn
+#      artifact and would 400 the API ("expected tool results").
+#   3. Collapse adjacent role:'user' messages (newline-joined).
+#      Only when BOTH contents are strings — multimodal lists are
+#      preserved verbatim so image blocks don't get mangled.
+# ============================================================
+fun repair_history(messages) {
+    s1 = drop_orphan_tools(messages, [], [])
+    s2 = drop_trailing_unmatched_calls(s1)
+    collapse_consecutive_users(s2, [])
+}
+
+# Walk forward; `open` is the list of tool_call_ids the most recent
+# assistant message announced. Tool messages with ids outside that set
+# are dropped silently. Open set is replaced (not appended) on every
+# assistant message because OpenAI's wire format scopes ids per turn.
+fun drop_orphan_tools(msgs, open, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        role = map_get(m, 'role')
+        if (role == 'assistant') {
+            tcs = map_get(m, 'tool_calls')
+            new_open = if (tcs == nil) { [] }
+                       else { tc_ids(tcs, []) }
+            drop_orphan_tools(tl(msgs), new_open, list_append(acc, m))
+        }
+        else { if (role == 'tool') {
+            tcid = map_get(m, 'tool_call_id')
+            tcid_s = if (tcid == nil) { "" } else { to_string(tcid) }
+            if (id_in(tcid_s, open) == 'true') {
+                drop_orphan_tools(tl(msgs), open, list_append(acc, m))
+            } else {
+                # Skip orphan — don't put it in acc.
+                drop_orphan_tools(tl(msgs), open, acc)
+            }
+        }
+        else {
+            # system / user / unknown — pass through, leave open set alone.
+            drop_orphan_tools(tl(msgs), open, list_append(acc, m))
+        }}
+    }
+}
+
+fun tc_ids(tcs, acc) {
+    if (length(tcs) == 0) { acc }
+    else {
+        tc = hd(tcs)
+        id = map_get(tc, 'id')
+        id_s = if (id == nil) { "" } else { to_string(id) }
+        tc_ids(tl(tcs), list_append(acc, id_s))
+    }
+}
+
+fun id_in(id, lst) {
+    if (length(lst) == 0) { 'false' }
+    else { if (hd(lst) == id) { 'true' } else { id_in(id, tl(lst)) }}
+}
+
+# If the LAST message is role:'assistant' with non-empty tool_calls,
+# drop it — the agent crashed (or compaction landed) before any tool
+# results came back. Sending it would 400 the API. The next user turn
+# starts cleanly from the prior assistant prose.
+fun drop_trailing_unmatched_calls(msgs) {
+    n = length(msgs)
+    if (n == 0) { msgs }
+    else {
+        last = nth_safe(msgs, n - 1)
+        role = map_get(last, 'role')
+        if (role == 'assistant') {
+            tcs = map_get(last, 'tool_calls')
+            has_tcs = if (tcs == nil) { 'false' }
+                      else { if (length(tcs) == 0) { 'false' } else { 'true' }}
+            if (has_tcs == 'true') {
+                take_first(msgs, n - 1, 0, [])
+            } else { msgs }
+        } else { msgs }
+    }
+}
+
+fun nth_safe(lst, i) {
+    if (i == 0) { hd(lst) }
+    else { nth_safe(tl(lst), i - 1) }
+}
+
+fun take_first(lst, k, i, acc) {
+    if (i >= k) { acc }
+    else { if (length(lst) == 0) { acc }
+    else { take_first(tl(lst), k, i + 1, list_append(acc, hd(lst))) }}
+}
+
+# Collapse two-or-more consecutive user messages into one. Pairwise
+# scan: when prev and cur are both string-content users, emit a merged
+# message into acc and continue with cur consumed. Multimodal (list)
+# content stays untouched.
+fun collapse_consecutive_users(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        cur = hd(msgs)
+        rest = tl(msgs)
+        if (length(rest) == 0) {
+            list_append(acc, cur)
+        } else {
+            nxt = hd(rest)
+            if (map_get(cur, 'role') == 'user' && map_get(nxt, 'role') == 'user') {
+                cc = map_get(cur, 'content')
+                nc = map_get(nxt, 'content')
+                cur_is_list = is_list(cc)
+                nxt_is_list = is_list(nc)
+                if (cur_is_list == 'true' || nxt_is_list == 'true') {
+                    # Multimodal — leave both alone, never merge image blocks.
+                    collapse_consecutive_users(rest, list_append(acc, cur))
+                } else {
+                    merged_content = to_string(cc) ++ "\n" ++ to_string(nc)
+                    merged = %{role: 'user', content: merged_content}
+                    # Recurse on (merged :: rest_of_rest) so a third
+                    # consecutive user collapses into the same message.
+                    collapse_consecutive_users(
+                        cons(merged, tl(rest)), acc)
+                }
+            } else {
+                collapse_consecutive_users(rest, list_append(acc, cur))
+            }
+        }
+    }
+}
+
+fun cons(x, lst) {
+    # Prepend a single element to a list — uses ++ for list
+    # concatenation (verified working in native_req above).
+    [x] ++ lst
+}
+
+# ============================================================
 # build_request_body — serialize history to OpenAI wire shape
 # ============================================================
 fun build_request_body(messages, opts) {
@@ -150,14 +296,20 @@ fun build_request_body(messages, opts) {
     max_tokens = map_get(opts, 'max_tokens')
     tool_format = map_get(opts, 'tool_format')
 
+    # Repair history before serialising — drops orphan tool messages,
+    # trailing unmatched tool_calls, and collapses consecutive user
+    # messages. Keeps the API from rejecting requests after a crash
+    # mid-turn or a journal load that landed mid-conversation.
+    repaired = repair_history(messages)
+
     # Drain any pending image attachments (from read_image) and inject
     # them into the LAST user message as OpenAI multimodal content
     # blocks. Cleared from the queue so each image is sent exactly once.
     pending = Vision.get_pending(opts)
-    messages_with_images = if (length(pending) == 0) { messages }
+    messages_with_images = if (length(pending) == 0) { repaired }
                           else {
                               Vision.clear(opts)
-                              inject_attachments(messages, pending)
+                              inject_attachments(repaired, pending)
                           }
 
     msg_maps = if (tool_format == 'native') {
@@ -470,9 +622,24 @@ fun last_fail(opts) {
 }
 
 fun retry_delay_ms(attempt) {
-    if (attempt == 0) { 1000 }
-    else { if (attempt == 1) { 2000 }
-    else { 4000 }}
+    base = 1000
+    cap = 30000
+    # Pow-of-two with cap.
+    raw = if (attempt == 0) { base }
+          else { if (attempt == 1) { base * 2 }
+          else { if (attempt == 2) { base * 4 }
+          else { if (attempt == 3) { base * 8 }
+          else { cap }}}}
+    bounded = if (raw > cap) { cap } else { raw }
+    # Jitter: multiplicative 1.0 .. 1.5 from the timestamp's low bits.
+    # swarmrt has no rand builtin, but timestamp() is ms-granular and
+    # call sites here are seconds apart, so its low 10 bits are
+    # effectively uniform. Goal is to break up thundering-herd retries
+    # when multiple agents restart simultaneously — not crypto-grade.
+    ts = timestamp()
+    low10 = ts - (ts / 1024) * 1024
+    jitter_pct = low10 * 50 / 1024
+    bounded + (bounded * jitter_pct / 100)
 }
 
 fun max_chat_retries() { 3 }
@@ -578,7 +745,19 @@ fun chat_native(messages, opts) {
                     msg_obj = map_get(choice0, 'message')
                     raw_content = map_get(msg_obj, 'content')
                     raw_tool_calls = map_get(msg_obj, 'tool_calls')
-                    prose = if (raw_content == nil) { "" } else { to_string(raw_content) }
+                    prose_raw = if (raw_content == nil) { "" } else { to_string(raw_content) }
+                    # Length-truncation recovery: when the server stops on
+                    # max_tokens with an empty content but populated
+                    # reasoning_content (Kimi K2 thinking mid-stream), we'd
+                    # otherwise hand the user a blank turn. Surface the
+                    # reasoning with a clear marker so it's at least actionable.
+                    finish_reason = map_get(choice0, 'finish_reason')
+                    fr_str = if (finish_reason == nil) { "" } else { to_string(finish_reason) }
+                    prose = if (string_length(string_trim(prose_raw)) == 0
+                                && reason_text != nil
+                                && fr_str == "length") {
+                        "[truncated due to length — model's reasoning surfaced below]\n\n" ++ to_string(reason_text)
+                    } else { prose_raw }
                     tool_calls = api_tool_calls_to_internal(raw_tool_calls, [])
 
                     had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
@@ -660,8 +839,19 @@ fun chat_inband(messages, opts) {
             record_reasoning(opts, reason_text)
 
             parsed = parse_inband_tool_calls(to_string(raw_content))
-            prose = map_get(parsed, 'content')
+            prose_raw = map_get(parsed, 'content')
             tool_calls = map_get(parsed, 'tool_calls')
+
+            # Length-truncation recovery: see chat_native for rationale.
+            # Inband mode rarely reports finish_reason: "length" (Gemma
+            # servers usually fold it into truncated prose) but we apply
+            # the same rule for safety so users never stare at a blank turn.
+            fr_str = extract_finish_reason(resp)
+            prose = if (string_length(string_trim(to_string(prose_raw))) == 0
+                        && reason_text != nil
+                        && fr_str == "length") {
+                "[truncated due to length — model's reasoning surfaced below]\n\n" ++ to_string(reason_text)
+            } else { prose_raw }
 
             had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
             Log.llm_response(latency, string_length(to_string(prose)), had_tools)
@@ -893,6 +1083,21 @@ fun extract_reasoning(resp_body) {
                 if (rc == nil) { nil }
                 else { if (string_length(to_string(rc)) == 0) { nil } else { rc } }
             }
+        }}
+    }
+}
+
+fun extract_finish_reason(resp_body) {
+    decoded = json_decode(resp_body)
+    if (decoded == nil) { "" }
+    else {
+        choices = map_get(decoded, 'choices')
+        if (choices == nil) { "" }
+        else { if (length(choices) == 0) { "" }
+        else {
+            choice0 = hd(choices)
+            fr = map_get(choice0, 'finish_reason')
+            if (fr == nil) { "" } else { to_string(fr) }
         }}
     }
 }

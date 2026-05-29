@@ -236,16 +236,28 @@ fun do_bash(args) {
     if (cmd == nil) {
         "error: missing 'command' argument"
     } else {
-        t_s = resolve_bash_timeout_s(timeout_raw)
-        user_cmd = to_string(cmd)
-        noninteractive = noninteractive_wrap(user_cmd)
-        wrapped = with_timeout(noninteractive, t_s)
-        result = shell(wrapped)
-        code = elem(result, 0)
-        out = elem(result, 1)
-        line_capped = truncate_output_lines(out, bash_max_lines())
-        byte_capped = truncate_output(line_capped, max_output_bytes())
-        format_timed_result(code, byte_capped, t_s)
+        # Sudo guard — outright block unless explicitly enabled. The
+        # model has no safe way to enter a sudo password, and the
+        # ambient setuid escalation risk is too high to gate behind
+        # only a prompt (which is_dangerous_bash already does).
+        # Set SWARM_CODE_ALLOW_SUDO=1 to opt back in.
+        cmd_s = to_string(cmd)
+        sudo_allowed = getenv("SWARM_CODE_ALLOW_SUDO")
+        if (string_contains(cmd_s, "sudo ") == 'true' && sudo_allowed != "1") {
+            "error: sudo is disabled — set SWARM_CODE_ALLOW_SUDO=1 to enable (acknowledge that an agent running sudo is high-risk)"
+        }
+        else {
+            t_s = resolve_bash_timeout_s(timeout_raw)
+            user_cmd = cmd_s
+            noninteractive = noninteractive_wrap(user_cmd)
+            wrapped = with_timeout(noninteractive, t_s)
+            result = shell(wrapped)
+            code = elem(result, 0)
+            out = elem(result, 1)
+            line_capped = truncate_output_lines(out, bash_max_lines())
+            byte_capped = truncate_output(line_capped, max_output_bytes())
+            format_timed_result(code, byte_capped, t_s)
+        }
     }
 }
 
@@ -372,13 +384,60 @@ fun do_write(args) {
         if (content == nil) {
             "error: missing content"
         } else {
-            rc = file_write(path, content)
-            if (rc == 'ok') {
-                "ok: wrote " ++ to_string(string_length(content)) ++ " bytes to " ++ path
-            } else {
-                "error: file_write failed for " ++ path
+            guard = validate_write_path(to_string(path))
+            if (guard != "ok") { guard }
+            else {
+                rc = file_write(path, content)
+                if (rc == 'ok') {
+                    "ok: wrote " ++ to_string(string_length(content)) ++ " bytes to " ++ path
+                } else {
+                    "error: file_write failed for " ++ path
+                }
             }
         }
+    }
+}
+
+# ------------------------------------------------------------
+# validate_write_path — block sensitive paths on WRITE tools only.
+# ------------------------------------------------------------
+# Returns "ok" if the write is allowed, or an error string describing
+# the blocked pattern. Reads (do_read/do_glob/do_grep) deliberately
+# do NOT call this — the agent needs to inspect those files for
+# debugging and auditing. This guard is write-only.
+#
+# Bypass: export SWARM_CODE_UNSAFE_WRITES=1 to disable.
+#
+# Blocked:
+#   * any path containing "/.ssh/"        (SSH keys / authorized_keys)
+#   * any path under "/etc/"               (system config)
+#   * any path containing "/.aws/"        (AWS credentials)
+#   * "/.config/gh/hosts.yml"             (gh CLI token)
+#   * "/.config/git/credentials"          (git credentials)
+#   * "/.swarm-code/settings.json"        (our own config)
+fun validate_write_path(path) {
+    bypass = getenv("SWARM_CODE_UNSAFE_WRITES")
+    if (bypass == "1") { "ok" }
+    else {
+        if (string_contains(path, "/.ssh/") == 'true') {
+            "error: refusing to write inside an .ssh directory — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+        }
+        else { if (string_starts_with(path, "/etc/") == 'true') {
+            "error: refusing to write under /etc/ — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+        }
+        else { if (string_contains(path, "/.aws/") == 'true') {
+            "error: refusing to write inside an .aws directory (credentials) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+        }
+        else { if (string_contains(path, "/.config/gh/hosts.yml") == 'true') {
+            "error: refusing to write the gh CLI hosts.yml (auth token) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+        }
+        else { if (string_contains(path, "/.config/git/credentials") == 'true') {
+            "error: refusing to write git credentials file — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+        }
+        else { if (string_contains(path, "/.swarm-code/settings.json") == 'true') {
+            "error: refusing to write swarm-code's own settings.json — edit it yourself, or set SWARM_CODE_UNSAFE_WRITES=1 to override"
+        }
+        else { "ok" }}}}}}
     }
 }
 
@@ -400,6 +459,12 @@ fun do_edit(args) {
 }
 
 fun do_edit_impl(path, old_s, new_s) {
+    guard = validate_write_path(to_string(path))
+    if (guard != "ok") { guard }
+    else { do_edit_impl_inner(path, old_s, new_s) }
+}
+
+fun do_edit_impl_inner(path, old_s, new_s) {
     original = file_read(path)
     if (original == nil) {
         # Missing file. Empty old_string = create it with new_string.
@@ -1249,11 +1314,15 @@ fun do_multi_edit(args) {
     else {
         if (edits == nil) { "error: missing edits list" }
         else {
-            original = file_read(path)
-            if (original == nil) {
-                "error: could not read " ++ path
-            } else {
-                apply_edits(path, original, edits, 0)
+            guard = validate_write_path(to_string(path))
+            if (guard != "ok") { guard }
+            else {
+                original = file_read(path)
+                if (original == nil) {
+                    "error: could not read " ++ path
+                } else {
+                    apply_edits(path, original, edits, 0)
+                }
             }
         }
     }

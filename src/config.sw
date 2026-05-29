@@ -32,7 +32,7 @@ import Util
 #   }
 # }
 
-export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash]
+export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
@@ -95,27 +95,36 @@ fun load_project_context() {
 #      We are not giving a model root access to the box.
 # ------------------------------------------------------------
 fun check_permission(tool_name, args, opts) {
-    settings = map_get(opts, 'settings')
-    perms = if (settings == nil) { nil } else { map_get(settings, 'permissions') }
-
-    # settings.json is decoded with atom keys, so pass tool_name directly.
-    configured = if (perms == nil) {
-        nil
-    } else {
-        map_get(perms, tool_name)
+    # HARDLINE: unbypassable deny for catastrophic patterns (mkfs, dd
+    # to disk, shutdown/reboot, fork bomb, rm -rf /*). Fires BEFORE
+    # any settings/env lookup so SWARM_CODE_ALLOW_DANGEROUS=1 cannot
+    # turn it off. See is_hardline_bash for the pattern list.
+    if (tool_name == 'bash' && is_hardline_bash(args) == 'true') {
+        'deny'
     }
+    else {
+        settings = map_get(opts, 'settings')
+        perms = if (settings == nil) { nil } else { map_get(settings, 'permissions') }
 
-    decision = if (configured != nil) {
-        string_to_perm(configured)
-    } else {
-        default_permission(tool_name)
-    }
+        # settings.json is decoded with atom keys, so pass tool_name directly.
+        configured = if (perms == nil) {
+            nil
+        } else {
+            map_get(perms, tool_name)
+        }
 
-    # Hard-gate dangerous bash commands regardless of config.
-    if (tool_name == 'bash' && is_dangerous_bash(args) == 'true') {
-        'ask'
-    } else {
-        decision
+        decision = if (configured != nil) {
+            string_to_perm(configured)
+        } else {
+            default_permission(tool_name)
+        }
+
+        # Hard-gate dangerous bash commands regardless of config.
+        if (tool_name == 'bash' && is_dangerous_bash(args) == 'true') {
+            'ask'
+        } else {
+            decision
+        }
     }
 }
 
@@ -179,6 +188,56 @@ fun is_dangerous_bash(args) {
                         string_contains(cmd, "of=/dev/") == 'true') { 'true' }
             else { 'false' }}}}}}
         }
+    }
+}
+
+# ------------------------------------------------------------
+# HARDLINE blocklist — UNBYPASSABLE bash patterns.
+# ------------------------------------------------------------
+# Unlike is_dangerous_bash, this CANNOT be turned off with
+# SWARM_CODE_ALLOW_DANGEROUS=1. If your agent is asking to mkfs a
+# disk or reboot the box, no env var should let it through.
+#
+# Categories:
+#   * Filesystem destruction: mkfs, mkswap
+#   * Disk wipe: dd if=... of=/dev/{sd,nvme,disk,rdisk}
+#   * System halt: shutdown, reboot, halt, poweroff, init 0, init 6
+#   * Filesystem lockout: chmod 000 /, chown -R 0:0 /
+#   * Fork bomb literal: :(){:|:&};:
+#   * Whole-disk rm: rm -rf /*
+# ------------------------------------------------------------
+fun is_hardline_bash(args) {
+    cmd = map_get(args, 'command')
+    if (cmd == nil) { 'false' }
+    else {
+        s = to_string(cmd)
+        # Filesystem destruction
+        if (string_contains(s, "mkfs") == 'true') { 'true' }
+        else { if (string_contains(s, "mkswap") == 'true') { 'true' }
+        # dd writing to a raw disk node
+        else { if (string_contains(s, "dd if=") == 'true' &&
+                   string_contains(s, "of=/dev/sd") == 'true') { 'true' }
+        else { if (string_contains(s, "dd if=") == 'true' &&
+                   string_contains(s, "of=/dev/nvme") == 'true') { 'true' }
+        else { if (string_contains(s, "dd if=") == 'true' &&
+                   string_contains(s, "of=/dev/disk") == 'true') { 'true' }
+        else { if (string_contains(s, "dd if=") == 'true' &&
+                   string_contains(s, "of=/dev/rdisk") == 'true') { 'true' }
+        # System halt
+        else { if (string_contains(s, "shutdown") == 'true') { 'true' }
+        else { if (string_contains(s, "reboot") == 'true') { 'true' }
+        else { if (string_contains(s, "halt") == 'true') { 'true' }
+        else { if (string_contains(s, "poweroff") == 'true') { 'true' }
+        else { if (string_contains(s, "init 0") == 'true') { 'true' }
+        else { if (string_contains(s, "init 6") == 'true') { 'true' }
+        # Filesystem lockout
+        else { if (string_contains(s, "chmod 000 /") == 'true') { 'true' }
+        else { if (string_contains(s, "chown -R 0:0 /") == 'true') { 'true' }
+        # Fork bomb
+        else { if (string_contains(s, ":(){:|:&};:") == 'true') { 'true' }
+        # Whole-disk wipe
+        else { if (string_contains(s, "rm -rf /*") == 'true') { 'true' }
+        else { 'false' }}}}}}}}}}}}}}}}
     }
 }
 

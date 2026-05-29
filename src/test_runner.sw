@@ -25,6 +25,9 @@ import Config
 import Memory
 import Tools
 import Mcp
+import ToolGuardrails
+import Agent
+import Scheduler
 
 fun main() {
     print("")
@@ -53,7 +56,23 @@ fun main() {
         t_grep(),
         t_mcp_unconfigured(),
         t_remember_body(),
-        t_spawn_send_receive()
+        t_spawn_send_receive(),
+        t_hardline_unbypassable(),
+        t_path_traversal_blocked(),
+        t_sudo_blocked(),
+        t_repair_history_drops_orphan_tool(),
+        t_repair_history_drops_trailing_unmatched(),
+        t_repair_history_collapses_users(),
+        t_repair_history_keeps_matched_tool(),
+        t_guardrail_identical_blocks(),
+        t_guardrail_idempotent_streak(),
+        t_guardrail_resets_on_mutation(),
+        t_guardrail_failure_halt(),
+        t_subagent_blocked_tool(),
+        t_scheduler_units_ms(),
+        t_scheduler_daily_parses(),
+        t_scheduler_daily_rejects_garbage(),
+        t_scheduler_compute_next_fire_interval()
     ]
 
     passed = sum_list(results, 0)
@@ -387,4 +406,290 @@ fun await_pong() {
         {'pong', n} -> n
         after 5000 { 0 }
     }
+}
+
+# ------------------------------------------------------------
+# Security hardening regression guards
+# ------------------------------------------------------------
+
+# is_hardline_bash flags every catastrophic pattern category. These
+# return 'deny' at check_permission regardless of
+# SWARM_CODE_ALLOW_DANGEROUS — verified at the function level here.
+fun t_hardline_unbypassable() {
+    h_mkfs    = Config.is_hardline_bash(%{command: "mkfs /dev/sda1"})
+    h_dd      = Config.is_hardline_bash(%{command: "dd if=/dev/zero of=/dev/sda bs=1M"})
+    h_reboot  = Config.is_hardline_bash(%{command: "reboot now"})
+    h_chmod   = Config.is_hardline_bash(%{command: "chmod 000 /"})
+    h_forkbomb = Config.is_hardline_bash(%{command: ":(){:|:&};:"})
+    h_rmstar  = Config.is_hardline_bash(%{command: "rm -rf /*"})
+    h_safe    = Config.is_hardline_bash(%{command: "ls -la /tmp"})
+    ok = bool_and(
+        bool_and3(
+            if (h_mkfs == 'true') { 'true' } else { 'false' },
+            if (h_dd == 'true') { 'true' } else { 'false' },
+            if (h_reboot == 'true') { 'true' } else { 'false' }),
+        bool_and(
+            bool_and3(
+                if (h_chmod == 'true') { 'true' } else { 'false' },
+                if (h_forkbomb == 'true') { 'true' } else { 'false' },
+                if (h_rmstar == 'true') { 'true' } else { 'false' }),
+            if (h_safe == 'false') { 'true' } else { 'false' }))
+    check("is_hardline_bash: 6 catastrophic categories flagged, safe pass-through", ok)
+}
+
+# do_write into a sensitive path (/.ssh/) must be refused with an
+# error and NOT create the file. A normal /tmp path must succeed.
+fun t_path_traversal_blocked() {
+    home = getenv("HOME")
+    evil_path = home ++ "/.ssh/swarm_code_test_should_not_exist"
+    # Make sure prior runs didn't leave a stray copy.
+    file_delete(evil_path)
+    blocked = Tools.exec('write',
+        %{path: evil_path, content: "evil"}, %{})
+    blocked_str = to_string(blocked)
+    refused = string_contains(blocked_str, "error")
+    not_written = if (file_exists(evil_path) == 'false') { 'true' } else { 'false' }
+
+    safe_path = "/tmp/sw_pathtest_guard.txt"
+    file_delete(safe_path)
+    allowed = Tools.exec('write',
+        %{path: safe_path, content: "safe"}, %{})
+    wrote = if (file_exists(safe_path) == 'true') { 'true' } else { 'false' }
+    file_delete(safe_path)
+
+    ok = bool_and3(refused, not_written, wrote)
+    check("validate_write_path blocks .ssh, allows /tmp", ok)
+}
+
+# do_bash must outright refuse a sudo command without
+# SWARM_CODE_ALLOW_SUDO=1. The error string must mention "sudo" so
+# the model knows what was rejected.
+fun t_sudo_blocked() {
+    out = Tools.exec('bash', %{command: "sudo ls /"}, %{})
+    s = to_string(out)
+    ok = bool_and(
+        if (string_contains(s, "error") == 'true') { 'true' } else { 'false' },
+        if (string_contains(s, "sudo") == 'true') { 'true' } else { 'false' })
+    check("do_bash refuses sudo without SWARM_CODE_ALLOW_SUDO=1", ok)
+}
+
+# ------------------------------------------------------------
+# LLM.repair_history regression guards
+# ------------------------------------------------------------
+# Helper: count messages with a given role in a list.
+fun count_role(msgs, role) {
+    count_role_loop(msgs, role, 0)
+}
+fun count_role_loop(msgs, role, n) {
+    if (length(msgs) == 0) { n }
+    else {
+        bump = if (map_get(hd(msgs), 'role') == role) { 1 } else { 0 }
+        count_role_loop(tl(msgs), role, n + bump)
+    }
+}
+
+# Orphan tool message — no preceding assistant.tool_calls with a
+# matching tool_call_id — must be dropped. The user/system messages
+# around it stay intact.
+fun t_repair_history_drops_orphan_tool() {
+    h = [
+        LLM.new_message_system("sys"),
+        LLM.new_message_user("hello"),
+        LLM.new_message_tool("orphan_id_xyz", "shouldn't be here")
+    ]
+    out = LLM.repair_history(h)
+    tool_count = count_role(out, 'tool')
+    user_count = count_role(out, 'user')
+    ok = bool_and(
+        if (tool_count == 0) { 'true' } else { 'false' },
+        if (user_count == 1) { 'true' } else { 'false' })
+    check("repair_history drops orphan tool message", ok)
+}
+
+# Trailing assistant with tool_calls but no matching tool results = the
+# agent crashed mid-turn. The API would 400. Drop the assistant.
+fun t_repair_history_drops_trailing_unmatched() {
+    h = [
+        LLM.new_message_user("do something"),
+        LLM.new_message_assistant(
+            "calling tool",
+            [%{id: "call_X", name: "bash", arguments: "{}"}],
+            nil)
+    ]
+    out = LLM.repair_history(h)
+    asst_count = count_role(out, 'assistant')
+    user_count = count_role(out, 'user')
+    ok = bool_and(
+        if (asst_count == 0) { 'true' } else { 'false' },
+        if (user_count == 1) { 'true' } else { 'false' })
+    check("repair_history drops trailing assistant with unmatched tool_calls", ok)
+}
+
+# Three consecutive role:'user' messages collapse into one,
+# newline-joined.
+fun t_repair_history_collapses_users() {
+    h = [
+        LLM.new_message_user("a"),
+        LLM.new_message_user("b"),
+        LLM.new_message_user("c")
+    ]
+    out = LLM.repair_history(h)
+    ok = if (length(out) == 1) {
+        merged = to_string(map_get(hd(out), 'content'))
+        if (merged == "a\nb\nc") { 'true' } else { 'false' }
+    } else { 'false' }
+    check("repair_history collapses 3 consecutive user msgs into one", ok)
+}
+
+# Sanity: a properly paired assistant+tool must NOT be dropped.
+# Guards against an over-eager repair that nukes legit tool results.
+fun t_repair_history_keeps_matched_tool() {
+    h = [
+        LLM.new_message_user("run it"),
+        LLM.new_message_assistant(
+            "ok",
+            [%{id: "call_keep", name: "bash", arguments: "{}"}],
+            nil),
+        LLM.new_message_tool("call_keep", "result")
+    ]
+    out = LLM.repair_history(h)
+    ok = if (length(out) == 3) { 'true' } else { 'false' }
+    check("repair_history preserves matched assistant + tool pair", ok)
+}
+
+# ------------------------------------------------------------
+# ToolGuardrails — per-turn loop / no-progress / failure brakes
+# ------------------------------------------------------------
+
+# Build a minimal opts map with a fresh guardrails table installed.
+fun guardrail_opts() {
+    table = ToolGuardrails.init()
+    ToolGuardrails.reset(%{guardrails_table: table})
+    %{guardrails_table: table}
+}
+
+# 5 identical calls in a row trip the identical-call threshold.
+# The 5th observe_before must return an error string mentioning
+# "guardrail" so the model gets clear in-band feedback.
+fun t_guardrail_identical_blocks() {
+    opts = guardrail_opts()
+    r1 = ToolGuardrails.observe_before(opts, "bash", "{\"command\":\"ls\"}")
+    r2 = ToolGuardrails.observe_before(opts, "bash", "{\"command\":\"ls\"}")
+    r3 = ToolGuardrails.observe_before(opts, "bash", "{\"command\":\"ls\"}")
+    r4 = ToolGuardrails.observe_before(opts, "bash", "{\"command\":\"ls\"}")
+    r5 = ToolGuardrails.observe_before(opts, "bash", "{\"command\":\"ls\"}")
+    ok = bool_and(
+        if (r1 == 'ok' && r2 == 'ok' && r3 == 'ok' && r4 == 'ok') { 'true' } else { 'false' },
+        if (r5 != 'ok' && string_contains(to_string(r5), "guardrail") == 'true') { 'true' } else { 'false' })
+    check("guardrail blocks 5 identical calls in a row", ok)
+}
+
+# 5 consecutive idempotent reads (different args, so identical-sig
+# doesn't trip) must trigger the no-progress brake on the 5th.
+fun t_guardrail_idempotent_streak() {
+    opts = guardrail_opts()
+    r1 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/a\"}")
+    r2 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/b\"}")
+    r3 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/c\"}")
+    r4 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/d\"}")
+    r5 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/e\"}")
+    ok = bool_and(
+        if (r1 == 'ok' && r2 == 'ok' && r3 == 'ok' && r4 == 'ok') { 'true' } else { 'false' },
+        if (r5 != 'ok' && string_contains(to_string(r5), "consecutive read-only") == 'true') { 'true' } else { 'false' })
+    check("guardrail blocks 5 consecutive read-only calls", ok)
+}
+
+# 4 reads, then a write (which resets the streak), then 4 more
+# reads — none should trip. The mutation must clear the counter.
+fun t_guardrail_resets_on_mutation() {
+    opts = guardrail_opts()
+    r1 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/a\"}")
+    r2 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/b\"}")
+    r3 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/c\"}")
+    r4 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/d\"}")
+    w  = ToolGuardrails.observe_before(opts, "write", "{\"path\":\"/x\",\"content\":\"y\"}")
+    r5 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/f\"}")
+    r6 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/g\"}")
+    r7 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/h\"}")
+    r8 = ToolGuardrails.observe_before(opts, "read", "{\"path\":\"/i\"}")
+    all_ok = bool_and3(
+        if (r1 == 'ok' && r2 == 'ok' && r3 == 'ok' && r4 == 'ok') { 'true' } else { 'false' },
+        if (w == 'ok') { 'true' } else { 'false' },
+        if (r5 == 'ok' && r6 == 'ok' && r7 == 'ok' && r8 == 'ok') { 'true' } else { 'false' })
+    check("guardrail: mutating call resets idempotent streak", all_ok)
+}
+
+# 8 consecutive error results from the same tool must set the
+# halt_reason flag, which run_turn checks before the next LLM call.
+fun t_guardrail_failure_halt() {
+    opts = guardrail_opts()
+    ToolGuardrails.observe_after(opts, "bash", "error: 1")
+    ToolGuardrails.observe_after(opts, "bash", "error: 2")
+    ToolGuardrails.observe_after(opts, "bash", "error: 3")
+    ToolGuardrails.observe_after(opts, "bash", "error: 4")
+    ToolGuardrails.observe_after(opts, "bash", "error: 5")
+    ToolGuardrails.observe_after(opts, "bash", "error: 6")
+    ToolGuardrails.observe_after(opts, "bash", "error: 7")
+    ToolGuardrails.observe_after(opts, "bash", "error: 8")
+    table = map_get(opts, 'guardrails_table')
+    halt = ets_get(table, 'halt_reason')
+    ok = if (halt != nil && string_contains(to_string(halt), "8 consecutive") == 'true') { 'true' } else { 'false' }
+    check("guardrail: 8 same-tool failures set halt_reason", ok)
+}
+
+# Subagent toolset restriction: "task" is in the blocked list and
+# "read" is not. Guards the substring check Agent.subagent_blocked uses.
+fun t_subagent_blocked_tool() {
+    blocked_task = Agent.subagent_blocked("task")
+    blocked_remember = Agent.subagent_blocked("remember")
+    allowed_read = Agent.subagent_blocked("read")
+    allowed_bash = Agent.subagent_blocked("bash")
+    ok = bool_and(
+        if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
+        if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
+    check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# ------------------------------------------------------------
+# Scheduler — interval unit / daily / next-fire regression guards
+# ------------------------------------------------------------
+# parse_interval used to return SECONDS while timestamp() returns
+# milliseconds, so "1h" actually fired every ~3.6 seconds.
+fun t_scheduler_units_ms() {
+    ok = bool_and3(
+        if (Scheduler.parse_expr("30s") == 30000) { 'true' } else { 'false' },
+        if (Scheduler.parse_expr("1m") == 60000) { 'true' } else { 'false' },
+        if (Scheduler.parse_expr("1h") == 3600000) { 'true' } else { 'false' })
+    check("scheduler intervals return ms (30s=30000, 1m=60000, 1h=3.6e6)", ok)
+}
+
+# "daily HH:MM" was matched as the prefix-only "daily " branch and
+# threw away the time. daily_time_ms now parses it to ms-since-midnight.
+fun t_scheduler_daily_parses() {
+    nine_am = 9 * 3600 * 1000
+    eleven_fifty_nine = (23 * 3600 + 59 * 60) * 1000
+    ok = bool_and(
+        if (Scheduler.daily_time_ms("daily 09:00") == nine_am) { 'true' } else { 'false' },
+        if (Scheduler.daily_time_ms("daily 23:59") == eleven_fifty_nine) { 'true' } else { 'false' })
+    check("daily HH:MM parses to ms-since-midnight", ok)
+}
+
+# Out-of-range hours/minutes and non-"daily " inputs must return nil.
+fun t_scheduler_daily_rejects_garbage() {
+    ok = bool_and3(
+        if (Scheduler.daily_time_ms("daily 25:00") == nil) { 'true' } else { 'false' },
+        if (Scheduler.daily_time_ms("daily abc") == nil) { 'true' } else { 'false' },
+        if (Scheduler.daily_time_ms("hourly") == nil) { 'true' } else { 'false' })
+    check("daily HH:MM rejects out-of-range / malformed forms", ok)
+}
+
+# Interval branch: compute_next_fire returns last_run + interval_ms.
+# Validates the ms-aligned math against the new contract.
+fun t_scheduler_compute_next_fire_interval() {
+    last = 1000
+    now = 5000
+    nf = Scheduler.compute_next_fire("30s", last, now)
+    # 1000 + 30000 = 31000 (still in the future relative to now=5000)
+    check("compute_next_fire ms-aligned for intervals",
+          if (nf == 31000) { 'true' } else { 'false' })
 }

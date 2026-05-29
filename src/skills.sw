@@ -110,7 +110,7 @@ fun forget(slug) {
         # Delete just SKILL.md — that's what the index keys on. Any
         # helper scripts beside it are left for the user to inspect.
         rc = file_delete(p)
-        if (rc == 'ok' || rc == 'true' || rc == nil) {
+        if (rc == 'ok') {
             rebuild_index()
             "ok: forgot " ++ slug ++ " (helper files in " ++ skill_dir(slug) ++ " left in place)"
         } else {
