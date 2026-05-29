@@ -52,7 +52,8 @@ fun main() {
         t_glob(),
         t_grep(),
         t_mcp_unconfigured(),
-        t_remember_body()
+        t_remember_body(),
+        t_spawn_send_receive()
     ]
 
     passed = sum_list(results, 0)
@@ -356,4 +357,34 @@ fun t_remember_body() {
     ok = if (saved == nil) { 'false' } else { string_contains(saved, marker) }
     file_delete(path)
     check("remember persists the body to the .md file", ok)
+}
+
+# Multi-agent concurrency primitive: spawn two workers, send each a
+# ping, collect both pongs. Regression guard for the runtime's
+# process scheduler + mailbox ordering.
+fun t_spawn_send_receive() {
+    parent = self()
+    w1 = spawn(ping_worker(parent))
+    w2 = spawn(ping_worker(parent))
+    send(w1, {'ping', 1})
+    send(w2, {'ping', 2})
+    r1 = await_pong()
+    r2 = await_pong()
+    ok = bool_and(
+        if (r1 + r2 == 3) { 'true' } else { 'false' },
+        if (r1 != 0 && r2 != 0) { 'true' } else { 'false' })
+    check("spawn/send/receive: two concurrent workers", ok)
+}
+
+fun ping_worker(parent) {
+    receive {
+        {'ping', n} -> send(parent, {'pong', n})
+    }
+}
+
+fun await_pong() {
+    receive {
+        {'pong', n} -> n
+        after 5000 { 0 }
+    }
 }
