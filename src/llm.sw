@@ -44,7 +44,8 @@ export [
     new_message_assistant, new_message_tool,
     parse_inband_tool_calls, inband_assistant_text,
     api_tool_calls_to_internal,
-    repair_history, apply_override
+    repair_history, apply_override,
+    inject_context_status, build_status_string
 ]
 
 # ============================================================
@@ -313,10 +314,19 @@ fun build_request_body(messages, opts) {
                               inject_attachments(repaired, pending)
                           }
 
+    # Passive context meter — appends "<context_status>X% room until
+    # compaction · …</context_status>" to the LAST user message so the
+    # agent always sees how close it is to the auto-compactor without
+    # having to call a tool. Cache-safe: the user message wasn't being
+    # cached anyway; the static system prompt above it stays cacheable.
+    # Skipped when last message isn't role:user (mid-tool, etc) or when
+    # the content is a multimodal list (would corrupt image blocks).
+    messages_with_status = inject_context_status(messages_with_images, opts)
+
     msg_maps = if (tool_format == 'native') {
-        messages_to_api_native(messages_with_images, [])
+        messages_to_api_native(messages_with_status, [])
     } else {
-        messages_to_api_inband(messages_with_images, [])
+        messages_to_api_inband(messages_with_status, [])
     }
 
     base = %{
@@ -396,6 +406,124 @@ fun build_image_blocks(attachments, acc) {
             image_url: %{url: to_string(map_get(a, 'data_url'))}
         }
         build_image_blocks(tl(attachments), list_append(acc, block))
+    }
+}
+
+# ------------------------------------------------------------
+# inject_context_status — passive token/message meter on every turn
+# ------------------------------------------------------------
+# Appends a small <context_status>…</context_status> block to the
+# last user message so the model is ambient-aware of how close it
+# is to the auto-compactor. Replaces the explicit context_meter
+# tool — the agent shouldn't have to remember to check its own
+# budget.
+#
+# Wording is "N% room until compaction" using the TIGHTER of the
+# two compactor triggers: 120-message threshold (Agent.compact_threshold)
+# OR token budget (max_tokens - output_reserve - compact_buffer).
+# Whichever is closer to firing is the one shown.
+fun inject_context_status(messages, opts) {
+    n = length(messages)
+    if (n == 0) { messages }
+    else {
+        last_idx = n - 1
+        last_msg = nth(messages, last_idx)
+        role = map_get(last_msg, 'role')
+        if (role != 'user') { messages }
+        else {
+            content = map_get(last_msg, 'content')
+            if (is_list(content) == 'true') { messages }
+            else {
+                status = build_status_string(messages, opts)
+                if (string_length(status) == 0) { messages }
+                else {
+                    new_content = to_string(content) ++
+                        "\n\n<context_status>" ++ status ++ "</context_status>"
+                    new_msg = map_put(last_msg, 'content', new_content)
+                    replace_at(messages, last_idx, new_msg, 0, [])
+                }
+            }
+        }
+    }
+}
+
+fun build_status_string(messages, opts) {
+    msg_count = length(messages)
+    msg_threshold = 120
+
+    last_pt = last_prompt_tokens(opts)
+    max_tok = parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144)
+    out_res = parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384)
+    buf = parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000)
+    tok_budget = max_tok - out_res - buf
+
+    tok_used = if (last_pt != nil) { last_pt }
+               else { rough_token_estimate(messages, 0) }
+
+    # Room left until each trigger. Clamp at 0 so an over-budget
+    # state shows "0% room" rather than a negative.
+    msg_room_pct = ((msg_threshold - msg_count) * 100) / msg_threshold
+    tok_room_pct = ((tok_budget - tok_used) * 100) / tok_budget
+
+    msg_clamped = if (msg_room_pct < 0) { 0 } else { msg_room_pct }
+    tok_clamped = if (tok_room_pct < 0) { 0 } else { tok_room_pct }
+
+    # The tighter of the two is the one the agent should care about.
+    pct = if (msg_clamped < tok_clamped) { msg_clamped } else { tok_clamped }
+
+    to_string(pct) ++ "% room until compaction · " ++
+    to_string(msg_count) ++ "/" ++ to_string(msg_threshold) ++ " msgs · " ++
+    fmt_k(tok_used) ++ "/" ++ fmt_k(tok_budget) ++ " tokens"
+}
+
+# Estimate token count from char count (≈4 chars/token) for use on
+# the first turn before the server has reported usage. Multimodal
+# content lists are skipped (images aren't text-counted).
+fun rough_token_estimate(msgs, acc) {
+    if (length(msgs) == 0) { acc / 4 }
+    else {
+        m = hd(msgs)
+        c = map_get(m, 'content')
+        n_chars = if (c == nil) { 0 }
+                  else { if (is_list(c) == 'true') { 0 }
+                  else { string_length(to_string(c)) }}
+        rough_token_estimate(tl(msgs), acc + n_chars)
+    }
+}
+
+fun fmt_k(n) {
+    if (n < 1000) { to_string(n) }
+    else { to_string(n / 1000) ++ "k" }
+}
+
+# Local env-int parser — duplicated from agent.sw to keep llm.sw
+# free of agent.sw dependencies (agent imports llm, so the reverse
+# would be a cycle).
+fun parse_env_int_local(name, fallback) {
+    env = getenv(name)
+    if (env == nil) { fallback }
+    else {
+        parsed = parse_positive_int_local(env, 0, 0, 'false')
+        if (parsed < 0) { fallback } else { parsed }
+    }
+}
+
+fun parse_positive_int_local(s, i, acc, saw_digit) {
+    if (i >= string_length(s)) {
+        if (saw_digit == 'true') { acc } else { 0 - 1 }
+    } else {
+        ch = string_sub(s, i, 1)
+        d = if (ch == "0") { 0 } else { if (ch == "1") { 1 }
+            else { if (ch == "2") { 2 } else { if (ch == "3") { 3 }
+            else { if (ch == "4") { 4 } else { if (ch == "5") { 5 }
+            else { if (ch == "6") { 6 } else { if (ch == "7") { 7 }
+            else { if (ch == "8") { 8 } else { if (ch == "9") { 9 }
+            else { 0 - 1 }}}}}}}}}}
+        if (d < 0) {
+            if (saw_digit == 'true') { acc } else { 0 - 1 }
+        } else {
+            parse_positive_int_local(s, i + 1, acc * 10 + d, 'true')
+        }
     }
 }
 

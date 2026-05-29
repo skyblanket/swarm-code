@@ -68,7 +68,6 @@ fun all_tools() {
         # telemetry / git / search
         %{name: "sys_stats",            atom: 'sys_stats'},
         %{name: "heartbeat_status",     atom: 'heartbeat_status'},
-        %{name: "context_meter",        atom: 'context_meter'},
         %{name: "git_status",           atom: 'git_status'},
         %{name: "git_diff",             atom: 'git_diff'},
         %{name: "git_commit",           atom: 'git_commit'},

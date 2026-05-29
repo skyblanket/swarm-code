@@ -68,7 +68,7 @@ fun main() {
         t_guardrail_research_allowed(),
         t_guardrail_failure_halt(),
         t_subagent_blocked_tool(),
-        t_context_meter(),
+        t_context_status_injected(),
         t_scheduler_units_ms(),
         t_scheduler_daily_parses(),
         t_scheduler_daily_rejects_garbage(),
@@ -638,19 +638,21 @@ fun t_subagent_blocked_tool() {
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
 }
 
-fun t_context_meter() {
-    # Build opts with fake history stats.
-    fake_opts = map_put(map_put(map_put(map_new(),
-        'history_len', 42),
-        'history_chars', 8000),
-        'context_budget', 100000)
-    fake_opts2 = map_put(fake_opts, 'compact_thr', 120)
-    out = Tools.exec('context_meter', %{}, fake_opts2)
-    has_msgs = string_contains(out, "messages")
-    has_budget = string_contains(out, "budget")
-    has_remaining = string_contains(out, "remaining")
-    ok = bool_and3(has_msgs, has_budget, has_remaining)
-    check("context_meter returns usage stats", ok)
+# The passive context-status injection replaces the old explicit
+# context_meter tool. Verify the wire body for a basic native-mode
+# request actually carries the <context_status> block on the last
+# user message, with the "% room until compaction" wording.
+fun t_context_status_injected() {
+    msgs = [
+        LLM.new_message_system("you are a test"),
+        LLM.new_message_user("hello")
+    ]
+    body = LLM.build_request_body(msgs, native_opts())
+    ok = bool_and3(
+        string_contains(body, "context_status"),
+        string_contains(body, "room until compaction"),
+        string_contains(body, "msgs"))
+    check("context_status injected into last user msg of wire body", ok)
 }
 
 # ------------------------------------------------------------

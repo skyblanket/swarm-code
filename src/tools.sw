@@ -102,7 +102,6 @@ fun all_tools() {
         %{atom: 'bg_kill',            handler: fun(args, opts) { do_bg_kill(args, opts) }},
         %{atom: 'sys_stats',          handler: fun(args, opts) { Telemetry.sys_stats() }},
         %{atom: 'heartbeat_status',   handler: fun(args, opts) { do_heartbeat_status(opts) }},
-        %{atom: 'context_meter',      handler: fun(args, opts) { do_context_meter(args, opts) }},
         %{atom: 'git_status',         handler: fun(args, opts) { do_git_status(args) }},
         %{atom: 'git_diff',           handler: fun(args, opts) { do_git_diff(args) }},
         %{atom: 'git_commit',         handler: fun(args, opts) { do_git_commit(args) }},

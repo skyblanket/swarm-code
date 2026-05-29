@@ -119,7 +119,6 @@ fun tool_descriptions() {
     bg_kill_desc() ++ "\n" ++
     sys_stats_desc() ++ "\n" ++
     heartbeat_desc() ++ "\n" ++
-    context_meter_desc() ++ "\n" ++
     web_search_desc() ++ "\n" ++
     git_status_desc() ++ "\n" ++
     git_diff_desc() ++ "\n" ++
