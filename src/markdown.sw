@@ -36,7 +36,7 @@ module Markdown
 
 import UI
 
-export [render]
+export [render, repaint_streamed_prose, has_markdown]
 
 # ------------------------------------------------------------
 # Public entry: render(content, width) -> string
@@ -687,6 +687,92 @@ fun is_ansi_end_char(ch) {
 # ------------------------------------------------------------
 
 fun indent_line(line, width) { "  " ++ line }
+
+# ============================================================
+# Post-stream re-render — clear the C-streamed prose and reprint it
+# through the markdown renderer with a 2-col gutter.
+# ============================================================
+#
+# During an LLM call swarmrt's http_post_stream emits tokens straight
+# to the terminal — that's the live-feedback the user values, but it
+# means literal `**bold**`, `### Headers`, fence markers, etc. land
+# on screen as text. After the stream ends we know the full prose,
+# so we wipe the streamed region and re-emit it formatted.
+#
+# Mechanics: cursor sits at end-of-prose. We move to column 0 with
+# \r, clear current line, then `\e[1A\e[K` once per terminal row the
+# prose consumed (counted from char length / term_width). Reasoning
+# content (Kimi K2 thinking mode) streams BEFORE prose and is left
+# untouched — only the prose tail is rewritten. Tool-call sequels
+# stay clean too because tool_header / tool_result already render
+# AFTER repaint runs.
+#
+# Disabled by SWARM_CODE_RAW_STREAM=1 — power users who prefer the
+# unfiltered token stream can opt out.
+fun repaint_streamed_prose(prose) {
+    if (string_length(string_trim(to_string(prose))) == 0) { 'noop' }
+    else {
+        env_raw = getenv("SWARM_CODE_RAW_STREAM")
+        if (env_raw == "1") { 'noop' }
+        else {
+            if (has_markdown(prose) == 'false') { 'noop' }
+            else {
+                w = UI.term_width()
+                rows = count_terminal_rows(prose, w)
+                # \r jumps to col 0 of the cursor's current row.
+                # \e[K clears from cursor to end of line.
+                # Then \e[1A moves cursor up one row, \e[K clears it.
+                # Repeated rows-1 times so the entire prose region is wiped.
+                print_inline("\r\e[K")
+                clear_rows_up(rows - 1)
+                print(render(prose, w))
+            }
+        }
+    }
+}
+
+# Cheap heuristic — skip the repaint when prose is plain text. Avoids
+# eating a frame for "hi" and similar trivial replies, and keeps the
+# UX identical for non-markdown content.
+fun has_markdown(s) {
+    if (string_contains(s, "**") == 'true') { 'true' }
+    else { if (string_contains(s, "`") == 'true') { 'true' }
+    else { if (string_contains(s, "\n# ") == 'true') { 'true' }
+    else { if (string_starts_with(s, "# ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n## ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n### ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n- ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n* ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n> ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n|") == 'true') { 'true' }
+    else { if (string_contains(s, "```") == 'true') { 'true' }
+    else { 'false' }}}}}}}}}}}
+}
+
+# Total terminal rows the prose occupies — sum of ceil(len/width)
+# for each hard-newline-delimited line, with empty lines counted as 1.
+fun count_terminal_rows(prose, width) {
+    lines = string_split(prose, "\n")
+    sum_rows(lines, width, 0)
+}
+
+fun sum_rows(lines, width, acc) {
+    if (length(lines) == 0) { acc }
+    else {
+        line_len = string_length(hd(lines))
+        rows = if (line_len == 0) { 1 }
+               else { (line_len + width - 1) / width }
+        sum_rows(tl(lines), width, acc + rows)
+    }
+}
+
+fun clear_rows_up(n) {
+    if (n <= 0) { 'ok' }
+    else {
+        print_inline("\e[1A\e[K")
+        clear_rows_up(n - 1)
+    }
+}
 
 fun list_last(lst) {
     if (length(lst) == 0) { nil }

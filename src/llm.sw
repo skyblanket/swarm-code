@@ -2,6 +2,7 @@ module LLM
 
 import Log
 import ToolSchemas
+import Markdown
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -763,6 +764,17 @@ fun chat_native(messages, opts) {
                     had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
 
+                    # Post-stream re-render: wipe the C-streamed prose
+                    # and reprint it formatted with the 2-col gutter.
+                    # Only fires when (a) there's prose, (b) it contains
+                    # markdown-y syntax, (c) SWARM_CODE_RAW_STREAM != 1.
+                    # Skipped when tool_calls is non-empty because tool
+                    # headers will render immediately after and a clean
+                    # re-render mid-turn would clobber them.
+                    if (had_tools == 'false') {
+                        Markdown.repaint_streamed_prose(prose)
+                    }
+
                     %{
                         content: prose,
                         tool_calls: tool_calls,
@@ -869,6 +881,16 @@ fun chat_inband(messages, opts) {
                       "Try restarting vllm on the host.)\e[0m")
                 print("")
             }
+
+            # Post-stream re-render (same rationale as chat_native):
+            # wipe the raw streamed prose and reprint via Markdown so
+            # bold/headers/lists/code render properly with a 2-col
+            # gutter. Skipped when tool_calls present so tool headers
+            # render cleanly right after.
+            if (had_tools == 'false') {
+                Markdown.repaint_streamed_prose(to_string(prose))
+            }
+
             %{
                 content: prose,
                 tool_calls: tool_calls,
