@@ -119,6 +119,7 @@ fun tool_descriptions() {
     bg_kill_desc() ++ "\n" ++
     sys_stats_desc() ++ "\n" ++
     heartbeat_desc() ++ "\n" ++
+    context_meter_desc() ++ "\n" ++
     web_search_desc() ++ "\n" ++
     git_status_desc() ++ "\n" ++
     git_diff_desc() ++ "\n" ++
@@ -311,6 +312,13 @@ fun heartbeat_desc() {
     "- heartbeat_status: Query the background pulse (tick count, uptime, last " ++
     "tick time). The heartbeat is a sw process spawned at startup that runs " ++
     "in the swarmrt runtime alongside the conversation.\n" ++
+    "  schema: {}"
+}
+
+fun context_meter_desc() {
+    "- context_meter: Query the current context-window usage — message count, " ++
+    "estimated tokens consumed, budget, remaining tokens, and whether " ++
+    "auto-compaction is imminent. No arguments.\n" ++
     "  schema: {}"
 }
 

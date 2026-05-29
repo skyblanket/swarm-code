@@ -1300,6 +1300,14 @@ fun print_session_lines(names, dir, i, cap) {
 # One turn: call LLM, dispatch any tool_calls, recurse until no more
 # tool_calls are emitted. Returns the updated history.
 # ------------------------------------------------------------
+fun opts_with_history(opts, history) {
+    a = map_put(opts, 'history_len', length(history))
+    b = map_put(a, 'history_chars', history_chars(history))
+    c = map_put(b, 'context_budget', context_budget_tokens())
+    d = map_put(c, 'compact_thr', compact_threshold())
+    d
+}
+
 fun history_chars(history) { history_chars_loop(history, 0) }
 
 fun history_chars_loop(h, acc) {
@@ -1426,8 +1434,9 @@ fun run_turn(history, opts, step) {
                     with_assistant
                 }
             } else {
-                post_exec = execute_all(tool_calls, with_assistant, opts)
-                run_turn(post_exec, opts, step + 1)
+                meter_opts = opts_with_history(opts, with_assistant)
+                post_exec = execute_all(tool_calls, with_assistant, meter_opts)
+                run_turn(post_exec, meter_opts, step + 1)
             }
         }
         }

@@ -28,7 +28,8 @@ fun all_schemas() {
      task_s(),
      browser_launch_s(), browser_navigate_s(), browser_click_s(),
      browser_type_s(), browser_screenshot_s(), browser_get_text_s(),
-     browser_get_html_s(), browser_evaluate_s(), browser_close_s()]
+     browser_get_html_s(), browser_evaluate_s(), browser_close_s(),
+     context_meter_s()]
 }
 
 # Return the schemas as JSON array string, ready for embedding in a
@@ -351,5 +352,15 @@ fun browser_evaluate_s() {
 fun browser_close_s() {
     tool("browser_close",
         "Close the WS session. Chrome stays running for fast re-launch.",
+        obj(%{}, []))
+}
+
+fun context_meter_s() {
+    tool("context_meter",
+        "Query the current context-window usage: message count, " ++
+        "estimated tokens consumed, budget, remaining tokens, and " ++
+        "whether auto-compaction is imminent. Use this when you " ++
+        "wonder 'how much room do I have left?' or before starting " ++
+        "a large exploration that might exhaust the window.",
         obj(%{}, []))
 }

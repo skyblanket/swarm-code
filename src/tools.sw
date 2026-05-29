@@ -102,6 +102,7 @@ fun all_tools() {
         %{atom: 'bg_kill',            handler: fun(args, opts) { do_bg_kill(args, opts) }},
         %{atom: 'sys_stats',          handler: fun(args, opts) { Telemetry.sys_stats() }},
         %{atom: 'heartbeat_status',   handler: fun(args, opts) { do_heartbeat_status(opts) }},
+        %{atom: 'context_meter',      handler: fun(args, opts) { do_context_meter(args, opts) }},
         %{atom: 'git_status',         handler: fun(args, opts) { do_git_status(args) }},
         %{atom: 'git_diff',           handler: fun(args, opts) { do_git_diff(args) }},
         %{atom: 'git_commit',         handler: fun(args, opts) { do_git_commit(args) }},
@@ -893,6 +894,53 @@ fun do_bg_result(args, opts) {
 fun do_heartbeat_status(opts) {
     hb_table = map_get(opts, 'heartbeat_table')
     Heartbeat.format_status(hb_table)
+}
+
+# ------------------------------------------------------------
+# context_meter  show current context-window usage
+# ------------------------------------------------------------
+fun do_context_meter(args, opts) {
+    hist_len = map_get(opts, 'history_len')
+    hist_chars = map_get(opts, 'history_chars')
+    budget = map_get(opts, 'context_budget')
+    thr = map_get(opts, 'compact_thr')
+
+    len_str = if (hist_len == nil) { "?" } else { to_string(hist_len) }
+    chars_str = if (hist_chars == nil) { "?" } else { to_string(hist_chars) }
+    budget_str = if (budget == nil) { "?" } else { to_string(budget) }
+    thr_str = if (thr == nil) { "120" } else { to_string(thr) }
+
+    last_pt = LLM.last_prompt_tokens(opts)
+    last_pt_str = if (last_pt == nil) { "unknown" } else { to_string(last_pt) }
+
+    est_from_chars = if (hist_chars == nil) { nil } else { hist_chars / 4 }
+    est_tokens = if (last_pt != nil) {
+        if (est_from_chars != nil && est_from_chars > last_pt) { est_from_chars } else { last_pt }
+    } else { est_from_chars }
+    est_str = if (est_tokens == nil) { "unknown" } else { to_string(est_tokens) }
+
+    remaining = if (budget == nil || est_tokens == nil) { nil }
+                else { budget - est_tokens }
+    remain_str = if (remaining == nil) { "unknown" }
+                 else { to_string(remaining) }
+
+    pct = if (budget == nil || est_tokens == nil || budget == 0) { nil }
+          else { (est_tokens * 100) / budget }
+    pct_str = if (pct == nil) { "?" } else { to_string(pct) ++ "%" }
+
+    compact_warn = if (thr == nil || hist_len == nil) { "" }
+    else { if (hist_len >= thr) {
+        "  ⚠ auto-compaction triggered (" ++ len_str ++ " >= " ++ thr_str ++ " messages)\n"
+    } else { "" }}
+
+    "context meter\n" ++
+    "  messages      : " ++ len_str ++ "\n" ++
+    "  chars (hist)  : " ++ chars_str ++ "\n" ++
+    "  last prompt   : " ++ last_pt_str ++ " tokens (from API usage)\n" ++
+    "  estimated     : " ++ est_str ++ " tokens\n" ++
+    "  budget        : " ++ budget_str ++ " tokens\n" ++
+    "  remaining     : " ++ remain_str ++ " tokens (" ++ pct_str ++ " used)\n" ++
+    compact_warn
 }
 
 # ------------------------------------------------------------
