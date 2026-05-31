@@ -39,8 +39,8 @@ fun reader_loop() {
             handle_main_read()
         {'permission_ask', prompt_text, reply_pid} ->
             handle_permission(prompt_text, reply_pid)
-        {'picker_ask', header, options, reply_pid} ->
-            handle_picker(header, options, reply_pid)
+        {'picker_ask', header, options, reply_pid, token} ->
+            handle_picker(header, options, reply_pid, token)
         _other ->
             'ignore'
     }
@@ -50,9 +50,12 @@ fun reader_loop() {
 # Arrow-key picker — render header + options, read a selection via
 # the read_choice builtin, send the resulting index back to the
 # caller. -1 means user cancelled (Esc or Ctrl+C).
-fun handle_picker(header, options, reply_pid) {
+fun handle_picker(header, options, reply_pid, token) {
     idx = read_choice(header, options)
-    if (reply_pid != nil) { send(reply_pid, {'picker_answer', idx}) }
+    # Echo the caller's correlation token back so a late answer (after the
+    # caller's deadline) can be identified and dropped instead of being
+    # mis-applied to a later, different permission prompt.
+    if (reply_pid != nil) { send(reply_pid, {'picker_answer', token, idx}) }
     'ok'
 }
 

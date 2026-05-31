@@ -471,9 +471,13 @@ fun load_opts() {
     mt_env = getenv("SWARM_CODE_MAX_OUTPUT_TOKENS")
     mt_prof = if (profile == nil) { nil } else { map_get(profile, 'max_tokens') }
     mt_set  = if (settings == nil) { nil } else { map_get(settings, 'max_tokens') }
+    # Coerce profile/settings values too (not just env): a quoted "8192" in
+    # settings.json decodes to a STRING and would flow into the body as
+    # max_tokens:"8192" → 400 on every turn. Routing through to_string + the
+    # env parser normalizes both int and string (and floors garbage).
     max_tokens = if (mt_env != nil) { parse_max_tokens_env(mt_env, 0, 0, 'false') }
-                 else { if (mt_prof != nil) { mt_prof }
-                 else { if (mt_set != nil) { mt_set }
+                 else { if (mt_prof != nil) { parse_max_tokens_env(to_string(mt_prof), 0, 0, 'false') }
+                 else { if (mt_set != nil) { parse_max_tokens_env(to_string(mt_set), 0, 0, 'false') }
                  else { 32768 }}}
 
     # Kimi K2.x rejects any temperature other than 1.0 — Moonshot

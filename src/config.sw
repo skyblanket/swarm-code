@@ -223,13 +223,19 @@ fun is_hardline_bash(args) {
                    string_contains(s, "of=/dev/disk") == 'true') { 'true' }
         else { if (string_contains(s, "dd if=") == 'true' &&
                    string_contains(s, "of=/dev/rdisk") == 'true') { 'true' }
-        # System halt
-        else { if (string_contains(s, "shutdown") == 'true') { 'true' }
-        else { if (string_contains(s, "reboot") == 'true') { 'true' }
-        else { if (string_contains(s, "halt") == 'true') { 'true' }
-        else { if (string_contains(s, "poweroff") == 'true') { 'true' }
-        else { if (string_contains(s, "init 0") == 'true') { 'true' }
-        else { if (string_contains(s, "init 6") == 'true') { 'true' }
+        # System halt — matched as whole command words (not bare substrings),
+        # so `cat asphalt_survey.csv` / `vim shutdown_handler.py` are NOT
+        # blocked while `shutdown -h now`, `/sbin/reboot`, `poweroff` still are.
+        else { if (contains_command_word(s, "shutdown") == 'true') { 'true' }
+        else { if (contains_command_word(s, "reboot") == 'true') { 'true' }
+        else { if (contains_command_word(s, "halt") == 'true') { 'true' }
+        else { if (contains_command_word(s, "poweroff") == 'true') { 'true' }
+        else { if (contains_command_word(s, "init 0") == 'true') { 'true' }
+        else { if (contains_command_word(s, "init 6") == 'true') { 'true' }
+        # telinit N is the SysV alias (telinit 0 halts, telinit 6 reboots) —
+        # word-boundary "init 0" misses it ("init" preceded by 'l'), so match
+        # the verb directly. Keep this as long as "init 0"/"init 6" are blocked.
+        else { if (contains_command_word(s, "telinit") == 'true') { 'true' }
         # Filesystem lockout
         else { if (string_contains(s, "chmod 000 /") == 'true') { 'true' }
         else { if (string_contains(s, "chown -R 0:0 /") == 'true') { 'true' }
@@ -237,8 +243,45 @@ fun is_hardline_bash(args) {
         else { if (string_contains(s, ":(){:|:&};:") == 'true') { 'true' }
         # Whole-disk wipe
         else { if (string_contains(s, "rm -rf /*") == 'true') { 'true' }
-        else { 'false' }}}}}}}}}}}}}}}}
+        else { 'false' }}}}}}}}}}}}}}}}}
     }
+}
+
+# Whole-word match for a catastrophic verb: the word must be bounded by a
+# non-identifier char (or string edge) on both sides, so it isn't matched as
+# a substring of a larger filename/identifier (asphalt, rebooter,
+# shutdown_handler). Over-blocks rare cases like `cat shutdown.sh` — the safe
+# direction for an unbypassable floor (never under-blocks a real `shutdown`).
+fun contains_command_word(s, word) {
+    cw_scan(s, word, string_length(word), string_length(s), 0)
+}
+
+fun cw_scan(s, word, wlen, slen, i) {
+    if (i + wlen > slen) { 'false' }
+    else {
+        if (string_sub(s, i, wlen) == word) {
+            prev_ch = cw_char_at(s, i - 1, slen)
+            next_ch = cw_char_at(s, i + wlen, slen)
+            if (cw_boundary(prev_ch) == 'true' && cw_boundary(next_ch) == 'true') { 'true' }
+            else { cw_scan(s, word, wlen, slen, i + 1) }
+        } else { cw_scan(s, word, wlen, slen, i + 1) }
+    }
+}
+
+fun cw_char_at(s, idx, slen) {
+    if (idx < 0 || idx >= slen) { "" }
+    else { string_sub(s, idx, 1) }
+}
+
+fun cw_boundary(ch) {
+    if (ch == "") { 'true' }
+    else { if (cw_is_ident(ch) == 'true') { 'false' } else { 'true' }}
+}
+
+fun cw_is_ident(ch) {
+    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
+        || (ch >= "0" && ch <= "9") || ch == "_") { 'true' }
+    else { 'false' }
 }
 
 # ------------------------------------------------------------

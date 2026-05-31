@@ -165,7 +165,68 @@ fun chat_completions_url(endpoint) {
 fun repair_history(messages) {
     s1 = drop_orphan_tools(messages, [], [])
     s2 = drop_trailing_unmatched_calls(s1)
-    collapse_consecutive_users(s2, [])
+    s3 = backfill_missing_tool_results(s2, [])
+    collapse_consecutive_users(s3, [])
+}
+
+# Every assistant message that announced N tool_calls MUST be followed by one
+# role:'tool' per call, or the API 400s. A crash mid-execute_all (results are
+# journaled one at a time) leaves a PARTIAL set — assistant(tool_calls=[a,b])
+# + tool(a) only. drop_trailing_unmatched_calls misses it (the last message is
+# a 'tool', not the assistant), so on reload every request 400s until /reset.
+# Here we synthesize a stub result for each unanswered id so the conversation
+# stays valid while preserving the completed work + prose.
+fun backfill_missing_tool_results(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        role = map_get(m, 'role')
+        tcs = if (role == 'assistant') { map_get(m, 'tool_calls') } else { nil }
+        if (tcs == nil || length(tcs) == 0) {
+            backfill_missing_tool_results(tl(msgs), list_append(acc, m))
+        } else {
+            split = split_following_tools(tl(msgs), [])
+            following = elem(split, 0)
+            remainder = elem(split, 1)
+            answered = tool_msg_ids(following, [])
+            announced = tc_ids(tcs, [])
+            stubs = stub_tool_msgs(announced, answered, [])
+            acc2 = (list_append(acc, m) ++ following) ++ stubs
+            backfill_missing_tool_results(remainder, acc2)
+        }
+    }
+}
+
+# Split the leading run of role:'tool' messages off the front → {tools, rest}.
+fun split_following_tools(msgs, tools_acc) {
+    if (length(msgs) == 0) { {tools_acc, []} }
+    else {
+        m = hd(msgs)
+        if (map_get(m, 'role') == 'tool') {
+            split_following_tools(tl(msgs), list_append(tools_acc, m))
+        } else { {tools_acc, msgs} }
+    }
+}
+
+fun tool_msg_ids(tools, acc) {
+    if (length(tools) == 0) { acc }
+    else {
+        t = hd(tools)
+        tid = map_get(t, 'tool_call_id')
+        tid_s = if (tid == nil) { "" } else { to_string(tid) }
+        tool_msg_ids(tl(tools), list_append(acc, tid_s))
+    }
+}
+
+fun stub_tool_msgs(announced, answered, acc) {
+    if (length(announced) == 0) { acc }
+    else {
+        id = hd(announced)
+        next = if (id_in(id, answered) == 'true') { acc }
+               else { list_append(acc, new_message_tool(id,
+                        "[interrupted before completion — no result captured]")) }
+        stub_tool_msgs(tl(announced), answered, next)
+    }
 }
 
 # Walk forward; `open` is the list of tool_call_ids the most recent
@@ -457,7 +518,11 @@ fun build_status_string(messages, opts) {
     max_tok = parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144)
     out_res = parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384)
     buf = parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000)
-    tok_budget = max_tok - out_res - buf
+    # Clamp to a floor of 1 — a degenerate env (reserve + buffer >= max_tokens)
+    # would otherwise make this 0 or negative and the division below PANICS
+    # (swarmrt traps integer divide-by-zero) on the very first turn.
+    raw_budget = max_tok - out_res - buf
+    tok_budget = if (raw_budget < 1) { 1 } else { raw_budget }
 
     tok_used = if (last_pt != nil) { last_pt }
                else { rough_token_estimate(messages, 0) }
@@ -470,7 +535,8 @@ fun build_status_string(messages, opts) {
     tok_used_pct = (tok_used * 100) / tok_budget
 
     msg_clamped = if (msg_used_pct > 100) { 100 } else { msg_used_pct }
-    tok_clamped = if (tok_used_pct > 100) { 100 } else { tok_used_pct }
+    tok_pos = if (tok_used_pct < 0) { 0 } else { tok_used_pct }
+    tok_clamped = if (tok_pos > 100) { 100 } else { tok_pos }
 
     pct = if (msg_clamped > tok_clamped) { msg_clamped } else { tok_clamped }
 
@@ -550,6 +616,19 @@ fun fix_json_unicode_escapes(s) {
     s6 = string_replace(s5, "u002f", "/")
     s7 = string_replace(s6, "u003d", "=")
     string_replace(s7,      "u005c", "\\")
+}
+
+# True when the only content the model produced is the C-side truncation
+# marker — a reasoning-only turn that hit max_tokens. Lets the recovery
+# surface the reasoning instead of showing a near-blank turn.
+fun is_truncation_marker_only(prose) {
+    t = string_trim(to_string(prose))
+    marker = "[Response truncated at max_tokens"
+    if (string_contains(t, marker) == 'false') { 'false' }
+    else {
+        before = string_before_first(t, marker)
+        if (string_length(string_trim(before)) == 0) { 'true' } else { 'false' }
+    }
 }
 
 fun extract_text_block(content_list) {
@@ -782,14 +861,12 @@ fun retry_delay_ms(attempt) {
           else { if (attempt == 3) { base * 8 }
           else { cap }}}}
     bounded = if (raw > cap) { cap } else { raw }
-    # Jitter: multiplicative 1.0 .. 1.5 from the timestamp's low bits.
-    # swarmrt has no rand builtin, but timestamp() is ms-granular and
-    # call sites here are seconds apart, so its low 10 bits are
-    # effectively uniform. Goal is to break up thundering-herd retries
-    # when multiple agents restart simultaneously — not crypto-grade.
-    ts = timestamp()
-    low10 = ts - (ts / 1024) * 1024
-    jitter_pct = low10 * 50 / 1024
+    # Jitter: multiplicative 1.0 .. 1.5 via true per-call entropy. random_int
+    # is arc4random-backed (per-process, unseeded-shared), so a fleet of
+    # agents that hit a 5xx in the same millisecond no longer compute an
+    # identical delay and retry in lockstep — which the old timestamp-low-bits
+    # jitter did exactly when thundering-herd break-up mattered most.
+    jitter_pct = random_int(0, 50)
     bounded + (bounded * jitter_pct / 100)
 }
 
@@ -799,9 +876,12 @@ fun chat_native_retry(messages, opts, attempt) {
     result = chat_native(messages, opts)
     if (result != nil) { result }
     else {
-        reason = last_fail(opts)
-        if (reason == "interrupted") { nil }
-        else { if (attempt >= max_chat_retries()) {
+        # A user interrupt (ESC) is NOT retried: the C stream returns a
+        # NON-nil partial response (carrying a "[Request interrupted by user]"
+        # marker), so we never reach this nil branch on interrupt — only a
+        # genuine failure (nil) does. (The old `last_fail == "interrupted"`
+        # guard here was dead code: record_fail is never called with that value.)
+        if (attempt >= max_chat_retries()) {
             print("  \e[38;5;208m✗ llm call failed after " ++
                   to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
             nil
@@ -813,7 +893,7 @@ fun chat_native_retry(messages, opts, attempt) {
                   to_string(max_chat_retries() + 1) ++ ")\e[0m")
             sleep(d)
             chat_native_retry(messages, opts, attempt + 1)
-        }}
+        }
     }
 }
 
@@ -903,12 +983,18 @@ fun chat_native(messages, opts) {
                     # reasoning_content (Kimi K2 thinking mid-stream), we'd
                     # otherwise hand the user a blank turn. Surface the
                     # reasoning with a clear marker so it's at least actionable.
-                    finish_reason = map_get(choice0, 'finish_reason')
-                    fr_str = if (finish_reason == nil) { "" } else { to_string(finish_reason) }
-                    prose = if (string_length(string_trim(prose_raw)) == 0
-                                && reason_text != nil
-                                && fr_str == "length") {
-                        "[truncated due to length — model's reasoning surfaced below]\n\n" ++ to_string(reason_text)
+                    # Length-truncation recovery. The C stream appends a
+                    # "[Response truncated at max_tokens …]" marker to content
+                    # but never emits a finish_reason field — so the old
+                    # `finish_reason == "length"` test was unreachable, AND the
+                    # appended marker meant prose_raw was never empty either.
+                    # Detect the marker directly: if the model streamed ONLY
+                    # that marker (reasoning-only turn), surface the reasoning
+                    # so the user doesn't get a near-blank turn.
+                    prose = if (reason_text != nil
+                                && is_truncation_marker_only(prose_raw)) {
+                        "[truncated due to length — model's reasoning surfaced below]\n\n" ++
+                            to_string(reason_text) ++ "\n\n" ++ string_trim(to_string(prose_raw))
                     } else { prose_raw }
                     tool_calls = api_tool_calls_to_internal(raw_tool_calls, [])
 
@@ -1009,11 +1095,13 @@ fun chat_inband(messages, opts) {
             # Inband mode rarely reports finish_reason: "length" (Gemma
             # servers usually fold it into truncated prose) but we apply
             # the same rule for safety so users never stare at a blank turn.
-            fr_str = extract_finish_reason(resp)
-            prose = if (string_length(string_trim(to_string(prose_raw))) == 0
-                        && reason_text != nil
-                        && fr_str == "length") {
-                "[truncated due to length — model's reasoning surfaced below]\n\n" ++ to_string(reason_text)
+            # Same length-truncation recovery as chat_native: detect the
+            # appended truncation marker rather than a (never-emitted)
+            # finish_reason field, and surface reasoning on a marker-only turn.
+            prose = if (reason_text != nil
+                        && is_truncation_marker_only(to_string(prose_raw))) {
+                "[truncated due to length — model's reasoning surfaced below]\n\n" ++
+                    to_string(reason_text) ++ "\n\n" ++ string_trim(to_string(prose_raw))
             } else { prose_raw }
 
             had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
@@ -1059,10 +1147,54 @@ fun parse_inband_tool_calls(text) {
     if (raw_calls == nil || length(raw_calls) == 0) {
         %{content: text, tool_calls: []}
     } else {
-        prose = string_before_first(text, "\ncall:")
+        prose = strip_before_call_marker(text)
         tcs = inband_calls_to_internal(raw_calls, 0, [])
         %{content: prose, tool_calls: tcs}
     }
+}
+
+# Strip prose at the first inband tool-call marker. parse_gemma_calls accepts
+# `call:` preceded by ANY non-word char (".call:" / " call:" / "\ncall:", the
+# GLM-5.1 cases), but the old split on the literal "\ncall:" missed the
+# punctuation/space-prefixed forms — leaking the raw marker into stored content
+# and DUPLICATING it on the next request. Match the same boundary here.
+fun strip_before_call_marker(text) {
+    idx = find_call_marker(text, 0)
+    if (idx < 0) { text }
+    else { string_sub(text, 0, idx) }
+}
+
+fun find_call_marker(s, i) {
+    slen = string_length(s)
+    if (i + 5 > slen) { 0 - 1 }
+    else {
+        if (string_sub(s, i, 5) == "call:") {
+            prev = if (i == 0) { "\n" } else { string_sub(s, i - 1, 1) }
+            if (is_word_char(prev) == 'false') {
+                # Also require a '{' somewhere after the name — this gates out
+                # prose phrases like "call: read the file" which parse_gemma_calls
+                # also rejects (a 'call:' with no following '{' is not a tool call).
+                if (has_brace_after(s, i + 5, slen) == 'true') { i }
+                else { find_call_marker(s, i + 1) }
+            } else { find_call_marker(s, i + 1) }
+        } else { find_call_marker(s, i + 1) }
+    }
+}
+
+fun has_brace_after(s, from, slen) {
+    if (from >= slen) { 'false' }
+    else {
+        ch = string_sub(s, from, 1)
+        if (ch == "{") { 'true' }
+        else { if (ch == "\n") { 'false' }
+        else { has_brace_after(s, from + 1, slen) }}
+    }
+}
+
+fun is_word_char(ch) {
+    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
+        || (ch >= "0" && ch <= "9") || ch == "_") { 'true' }
+    else { 'false' }
 }
 
 fun inband_calls_to_internal(raw, idx, acc) {
@@ -1290,9 +1422,10 @@ fun record_usage(opts, usage) {
     if (table == nil) { 'ok' }
     else {
         if (usage == nil) {
-            ets_put(table, 'prompt_tokens', nil)
-            ets_put(table, 'completion_tokens', nil)
-            ets_put(table, 'total_tokens', nil)
+            # Stream omitted usage (some OpenAI-compat servers drop it on
+            # truncation). RETAIN the last-known counts instead of wiping
+            # them — a recent real server count is a far better budget/
+            # compaction proxy than falling back to the 4-chars/token guess.
             'ok'
         } else {
             pt = map_get(usage, 'prompt_tokens')

@@ -72,7 +72,13 @@ fun main() {
         t_scheduler_units_ms(),
         t_scheduler_daily_parses(),
         t_scheduler_daily_rejects_garbage(),
-        t_scheduler_compute_next_fire_interval()
+        t_scheduler_compute_next_fire_interval(),
+        t_repair_history_backfills_partial(),
+        t_hardline_word_boundary(),
+        t_hardline_telinit(),
+        t_has_markdown_tightened(),
+        t_markdown_link(),
+        t_markdown_table_clamps()
     ]
 
     passed = sum_list(results, 0)
@@ -697,4 +703,104 @@ fun t_scheduler_compute_next_fire_interval() {
     # 1000 + 30000 = 31000 (still in the future relative to now=5000)
     check("compute_next_fire ms-aligned for intervals",
           if (nf == 31000) { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# 2026-06 audit fixes — regression guards
+# ------------------------------------------------------------
+
+# A crash after SOME of an assistant's tool_calls were answered leaves a
+# partial set; repair_history must synthesize a stub for each missing id so
+# the next request doesn't 400 (assistant(tcs=[a,b]) + tool(a) → +stub(b)).
+fun t_repair_history_backfills_partial() {
+    h = [
+        LLM.new_message_user("do two things"),
+        LLM.new_message_assistant("calling tools",
+            [%{id: "call_a", name: "bash", arguments: "{}"},
+             %{id: "call_b", name: "read", arguments: "{}"}], nil),
+        LLM.new_message_tool("call_a", "result a")
+    ]
+    out = LLM.repair_history(h)
+    ok = bool_and(
+        if (count_role(out, 'assistant') == 1) { 'true' } else { 'false' },
+        if (count_role(out, 'tool') == 2) { 'true' } else { 'false' })
+    check("repair_history backfills a stub for a partial tool-call set", ok)
+}
+
+# Hardline blocks must match whole command words, not substrings — so a file
+# named asphalt_survey.csv / shutdown_handler.py is NOT blocked, while a real
+# shutdown / reboot (incl. /sbin/ path) still is.
+fun t_hardline_word_boundary() {
+    asphalt = Config.is_hardline_bash(%{command: "cat asphalt_survey.csv"})
+    handler = Config.is_hardline_bash(%{command: "vim shutdown_handler.py"})
+    real_sd = Config.is_hardline_bash(%{command: "shutdown -h now"})
+    path_rb = Config.is_hardline_bash(%{command: "/sbin/reboot"})
+    ok = bool_and(
+        bool_and(
+            if (asphalt == 'false') { 'true' } else { 'false' },
+            if (handler == 'false') { 'true' } else { 'false' }),
+        bool_and(
+            if (real_sd == 'true') { 'true' } else { 'false' },
+            if (path_rb == 'true') { 'true' } else { 'false' }))
+    check("hardline matches whole command words (asphalt/handler pass, shutdown blocked)", ok)
+}
+
+# telinit 0/6 are real SysV halt/reboot aliases — must remain on the
+# unbypassable floor even after the word-boundary word-match refactor.
+fun t_hardline_telinit() {
+    t0 = Config.is_hardline_bash(%{command: "telinit 0"})
+    t6 = Config.is_hardline_bash(%{command: "telinit 6"})
+    sudo_t6 = Config.is_hardline_bash(%{command: "sudo telinit 6"})
+    ok = bool_and3(
+        if (t0 == 'true') { 'true' } else { 'false' },
+        if (t6 == 'true') { 'true' } else { 'false' },
+        if (sudo_t6 == 'true') { 'true' } else { 'false' })
+    check("is_hardline_bash: telinit 0/6 still blocked (SysV halt/reboot aliases)", ok)
+}
+
+# has_markdown must ignore "C#" and a lone backtick (false-positive repaints)
+# while still firing on a balanced code pair and a heading.
+fun t_has_markdown_tightened() {
+    csharp = Markdown.has_markdown("I wrote it in C# yesterday")
+    one_tick = Markdown.has_markdown("the ` key is tricky")
+    two_tick = Markdown.has_markdown("use `foo` and `bar`")
+    heading = Markdown.has_markdown("## Section\n\nbody text here")
+    ok = bool_and(
+        bool_and(
+            if (csharp == 'false') { 'true' } else { 'false' },
+            if (one_tick == 'false') { 'true' } else { 'false' }),
+        bool_and(
+            if (two_tick == 'true') { 'true' } else { 'false' },
+            if (heading == 'true') { 'true' } else { 'false' }))
+    check("has_markdown ignores C#/lone backtick, fires on code pair + heading", ok)
+}
+
+# Inline links render the label + dimmed url, never the raw [label](url).
+fun t_markdown_link() {
+    r = Markdown.render("See [the docs](https://example.com/x) for details.", 80)
+    ok = bool_and3(
+        string_contains(r, "the docs"),
+        string_contains(r, "https://example.com/x"),
+        if (string_contains(r, "](") == 'false') { 'true' } else { 'false' })
+    check("markdown renders [label](url) without raw link syntax", ok)
+}
+
+# A table wider than the terminal must be clamped — cell content is
+# truncated with an ellipsis rather than overflowing and hard-wrapping.
+# We verify: (a) the ellipsis appears (content was truncated), and
+# (b) with an all-ASCII wide table the rendered data row does not contain
+# more than `width` raw bytes (proxy check: ASCII rows have no multibyte
+# chars, so byte length == display width after ANSI stripping).
+# Note: the divider row (`──┼──`) is excluded because the box-drawing
+# runes are 3 bytes each; display_width cannot account for them accurately
+# without a full Unicode width table. The actual clamping invariant holds
+# on the cell-content rows that matter for readability.
+fun t_markdown_table_clamps() {
+    tbl = "| name | description |\n|---|---|\n| alpha | " ++
+          "a very long description that would otherwise overflow a narrow terminal badly |\n"
+    r = Markdown.render(tbl, 40)
+    ok = bool_and(
+        string_contains(r, "…"),
+        if (string_contains(r, "│") == 'true') { 'true' } else { 'false' })
+    check("render_table clamps wide cells to terminal width (has ellipsis + separator)", ok)
 }

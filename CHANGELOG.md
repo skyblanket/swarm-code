@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-06-01
 
+### Fixed — UI/markdown + full multi-agent audit (39 verified findings, see AUDIT.md)
+
+**UI / markdown rendering**
+- **`render_table` now clamps to the terminal width** (P1) — wide tables overflowed and the terminal hard-wrapped mid-cell, destroying alignment. Column widths are scaled to fit and over-wide cells are truncated on the *raw* text (before ANSI is added, so no escape is ever split) with an ellipsis.
+- **Post-stream repaint now clears the exact prose region** (P2). New swarmrt builtin `stream_content_rows()` reports the physical rows the C stream emitter actually produced for the assistant's content (soft-wrap + UTF-8 width accounted for) — replacing the byte-based `count_terminal_rows` estimate that under/over-counted (leftover raw markdown, or clearing into the reasoning block above). Falls back to the estimate if unavailable.
+- **Repaint clear threshold is now viewport-aware** via the new `term_rows()` builtin (was a fixed 25), so normal long answers re-render cleanly instead of being duplicated raw-then-rendered.
+- **Markdown links** `[label](url)` now render (label + dimmed url) instead of raw syntax.
+- `has_markdown` no longer false-fires on `C#`/a lone backtick (needs a balanced pair or a line-start heading) → no spurious repaint frame.
+- `display_width` accepts any ASCII-letter CSI terminator (was a partial hand-list that swallowed text on unlisted finals).
+- Bold inline guards against empty (`****`) and space-flanked (`a ** b ** c`) false emphasis.
+
+**Streaming / LLM**
+- **`\uXXXX` decode in the streaming SSE path** (P1, swarmrt) — both the content and reasoning escape loops now decode `\u` escapes (with surrogate pairs) to UTF-8. Em-dashes, accents, CJK, and emoji from `\u`-escaping servers no longer arrive as literal `u2014`/`ud83d…` in the stream and stored history.
+- **`repair_history` backfills partial tool-result sets** (P1) — a crash mid-`execute_all` left `assistant(tool_calls=[a,b]) + tool(a)`, which 400'd the API on every reload until `/reset`. Missing ids now get a synthesized stub result.
+- **`finish_reason:"length"` recovery actually fires** (P2) — it was dead (the stream never emits the field). Detects the truncation marker instead and surfaces the model's reasoning on a reasoning-only truncated turn.
+- **`tok_budget` divide-by-zero guard** (P2) — a degenerate `MAX_TOKENS`/reserve/buffer combo panicked on the first turn; clamped to a floor.
+- **Inband marker strip aligned with `parse_gemma_calls`** (P2) — `.call:`/` call:` (GLM-5.1) markers no longer leak into stored content + duplicate on the next request.
+- Retry jitter uses `random_int` (true entropy) instead of timestamp low-bits (which collided for same-ms restarts); `record_usage(nil)` retains the last-known token counts instead of wiping them; removed the dead `"interrupted"` retry branch.
+
+**Tools / safety / config**
+- **Long-tail tools are reachable in native mode** (P1) — `git_*`, `code_search`, `background`, `bg_*`, `sys_stats`, `heartbeat_status`, `log_wait`, `file_watch`, and `forget` had handlers + prose but **no native schema**, so the default (Kimi/native) user couldn't call them. Added typed schemas (arg names matched to the handlers).
+- **Hardline blocklist matches whole command words** (P2) — `shutdown`/`reboot`/`halt`/`poweroff`/`init 0|6` were bare substrings, so `cat asphalt_survey.csv` / `vim shutdown_handler.py` were unbypassably blocked. Now boundary-matched (over-blocks rather than under-blocks — never weakens the floor).
+- `web_fetch` schema corrected to match the implementation (no fake required `prompt` / "small-model extraction"); `forget` schema added; dead `context_meter` schema removed.
+- `max_tokens` from a profile/settings.json is coerced to int (a quoted `"8192"` previously 400'd every turn).
+- `todo_write` added to the subagent block-list (subagents shared the main agent's todo ETS key).
+
+**Sessions / scheduler / background**
+- **Session search escapes FTS5 special chars** (P2) — `C++`, `obj-c:`, partial quotes etc. silently returned zero hits; now quoted per-token.
+- **Scheduled jobs no longer fire immediately on creation** (P1) — `last_run` seeded to now instead of epoch.
+- Background poll/kill status transitions use `ets_cas` (compare-and-swap from `pending`), so a killed task can't be resurrected as done/error by a racing poll.
+
+**Tests** — suite grew 38 → 43: partial-tool-result backfill, hardline word-boundary, `has_markdown` tightening, markdown link render, table width clamp.
+
 ### Added — production hardening from the parity audit
 
 **Safety (P0)**

@@ -1714,7 +1714,7 @@ fun run_subagent_loop(history, opts, step) {
 # subagent can't quietly mutate the user's environment.
 fun SUBAGENT_BLOCKED_TOOLS() {
     ["task", "remember", "forget", "learn_skill", "forget_skill",
-     "bg_server", "browser_launch", "git_commit"]
+     "bg_server", "browser_launch", "git_commit", "todo_write"]
 }
 
 fun subagent_blocked(name) {
@@ -1840,12 +1840,25 @@ fun ask_via_reader(name, opts, table, cache_key) {
             "Yes, and always allow " ++ to_string(name) ++ " this session",
             "No"
         ]
-        send(reader_pid, {'picker_ask', header, options, self()})
-        idx = receive {
-            {'picker_answer', i} -> i
-            after 30000 { -1 }
-        }
+        # Correlation token: a permission prompt that the user takes a while
+        # to answer must not have its (eventual) answer consumed by the NEXT
+        # prompt — a stale "Yes" silently auto-approving a different, later
+        # tool is a real security bug. Tag the request; await only OUR token.
+        token = to_string(self()) ++ "/" ++ to_string(timestamp())
+        send(reader_pid, {'picker_ask', header, options, self(), token})
+        idx = await_picker(token)
         interpret_picker(idx, table, cache_key)
+    }
+}
+
+# Wait for THIS prompt's answer; drop (and keep waiting through) any stale
+# answer carrying a different token. The long deadline is only a dead-Reader
+# backstop — a permission decision is a human action, so we don't impose a
+# short timeout that would race the user (the old 30s timeout was the bug).
+fun await_picker(token) {
+    receive {
+        {'picker_answer', t, i} -> if (t == token) { i } else { await_picker(token) }
+        after 600000 { -1 }
     }
 }
 

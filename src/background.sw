@@ -161,7 +161,10 @@ fun kill_task(table, task_id) {
             } else {
                 r = shell("kill " ++ pid ++ " 2>&1 && echo killed || echo failed")
                 out = string_trim(elem(r, 1))
-                ets_put(table, task_id ++ "/status", 'killed')
+                # Flip to 'killed' only if still 'pending' — if the poll loop
+                # already recorded done/error (natural completion racing the
+                # kill), the CAS no-ops rather than clobbering the real result.
+                ets_cas(table, task_id ++ "/status", 'pending', 'killed')
                 "pid " ++ pid ++ ": " ++ out
             }
         }
@@ -242,18 +245,25 @@ fun poll_loop(table, i, limit, acc) {
                                 parse_int_safe(trimmed)
                             }
                 final_status = if (exit_code == 0) { 'done' } else { 'error' }
-                ets_put(table, task_id ++ "/status", final_status)
-                ets_put(table, task_id ++ "/exit", exit_code)
-                ets_put(table, task_id ++ "/ended", timestamp())
-
-                main_pid = whereis('main_agent')
-                if (main_pid != nil) {
-                    label_val = ets_get(table, task_id ++ "/label")
-                    label_str = if (label_val == nil) { task_id }
-                                else { to_string(label_val) }
-                    send(main_pid, {'bg_done', task_id, exit_code, label_str})
+                # Compare-and-swap from 'pending': if a concurrent bg_kill
+                # already flipped this to 'killed' (the status read above is
+                # not atomic with this write), the CAS fails and we DON'T
+                # resurrect the task as done/error or fire a spurious bg_done.
+                won = ets_cas(table, task_id ++ "/status", 'pending', final_status)
+                if (won == 'true') {
+                    ets_put(table, task_id ++ "/exit", exit_code)
+                    ets_put(table, task_id ++ "/ended", timestamp())
+                    main_pid = whereis('main_agent')
+                    if (main_pid != nil) {
+                        label_val = ets_get(table, task_id ++ "/label")
+                        label_str = if (label_val == nil) { task_id }
+                                    else { to_string(label_val) }
+                        send(main_pid, {'bg_done', task_id, exit_code, label_str})
+                    }
+                    poll_loop(table, i + 1, limit, list_append(acc, task_id))
+                } else {
+                    poll_loop(table, i + 1, limit, acc)
                 }
-                poll_loop(table, i + 1, limit, list_append(acc, task_id))
             } else {
                 poll_loop(table, i + 1, limit, acc)
             }

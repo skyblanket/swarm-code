@@ -11,20 +11,26 @@ module ToolSchemas
 # back into swarm-code's internal `call:NAME{JSON}` format so agent.sw
 # can keep using the same extraction pipeline.
 #
-# Schemas describe the argument shape for the 13 core tools. The long
-# tail of bg_*, git_*, code_search, heartbeat_status etc. still work —
-# they just don't get typed schemas; the model can discover them from
-# the prose description in the system prompt. We can add more schemas
-# later if we see the model missing them.
+# EVERY tool the registry dispatches gets a typed schema here. In native
+# mode (the default for Moonshot/Kimi and every cloud provider) the harness
+# executes ONLY structured tool_calls — a tool absent from this array cannot
+# be called at all, regardless of its prose description, because the system
+# prompt explicitly tells native models that text-embedded calls are never
+# executed. So the long tail (git_*, bg_*, code_search, sys_stats, forget …)
+# MUST be listed here or it is dead for the default user.
 
 export [all_schemas, all_schemas_json]
 
 fun all_schemas() {
     [bash_s(), read_s(), write_s(), edit_s(), multi_edit_s(),
      glob_s(), grep_s(), todo_write_s(), web_search_s(), web_fetch_s(),
-     remember_s(), recall_s(), memory_list_s(),
+     remember_s(), recall_s(), memory_list_s(), forget_s(),
      learn_skill_s(), recall_skill_s(), skill_list_s(), forget_skill_s(),
      session_search_s(), read_image_s(),
+     git_status_s(), git_diff_s(), git_commit_s(), code_search_s(),
+     log_wait_s(), file_watch_s(),
+     background_s(), bg_status_s(), bg_result_s(), bg_tail_s(),
+     bg_kill_s(), bg_server_s(), sys_stats_s(), heartbeat_status_s(),
      task_s(),
      browser_launch_s(), browser_navigate_s(), browser_click_s(),
      browser_type_s(), browser_screenshot_s(), browser_get_text_s(),
@@ -172,13 +178,11 @@ fun web_search_s() {
 
 fun web_fetch_s() {
     tool("web_fetch",
-        "Fetch a URL and process its content with a small model using your prompt. " ++
-        "Returns the extracted answer. Use after web_search to dig into a specific " ++
-        "URL, or directly when you know the page you want.",
+        "Fetch a URL and return its text content (HTML stripped). Use after " ++
+        "web_search to read a specific page, or directly when you know the URL.",
         obj(%{
-            url: s("Full URL to fetch"),
-            prompt: s("Instruction for what to extract from the page")
-        }, ["url", "prompt"]))
+            url: s("Full URL to fetch")
+        }, ["url"]))
 }
 
 fun remember_s() {
@@ -354,12 +358,135 @@ fun browser_close_s() {
         obj(%{}, []))
 }
 
-fun context_meter_s() {
-    tool("context_meter",
-        "Query the current context-window usage: message count, " ++
-        "estimated tokens consumed, budget, remaining tokens, and " ++
-        "whether auto-compaction is imminent. Use this when you " ++
-        "wonder 'how much room do I have left?' or before starting " ++
-        "a large exploration that might exhaust the window.",
+# ---------- memory delete ----------
+
+fun forget_s() {
+    tool("forget",
+        "Delete a memory file by slug. Use when a stored memory is wrong, " ++
+        "outdated, or no longer relevant.",
+        obj(%{slug: s("The memory's filename without .md")}, ["slug"]))
+}
+
+# ---------- git / search / background / system ----------
+
+fun git_status_s() {
+    tool("git_status",
+        "Show `git status` for the repo (porcelain summary of staged, " ++
+        "unstaged, and untracked files).",
+        obj(%{cwd: s("Optional: repo directory (defaults to cwd)")}, []))
+}
+
+fun git_diff_s() {
+    tool("git_diff",
+        "Show the working-tree diff. Set staged=true for the staged diff.",
+        obj(%{
+            staged: b("Optional: show the staged (index) diff instead"),
+            cwd: s("Optional: repo directory (defaults to cwd)")
+        }, []))
+}
+
+fun git_commit_s() {
+    tool("git_commit",
+        "Stage and commit. Commits the given files (or all changes when " ++
+        "omitted) with the provided message.",
+        obj(%{
+            message: s("Commit message"),
+            files: arr(s("A path to stage"), "Optional: paths to stage (defaults to all changes)"),
+            cwd: s("Optional: repo directory (defaults to cwd)")
+        }, ["message"]))
+}
+
+fun code_search_s() {
+    tool("code_search",
+        "Structure-aware code search across the project. Faster than grep " ++
+        "for finding definitions/usages.",
+        obj(%{
+            pattern: s("Search pattern"),
+            kind: s("Optional: 'def' (find definitions) | 'type' (find type usages) | 'ref' (find references, default)"),
+            lang: s("Optional: language filter (e.g. 'sw', 'py')"),
+            path: s("Optional: directory to search (defaults to cwd)")
+        }, ["pattern"]))
+}
+
+fun log_wait_s() {
+    tool("log_wait",
+        "Block until a pattern appears in a file or a background task's " ++
+        "output (or the timeout elapses). Use to wait for a build/server " ++
+        "to print a readiness line.",
+        obj(%{
+            pattern: s("Regex/substring to wait for"),
+            path: s("Optional: file to watch"),
+            task_id: s("Optional: background task id to watch instead of a file"),
+            timeout_sec: i("Optional: max seconds to wait (default 30)")
+        }, ["pattern"]))
+}
+
+fun file_watch_s() {
+    tool("file_watch",
+        "Block until a file changes (or the timeout elapses).",
+        obj(%{
+            path: s("File to watch"),
+            timeout_sec: i("Optional: max seconds to wait (default 30)")
+        }, ["path"]))
+}
+
+fun background_s() {
+    tool("background",
+        "Run a shell command as a detached background task. Returns a " ++
+        "task id immediately; poll with bg_status / bg_result / bg_tail.",
+        obj(%{
+            command: s("The shell command to run in the background"),
+            label: s("Optional: short label for the task")
+        }, ["command"]))
+}
+
+fun bg_server_s() {
+    tool("bg_server",
+        "Start a long-running server process in the background (like " ++
+        "`background` but intended for processes that don't exit).",
+        obj(%{
+            command: s("The server command to run"),
+            label: s("Optional: short label")
+        }, ["command"]))
+}
+
+fun bg_status_s() {
+    tool("bg_status",
+        "Report the status (pending/done/error/killed + exit code) of a " ++
+        "background task.",
+        obj(%{task_id: s("The background task id")}, ["task_id"]))
+}
+
+fun bg_result_s() {
+    tool("bg_result",
+        "Return the full captured output of a finished background task.",
+        obj(%{task_id: s("The background task id")}, ["task_id"]))
+}
+
+fun bg_tail_s() {
+    tool("bg_tail",
+        "Return the last N lines of a background task's output so far.",
+        obj(%{
+            task_id: s("The background task id"),
+            lines: i("Optional: number of trailing lines (default 20)")
+        }, ["task_id"]))
+}
+
+fun bg_kill_s() {
+    tool("bg_kill",
+        "Terminate a running background task by id.",
+        obj(%{task_id: s("The background task id")}, ["task_id"]))
+}
+
+fun sys_stats_s() {
+    tool("sys_stats",
+        "Report host system stats (CPU, memory, load, disk).",
+        obj(%{}, []))
+}
+
+fun heartbeat_status_s() {
+    tool("heartbeat_status",
+        "Report the heartbeat process state: tick count, background tasks " ++
+        "tracked, and daemon/cognitive-pulse mode.",
         obj(%{}, []))
 }

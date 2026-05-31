@@ -25,10 +25,10 @@ import Util
 #       {"type": "text",      "text": "what's in this?"}
 #   ]}
 #
-# Per-profile gating: profiles in settings.json that support vision
-# (kimi, z.ai GLM-5, multimodal Gemma 4 weights) must set vision:true.
-# Profiles without the flag get a refusal from read_image so we don't
-# burn tokens on an API rejection.
+# Per-profile gating: vision defaults ON. A profile (or the root settings)
+# can opt OUT by setting vision:false — e.g. a text-only backend where a
+# multimodal request would be rejected. supports() returns true unless the
+# flag is explicitly falsy, so unflagged profiles are vision-enabled.
 
 export [
     read_as_data_url, attach, get_pending, clear, supports,

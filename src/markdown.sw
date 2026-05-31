@@ -36,7 +36,7 @@ module Markdown
 
 import UI
 
-export [render, repaint_streamed_prose, has_markdown]
+export [render, repaint_streamed_prose, has_markdown, display_width]
 
 # ------------------------------------------------------------
 # Public entry: render(content, width) -> string
@@ -359,7 +359,12 @@ fun render_table(rows, width) {
     parsed = parse_rows(rows, [])
     if (length(parsed) == 0) { "" }
     else {
-        widths = compute_col_widths(parsed, [])
+        raw_widths = compute_col_widths(parsed, [])
+        # Clamp the column widths so the whole row fits `width`. Without this
+        # a wide table overflows and the terminal hard-wraps it mid-cell (the
+        # final render goes through plain print(), not the column-aware
+        # streaming emitter), destroying alignment.
+        widths = clamp_table_widths(raw_widths, width)
         # First parsed row is the header. Render it, then the divider,
         # then the body rows.
         head = hd(parsed)
@@ -464,8 +469,7 @@ fun row_cells_loop(cells, widths, acc) {
     else {
         cell = hd(cells)
         col_width = if (length(widths) == 0) { display_width(cell) } else { hd(widths) }
-        rendered = render_inline(cell)
-        padded = rendered ++ pad_chars(col_width - display_width(rendered), "")
+        padded = render_cell(cell, col_width)
         sep = if (string_length(acc) == 0) { "" } else { " " ++ UI.grey_border() ++ "│" ++ UI.reset() ++ " " }
         next_widths = if (length(widths) == 0) { [] } else { tl(widths) }
         row_cells_loop(tl(cells), next_widths, acc ++ sep ++ padded)
@@ -475,6 +479,105 @@ fun row_cells_loop(cells, widths, acc) {
 fun pad_chars(n, acc) {
     if (n <= 0) { acc }
     else { pad_chars(n - 1, acc ++ " ") }
+}
+
+# Render one cell to exactly `col_width` display columns. When the content
+# is too wide we truncate the RAW text (before render_inline adds ANSI), so
+# we never split an escape sequence, then append a 1-col ellipsis.
+fun render_cell(cell, col_width) {
+    rendered = render_inline(cell)
+    dw = display_width(rendered)
+    if (dw <= col_width) {
+        rendered ++ pad_chars(col_width - dw, "")
+    } else {
+        room = if (col_width > 1) { col_width - 1 } else { 1 }
+        r2 = render_inline(truncate_raw(cell, room))
+        dw2 = display_width(r2)
+        pad_n = col_width - dw2 - 1
+        r2 ++ "…" ++ pad_chars(if (pad_n > 0) { pad_n } else { 0 }, "")
+    }
+}
+
+# Truncate a raw string to at most `n` bytes. Cells are typically ASCII; a
+# rare multibyte cut is cosmetic and far better than a table overflowing the
+# terminal and hard-wrapping mid-cell.
+fun truncate_raw(s, n) {
+    if (string_length(s) <= n) { s }
+    else { string_sub(s, 0, n) }
+}
+
+# Shrink column widths so the whole row fits `width`. Layout is
+# "  c1 │ c2 │ … │ cN" → 2 leading cols + 3 cols per separator (N-1 of them).
+# When natural widths overflow, scale each by avail/total with a small floor
+# so the widest columns surrender the most space.
+fun clamp_table_widths(widths, width) {
+    n = length(widths)
+    if (n == 0) { widths }
+    else {
+        overhead = 2 + 3 * (n - 1)
+        avail = width - overhead
+        total = sum_ints(widths, 0)
+        if (avail < n || total <= avail) { widths }
+        else {
+            # First pass: proportional scale with a per-column floor of 1.
+            # Floor at 1 (not 4) so narrow cols don't eat surplus budget.
+            scaled = scale_widths(widths, avail, total, [])
+            # Second pass: shave any rounding/floor surplus from the widest
+            # column(s) until sum == avail. This guarantees the row fits width.
+            trim_to_avail(scaled, avail)
+        }
+    }
+}
+
+fun sum_ints(xs, acc) {
+    if (length(xs) == 0) { acc }
+    else { sum_ints(tl(xs), acc + hd(xs)) }
+}
+
+fun scale_widths(widths, avail, total, acc) {
+    if (length(widths) == 0) { acc }
+    else {
+        w = hd(widths)
+        scaled = (w * avail) / total
+        floored = if (scaled < 1) { 1 } else { scaled }
+        scale_widths(tl(widths), avail, total, list_append(acc, floored))
+    }
+}
+
+# Shave (sum - avail) display columns off the widest column(s), one at a time,
+# until the total equals avail. Each shave keeps a floor of 1. O(surplus) steps
+# but surplus is bounded by n (rounding + floor) so it's always tiny.
+fun trim_to_avail(widths, avail) {
+    s = sum_ints(widths, 0)
+    if (s <= avail) { widths }
+    else { trim_to_avail(shave_widest(widths, [], 0), avail) }
+}
+
+fun shave_widest(widths, acc, max_so_far) {
+    # Find the value of the widest column.
+    mx = find_max(widths, 0)
+    shave_widest_at(widths, acc, mx, 'false')
+}
+
+fun find_max(xs, m) {
+    if (length(xs) == 0) { m }
+    else {
+        h = hd(xs)
+        find_max(tl(xs), if (h > m) { h } else { m })
+    }
+}
+
+# Shave 1 from the first occurrence of `mx` that is > 1, leave rest unchanged.
+fun shave_widest_at(widths, acc, mx, done) {
+    if (length(widths) == 0) { acc }
+    else {
+        w = hd(widths)
+        if (done == 'false' && w == mx && w > 1) {
+            shave_widest_at(tl(widths), list_append(acc, w - 1), mx, 'true')
+        } else {
+            shave_widest_at(tl(widths), list_append(acc, w), mx, done)
+        }
+    }
 }
 
 # Divider beneath the header row: ──── per column joined with ┼.
@@ -536,17 +639,40 @@ fun inline_loop(s, i, acc) {
             }
         } else { if (peek2(s, i) == "**") {
             bold_close = find_close(s, i + 2, "**")
-            if (bold_close < 0) {
-                # No closer — emit literal "**" and continue.
+            # CommonMark-ish flanking: no closer, an EMPTY span (`****`), or a
+            # space right inside either delimiter (`a ** b ** c`, glob/math
+            # `2 ** 8`) is not emphasis — emit a literal "**" and keep scanning.
+            if (bold_close < 0 || bold_close == i + 2
+                || string_sub(s, i + 2, 1) == " "
+                || string_sub(s, bold_close - 1, 1) == " ") {
                 inline_loop(s, i + 2, acc ++ "**")
             } else {
                 bold_inner = string_sub(s, i + 2, bold_close - (i + 2))
                 inline_loop(s, bold_close + 2, acc ++ "\e[1m" ++ bold_inner ++ UI.reset())
             }
+        } else { if (peek1(s, i) == "[") {
+            # Markdown link [label](url): render the label, then the URL
+            # dimmed in parens. Falls through to a literal "[" on any
+            # non-match (lone bracket, missing "](", unclosed paren).
+            close_br = find_close(s, i + 1, "]")
+            if (close_br < 0 || peek1(s, close_br + 1) != "(") {
+                inline_loop(s, i + 1, acc ++ "[")
+            } else {
+                close_paren = find_close(s, close_br + 2, ")")
+                if (close_paren < 0) {
+                    inline_loop(s, i + 1, acc ++ "[")
+                } else {
+                    label = string_sub(s, i + 1, close_br - (i + 1))
+                    url = string_sub(s, close_br + 2, close_paren - (close_br + 2))
+                    link_out = render_inline(label) ++ " " ++
+                               UI.grey_text() ++ "(" ++ url ++ ")" ++ UI.reset()
+                    inline_loop(s, close_paren + 1, acc ++ link_out)
+                }
+            }
         } else {
             ch = string_sub(s, i, 1)
             inline_loop(s, i + 1, acc ++ ch)
-        }}
+        }}}
     }
 }
 
@@ -673,13 +799,13 @@ fun dw_loop(s, i, count, in_esc) {
 }
 
 fun is_ansi_end_char(ch) {
-    # ANSI CSI terminators: A-Z and a-z
-    if (ch == "m" || ch == "K" || ch == "J" || ch == "H" || ch == "A"
-        || ch == "B" || ch == "C" || ch == "D" || ch == "E" || ch == "F"
-        || ch == "G" || ch == "S" || ch == "T" || ch == "f"
-        || ch == "h" || ch == "l" || ch == "n" || ch == "s" || ch == "u") {
-        'true'
-    } else { 'false' }
+    # A CSI sequence's FINAL byte is a letter (m, K, J, H, A-G, n, …). The
+    # introducer '[', the digits, and ';' parameter bytes are NOT terminators,
+    # so accepting any ASCII letter terminates correctly without prematurely
+    # ending on '['. The old hand-list missed many valid finals (I, L, M, etc.),
+    # which made display_width swallow following text as zero-width.
+    if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z")) { 'true' }
+    else { 'false' }
 }
 
 # ------------------------------------------------------------
@@ -718,7 +844,13 @@ fun repaint_streamed_prose(prose) {
             if (has_markdown(prose) == 'false') { 'noop' }
             else {
                 w = UI.term_width()
-                rows = count_terminal_rows(prose, w)
+                # Prefer the authoritative physical-row count the C stream
+                # emitter recorded for THIS turn's content — it accounts for
+                # soft-wrap at the real margin and UTF-8 display width exactly,
+                # which the byte-based count_terminal_rows cannot. Fall back to
+                # the estimate only if the builtin reports nothing.
+                c_rows = stream_content_rows()
+                rows = if (c_rows > 0) { c_rows } else { count_terminal_rows(prose, w) }
                 # The cursor-up clear (`\e[1A\e[K`) can only walk back
                 # as far as the top of the terminal's visible region.
                 # If the streamed response was longer than that, the
@@ -734,11 +866,11 @@ fun repaint_streamed_prose(prose) {
                 # gets clean formatting at the end of the buffer (where
                 # their eyes are) and the raw stream still serves as
                 # the live transcript.
-                threshold = max_clearable_rows()
+                threshold = clearable_threshold()
                 if (rows > threshold) {
                     print("")
                     print("  " ++ UI.grey_border() ++
-                          "─── rendered (long response) ───" ++ UI.reset())
+                          "─── rendered ───" ++ UI.reset())
                     print("")
                     print(render(prose, w))
                 } else {
@@ -761,21 +893,31 @@ fun repaint_streamed_prose(prose) {
 # eating a frame for "hi" and similar trivial replies, and keeps the
 # UX identical for non-markdown content.
 fun has_markdown(s) {
-    # `# ` catches ANY heading depth — `## A`, `### B`, etc. all
-    # contain `# ` somewhere (position 1 for ##, etc). Previously
-    # we anchored only `starts_with("# ")` and missed ##/### at
-    # the start, so the repaint never fired on H2/H3-only prose.
     if (string_contains(s, "**") == 'true') { 'true' }
-    else { if (string_contains(s, "`") == 'true') { 'true' }
-    else { if (string_contains(s, "# ") == 'true') { 'true' }
+    else { if (has_code_span(s) == 'true') { 'true' }
+    else { if (has_heading(s) == 'true') { 'true' }
     else { if (string_contains(s, "\n- ") == 'true') { 'true' }
     else { if (string_starts_with(s, "- ") == 'true') { 'true' }
     else { if (string_contains(s, "\n* ") == 'true') { 'true' }
     else { if (string_starts_with(s, "* ") == 'true') { 'true' }
     else { if (string_contains(s, "\n> ") == 'true') { 'true' }
     else { if (string_contains(s, "\n|") == 'true') { 'true' }
-    else { if (string_contains(s, "```") == 'true') { 'true' }
-    else { 'false' }}}}}}}}}}
+    else { 'false' }}}}}}}}}
+}
+
+# Inline code or a fence needs at least TWO backticks (a balanced pair) —
+# a single stray backtick, common in technical prose, no longer fires.
+fun has_code_span(s) {
+    if (length(string_split(s, "`")) >= 3) { 'true' } else { 'false' }
+}
+
+# A heading marker only counts at the START of a line (string start or after
+# a newline), so an inline "C#"/"F#" no longer triggers an unnecessary repaint.
+# `# ` matched anywhere previously — `string_contains(s, "# ")` is true for
+# "in C# yesterday". The renderer's header_depth still validates the real form.
+fun has_heading(s) {
+    if (string_starts_with(s, "#") == 'true') { 'true' }
+    else { if (string_contains(s, "\n#") == 'true') { 'true' } else { 'false' }}
 }
 
 # Conservative ceiling on how many rows we'll attempt to clear via
@@ -785,6 +927,17 @@ fun has_markdown(s) {
 # iTerm typically run 35-60 rows; we cap below the smallest common
 # default to be safe across different setups.
 fun max_clearable_rows() { 25 }
+
+# How many rows we can safely walk the cursor up and clear: anything still
+# on screen. We use the real terminal height (term_rows builtin) minus a
+# small margin for the trailing newline + the line the cursor rests on.
+# If the prose is taller than this, its top scrolled into scrollback and
+# can't be wiped — so we fall back to printing the rendered form below a
+# separator. Falls back to the conservative constant when height is unknown.
+fun clearable_threshold() {
+    tr = term_rows()
+    if (tr > 6) { tr - 2 } else { max_clearable_rows() }
+}
 
 # Total terminal rows the prose occupies — sum of ceil(len/width)
 # for each hard-newline-delimited line, with empty lines counted as 1.

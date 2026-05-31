@@ -96,7 +96,11 @@ fun add(expr, prompt) {
             expr: expr_str,
             prompt: to_string(prompt),
             created_at: timestamp(),
-            last_run: 0,
+            # Seed last_run to NOW, not 0. With 0 (epoch), compute_next_fire
+            # returns a 1970 timestamp that is always < now, so the next 2s
+            # heartbeat fires the job immediately on creation (and a past-slot
+            # daily HH:MM fires right away) instead of after one interval.
+            last_run: timestamp(),
             runs: 0
         }
         save_all(list_append(jobs, job))

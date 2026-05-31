@@ -174,9 +174,38 @@ fun search(query, limit) {
         "SELECT session, role, " ++
         "snippet(journals, 2, '>>>', '<<<', '…', 40) AS snip " ++
         "FROM journals WHERE journals MATCH ? LIMIT ?",
-        [query, limit])
+        [fts_escape(query), limit])
     db_close(db)
     rows
+}
+
+# FTS5 reads the MATCH string as a query EXPRESSION, so raw user text with
+# `" * ( ) : - AND OR NEAR` (code symbols, partial quotes, `C++`, `obj-c:`)
+# is a syntax error → sqlite3_step fails → db_query swallows it → 0 hits,
+# indistinguishable from a genuine miss. Quote each whitespace-separated
+# token as a literal phrase (doubling inner quotes) so any input matches
+# literally, while preserving multi-term implicit-AND.
+fun fts_escape(query) {
+    toks = fts_quote_tokens(string_split(string_trim(to_string(query)), " "), [])
+    if (length(toks) == 0) { "\"\"" } else { fts_join(toks, "") }
+}
+
+fun fts_quote_tokens(parts, acc) {
+    if (length(parts) == 0) { acc }
+    else {
+        p = string_trim(hd(parts))
+        next = if (string_length(p) == 0) { acc }
+               else { list_append(acc, "\"" ++ string_replace(p, "\"", "\"\"") ++ "\"") }
+        fts_quote_tokens(tl(parts), next)
+    }
+}
+
+fun fts_join(toks, acc) {
+    if (length(toks) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { " " }
+        fts_join(tl(toks), acc ++ sep ++ hd(toks))
+    }
 }
 
 # Render hits as a plain text block for slash command + tool output.
