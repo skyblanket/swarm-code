@@ -39,7 +39,159 @@ fun system_prompt(cwd, tool_format) {
     "\n\n=== ENVIRONMENT ===\n" ++ environment_section(cwd) ++
     protocol_section ++
     "\n\n=== AVAILABLE TOOLS ===\n" ++ tool_descriptions() ++
+    "\n\n=== WRITING SW CODE ===\n" ++ sw_guide() ++
     "\n\n=== RULES ===\n" ++ rules()
+}
+
+# ------------------------------------------------------------
+# Writing sw — the idiom cheat-sheet swarm-code carries about its
+# OWN language. swarm-code is written in sw and runs on swarmrt, so
+# when a user asks it to write or edit .sw files it must produce
+# current, correct, idiomatic sw — not a hallucinated dialect.
+#
+# Every rule below is verified against the live compiler. The pitfalls
+# are the ones that empirically trip up frontier models (the swarmrt
+# sw-writeability eval distilled them); the loud compiler hints +
+# sw_check turn them into a self-correcting loop. Distilled from
+# swarmrt/docs/AGENT_SYSTEM.md + eval/system_prompt.md, kept in sync
+# with the NEW capabilities (bytes, async WS, audio, Voice).
+# ------------------------------------------------------------
+fun sw_guide() {
+    sw_shape() ++ "\n\n" ++
+    sw_pitfalls() ++ "\n\n" ++
+    sw_builtins() ++ "\n\n" ++
+    sw_capabilities() ++ "\n\n" ++
+    sw_verify()
+}
+
+fun sw_shape() {
+    "When you write or edit .sw files (the sw language, swarmrt runtime — " ++
+    "swarm-code itself is written in it), follow these CURRENT idioms.\n\n" ++
+    "PROGRAM SHAPE:\n" ++
+    "- Every file starts with `module Name` (CamelCase) on line 1 — NOT " ++
+    "optional, never start with `import` or `fun`. Then `export [a, b]`, then " ++
+    "`fun name(args) { body }`. Files live at src/<ModuleName>.sw (src/main.sw " ++
+    "for `module Main`). `import Other` auto-resolves to src/Other.sw and the " ++
+    "stdlib under <swarmrt>/lib/.\n" ++
+    "- No `let`/`const` — bare `x = 5`. The LAST expression in a fun is its " ++
+    "return value; there is NO statement `return`. `if (c) { a } else { b }` " ++
+    "— both branches required, it is an expression.\n" ++
+    "- A process is a top-level `fun` that tail-calls ITSELF inside `receive { " ++
+    "pat -> body ; recur(new_state) }`. State is the recursion argument — there " ++
+    "are no mutable variables, no `while`; recurse with new values to update. " ++
+    "For shared mutable state use ETS (`ets_new/ets_put/ets_get`). `spawn(fun() " ++
+    "{ ... })` → pid; `send(pid, msg)`; `self()` is your pid.\n" ++
+    "- Booleans are the ATOMS `'true'`/`'false'` (single-quoted), not bare " ++
+    "keywords. Atoms (`'ok'`, `'error'`) tag messages; tuples `{'tag', payload, " ++
+    "reply_pid}` bundle a tag with data. Maps are `%{key: value}`."
+}
+
+fun sw_pitfalls() {
+    "PITFALLS THAT BITE (these cause most first-try failures):\n" ++
+    "1. Concatenate strings/lists with `++`, NEVER `+`. `+` is numeric only. " ++
+    "`++` auto-coerces ints/floats/atoms to string: `\"count: \" ++ n`. The " ++
+    "compiler will say `use ++ to concatenate` if you slip.\n" ++
+    "2. F-strings need the `f` prefix: `f\"hi {name} n={count}\"`. Plain " ++
+    "`\"hi {name}\"` prints literally. `format(\"hi {} n={}\", name, count)` is " ++
+    "the positional form. Inside `{...}` any expression works.\n" ++
+    "3. `map`, `filter`, `reduce`, `pmap` are GLOBAL builtins — write " ++
+    "`filter(fn, list)` / `map(fn, list)`, NOT `Std.filter`/`Std.map` (those " ++
+    "don't exist → compile error). `reduce(fun(acc, x){...}, list, init)` takes " ++
+    "the fn first. `pmap` is parallel map (one process per element). `each` " ++
+    "DOES live in Std: `Std.each(list, fn)`. So do `Std.sort`, `Std.sum`, " ++
+    "`Std.range(a,b)` (exclusive of b), `Std.group_by`, `Std.string_join`.\n" ++
+    "4. Use `%` for modulo (`n % 2 == 0`), not `mod`.\n" ++
+    "5. Lambdas can't self-recurse (`f = fun(x){ f(x) }` fails). For recursion " ++
+    "use a top-level `fun`.\n" ++
+    "6. Pattern matching binds: `case x { 0 -> .. ; {'tag', v} -> .. ; _ -> .. " ++
+    "}`, guards via `pat when cond ->`. NOW SUPPORTED (recently fixed): map " ++
+    "patterns `%{k: v}` bind their fields, cons `[h | t]` binds head/tail, AND " ++
+    "multi-element prefix `[a, b | rest]` binds the first two plus the rest. " ++
+    "(Older docs that say `[a, b | rest]` is unsupported are STALE — it works " ++
+    "now.) No BIF guards (`is_integer` etc.) — dispatch on `typeof(x)` which " ++
+    "returns \"int\"/\"float\"/\"string\"/\"atom\"/\"list\"/\"tuple\"/\"map\"/" ++
+    "\"pid\"/\"fun\"/\"bytes\"/\"nil\".\n" ++
+    "7. Errors: `panic(msg)` (loud, uncatchable, prints file:line + stack), " ++
+    "`error(reason)` (recoverable, caught by `try { } catch e { }`), " ++
+    "`expect(val, msg)` (unwrap-or-panic). NO `throw`/`raise`. `hd`/`tl`/`elem` " ++
+    "panic on empty/out-of-range — guard with a length check first; `map_get`/" ++
+    "`ets_get` return `nil` for missing keys.\n" ++
+    "8. `fun` defines functions and lambdas — NOT `fn` (`fn` is not a keyword; " ++
+    "it compiles to `unknown function`). `main()` is the entry point; the " ++
+    "runtime EXITS when main returns (Go-style) — for a long-running server end " ++
+    "main with a permanent `receive { ... }`."
+}
+
+fun sw_builtins() {
+    "USEFUL BUILTINS (global unless `Module.`-qualified):\n" ++
+    "- Strings: string_length, string_split(s, sep), string_replace(s, a, b), " ++
+    "string_sub(s, start, len), string_contains/starts_with/ends_with " ++
+    "(→ 'true'/'false'), string_upper/lower/trim, string_index_of.\n" ++
+    "- JSON: json_encode(v) → string, json_decode(s) → value or nil.\n" ++
+    "- HTTP: http_get(url, headers), http_post(url, headers, body) — headers " ++
+    "before body, headers are [{\"Header\", \"value\"}, ...].\n" ++
+    "- Files: file_read, file_write, file_exists (→ 'true'/'false'), " ++
+    "file_list(dir), file_delete, file_mkdir.\n" ++
+    "- SQLite: db_open(path) → slot; db_exec(slot, sql); db_query(slot, sql, " ++
+    "[binds]) → list of maps. Shell: shell(cmd) → {exit_code, stdout}; " ++
+    "shell_sandboxed(cmd, opts). Subprocess: subprocess_spawn/send_line/" ++
+    "recv_line/close (bidirectional child).\n" ++
+    "- Time/sys: timestamp() (ms), sleep(ms), random_int(lo, hi), " ++
+    "getenv(\"VAR\"), sys_exit(code).\n" ++
+    "- Concurrency/fault-tolerance: spawn, send, self(), register('name', " ++
+    "pid), whereis('name'), link(pid), monitor(pid) → ref, " ++
+    "exit_proc(pid, reason), trap_exit('true'). With trap_exit on, a linked " ++
+    "child's death arrives as `{'EXIT', from, reason}` in your mailbox; " ++
+    "monitor's is `{'DOWN', ref, 'process', pid, reason}`.\n" ++
+    "- Stdlib: `import Std` (range/take/drop/zip/sort/group_by/sum/each/" ++
+    "string_join/...), `import Mcp` (MCP client+server), `import Embed`+`import " ++
+    "Vec` (embeddings + vector store), `import Prompt` ({{var}} templates), " ++
+    "`import Cron` (Cron.every(ms, fn), Cron.in_ms), `import Telemetry`."
+}
+
+fun sw_capabilities() {
+    "NEW AGENT-BUILDING CAPABILITIES (these landed recently — use them, they " ++
+    "are real):\n" ++
+    "- bytes type: a length-carrying, NUL-safe byte vector (`typeof` → " ++
+    "\"bytes\") for raw binary (audio frames, protocol bytes). Values come from " ++
+    "builtins, never a literal. bytes_from_base64(s) / bytes_to_base64(b), " ++
+    "byte_size(b), byte_at(b, i), byte_slice(b, start, len), bytes_concat(a, " ++
+    "b), string_to_bytes(s) / bytes_to_string(b). Survives embedded 0x00, " ++
+    "copies over send, works as an ETS key.\n" ++
+    "- Async WebSockets: ws_set_handler / wsc_set_handler register a process " ++
+    "to receive frames as messages (server / client side). ws_send(conn, text), " ++
+    "ws_send_binary(conn, bytes), ws_close(conn). Client: wsc_connect(url) / " ++
+    "wsc_connect_tls(url, headers) → handle, wsc_send, wsc_recv(handle, " ++
+    "timeout_ms) (non-blocking poll with 0), wsc_close. This is how you build " ++
+    "real-time bidirectional agents.\n" ++
+    "- Audio codecs (base64 string twins AND raw-bytes twins): " ++
+    "audio_ulaw_to_pcm16 / audio_pcm16_to_ulaw / audio_resample(b64, from_hz, " ++
+    "to_hz), and the bytes versions audio_ulaw_to_pcm16_b / audio_pcm16_to_ulaw_b " ++
+    "/ audio_resample_b. For G.711 mu-law passthrough you stay in base64 ASCII " ++
+    "end-to-end and never touch raw bytes.\n" ++
+    "- Voice module (`import Voice`): native real-time voice-agent helpers " ++
+    "bridging a telephony provider (Telnyx Media Streaming, a swarmrt WS " ++
+    "*server*) to a speech-to-speech model (OpenAI Realtime, reached as a WS " ++
+    "*client* over wss). Voice.realtime_connect(%{model, api_key, format}), " ++
+    "Voice.session_update(opts), Voice.realtime_append(b64), " ++
+    "Voice.telnyx_media(b64), Voice.telnyx_clear(), plus frame inspectors " ++
+    "(Voice.openai_type, Voice.telnyx_event). See examples/voice_agent.sw in " ++
+    "the swarmrt repo for the full wiring."
+}
+
+fun sw_verify() {
+    "VERIFY WHAT YOU WRITE — the compile-fix loop:\n" ++
+    "After you write or edit ANY .sw file, call the `sw_check` tool on it " ++
+    "BEFORE telling the user it's done. sw's compiler is loud and precise: it " ++
+    "names src/Module.sw:LINE and gives a did-you-mean fix (e.g. `use ++ to " ++
+    "concatenate`, `filter is a global builtin, not Std.filter`, `fn is not a " ++
+    "keyword`). On a COMPILE ERROR, fix the exact line the compiler points at, " ++
+    "then call sw_check again. Loop until it returns OK. Trust the error " ++
+    "message — it is almost always literally telling you the idiom. This " ++
+    "compile-then-fix loop is how you produce correct sw; do not single-shot " ++
+    "and assume it's right. When the file is part of a project with a Makefile " ++
+    "(swarm-code itself, or any swarmrt app), also run `make` / `make test` " ++
+    "via bash to confirm the whole build stays green."
 }
 
 fun preamble() {
@@ -124,6 +276,7 @@ fun tool_descriptions() {
     git_diff_desc() ++ "\n" ++
     git_commit_desc() ++ "\n" ++
     code_search_desc() ++ "\n" ++
+    sw_check_desc() ++ "\n" ++
     log_wait_desc() ++ "\n" ++
     file_watch_desc() ++ "\n" ++
     browser_launch_desc() ++ "\n" ++
@@ -353,6 +506,17 @@ fun code_search_desc() {
     "filter (rust, swift, py, ts, go, etc). Prefer this over bare grep when " ++
     "looking for where a symbol is defined or referenced.\n" ++
     "  schema: {\"pattern\":\"string\",\"kind\":\"def|ref|type (optional)\",\"path\":\"string (optional)\",\"lang\":\"string (optional)\"}"
+}
+
+fun sw_check_desc() {
+    "- sw_check: Compile-verify a .sw file with the swarmrt compiler (`swc " ++
+    "emit` — parse + typecheck + codegen, no cc, so it's fast). ALWAYS call " ++
+    "this after writing or editing any .sw file, before you say it's done. " ++
+    "sw's compiler is loud and precise: it names the exact src/Module.sw:LINE " ++
+    "and gives a did-you-mean fix. On a COMPILE ERROR, fix the named line and " ++
+    "call sw_check again — loop until OK. This compile-fix loop is how you " ++
+    "write correct sw; do not single-shot it.\n" ++
+    "  schema: {\"path\":\"path to the .sw file (e.g. src/agent.sw)\"}"
 }
 
 fun log_wait_desc() {

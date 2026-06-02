@@ -106,6 +106,7 @@ fun all_tools() {
         %{atom: 'git_diff',           handler: fun(args, opts) { do_git_diff(args) }},
         %{atom: 'git_commit',         handler: fun(args, opts) { do_git_commit(args) }},
         %{atom: 'code_search',        handler: fun(args, opts) { do_code_search(args) }},
+        %{atom: 'sw_check',           handler: fun(args, opts) { do_sw_check(args) }},
         %{atom: 'log_wait',           handler: fun(args, opts) { do_log_wait(args, opts) }},
         %{atom: 'file_watch',         handler: fun(args, opts) { do_file_watch(args) }},
         %{atom: 'browser_launch',     handler: fun(args, opts) { do_browser_launch(args, opts) }},
@@ -1321,6 +1322,75 @@ fun do_file_watch(args) {
         } else {
             "error: file_watch failed (exit " ++ to_string(code) ++ "): " ++ out
         }}
+    }
+}
+
+# ------------------------------------------------------------
+# sw_check — compile-verify a .sw file and surface the loud
+# compiler errors so the model can self-fix.
+#
+# sw's compiler is the single best correction signal you have when
+# writing sw: it points at the exact src/<Module>.sw:LINE and emits
+# did-you-mean hints ("filter is a global builtin — write filter(fn,
+# list), not Std.filter", "use ++ to concatenate", "unknown function
+# 'Main_fn' — fn is not a keyword"). The eval proved that an agent
+# which compiles what it writes and fixes on the error beats one that
+# single-shots. This tool is the loop primitive.
+#
+# We run `swc emit` (full parse + typecheck + codegen to /dev/null)
+# rather than `build` — no cc invocation, so it's fast and isolates
+# *sw-level* errors. Exit 0 ⇒ the sw is valid; non-zero ⇒ return the
+# stderr verbatim (it already names the file:line and the fix).
+#
+# args: {"path": "src/foo.sw" (the .sw file to verify)}
+# Resolves the swc binary from: SWARM_CODE_SWC env → swc on PATH →
+# ../swarmrt/bin/swc relative to cwd (swarm-code's sibling layout).
+fun do_sw_check(args) {
+    path_arg = map_get(args, 'path')
+    if (path_arg == nil) { "error: sw_check needs 'path' (the .sw file to verify)" }
+    else {
+        path = to_string(path_arg)
+        if (file_exists(path) == 'false') {
+            "error: no such file: " ++ path
+        } else {
+            swc = resolve_swc()
+            # `swc emit` writes generated C to STDOUT and diagnostics to STDERR.
+            # We only want the diagnostics, so stdout → /dev/null and stderr →
+            # a temp file we read back. One emit run; the temp file is filtered
+            # of the harmless auto-import / cannot-open chatter swc always prints.
+            errf = "/tmp/swc-check-" ++ to_string(timestamp()) ++ ".err"
+            cmd = swc ++ " emit " ++ Util.shell_q(path) ++
+                  " >/dev/null 2>" ++ Util.shell_q(errf) ++ "; S=$?; " ++
+                  "grep -v 'auto-imported\\|cannot open' " ++ Util.shell_q(errf) ++
+                  "; rm -f " ++ Util.shell_q(errf) ++ "; exit $S"
+            r = shell(with_timeout(cmd, 60))
+            code = elem(r, 0)
+            out = string_trim(elem(r, 1))
+            if (code == 142) {
+                "[timed out after 60s while compiling " ++ path ++ "]"
+            } else { if (code == 0) {
+                "OK: " ++ path ++ " compiles clean (parse + typecheck + codegen passed)."
+            } else {
+                "COMPILE ERROR in " ++ path ++ " (exit " ++ to_string(code) ++ "):\n" ++
+                out ++
+                "\n\nFix the line the compiler names, then call sw_check again. " ++
+                "The error message tells you the idiom — trust it."
+            }}
+        }
+    }
+}
+
+# Resolve the swc compiler binary. swarm-code ships beside swarmrt
+# (../swarmrt/bin/swc); allow an explicit override via env, then fall
+# back to PATH, then the sibling-repo path.
+fun resolve_swc() {
+    override = getenv("SWARM_CODE_SWC")
+    if (override != nil) { to_string(override) }
+    else {
+        r = shell("command -v swc 2>/dev/null")
+        found = string_trim(elem(r, 1))
+        if (string_length(found) > 0) { found }
+        else { "../swarmrt/bin/swc" }
     }
 }
 

@@ -72,6 +72,7 @@ fun all_tools() {
         %{name: "git_diff",             atom: 'git_diff'},
         %{name: "git_commit",           atom: 'git_commit'},
         %{name: "code_search",          atom: 'code_search'},
+        %{name: "sw_check",             atom: 'sw_check'},
         %{name: "log_wait",             atom: 'log_wait'},
         %{name: "file_watch",           atom: 'file_watch'},
 

@@ -28,6 +28,7 @@ fun all_schemas() {
      learn_skill_s(), recall_skill_s(), skill_list_s(), forget_skill_s(),
      session_search_s(), read_image_s(),
      git_status_s(), git_diff_s(), git_commit_s(), code_search_s(),
+     sw_check_s(),
      log_wait_s(), file_watch_s(),
      background_s(), bg_status_s(), bg_result_s(), bg_tail_s(),
      bg_kill_s(), bg_server_s(), sys_stats_s(), heartbeat_status_s(),
@@ -406,6 +407,22 @@ fun code_search_s() {
             lang: s("Optional: language filter (e.g. 'sw', 'py')"),
             path: s("Optional: directory to search (defaults to cwd)")
         }, ["pattern"]))
+}
+
+fun sw_check_s() {
+    tool("sw_check",
+        "Compile-verify a .sw (sw / swarmrt) file and return the compiler's " ++
+        "errors. ALWAYS call this after you write or edit a .sw file, before " ++
+        "telling the user it's done. sw's compiler is loud and precise — it " ++
+        "names the exact src/Module.sw:LINE and gives a did-you-mean fix (e.g. " ++
+        "'use ++ to concatenate', 'filter is a global builtin, not Std.filter', " ++
+        "'fn is not a keyword'). On a COMPILE ERROR, fix the named line and call " ++
+        "sw_check again; loop until it returns OK. This compile-fix loop beats " ++
+        "single-shotting sw. Runs `swc emit` (parse + typecheck + codegen, no cc) " ++
+        "so it's fast and isolates sw-level mistakes.",
+        obj(%{
+            path: s("Path to the .sw file to verify (e.g. src/agent.sw)")
+        }, ["path"]))
 }
 
 fun log_wait_s() {
