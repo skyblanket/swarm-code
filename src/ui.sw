@@ -404,7 +404,6 @@ fun todo_render_loop(todos, acc) {
 fun todo_render_item(item) {
     status = map_get(item, 'status')
     content = map_get(item, 'content')
-    id_val = map_get(item, 'id')
     s = if (status == nil) { "pending" } else { to_string(status) }
     c = if (content == nil) { "(untitled)" } else { to_string(content) }
     todo_format_line(s, c)

@@ -95,7 +95,6 @@ fun launch(table, command, label) {
     task_id
 }
 
-# Shell-escape helper (single-quote wrap, escape embedded quotes).
 # Current status of a task.
 fun status(table, task_id) {
     s = ets_get(table, task_id ++ "/status")

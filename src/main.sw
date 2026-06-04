@@ -559,6 +559,12 @@ fun get_flag_value(args, flag) {
 # JSON-decoded maps have atom keys, so map_get(m, "gemma") on a map
 # saved as {"gemma": ...} won't match. Try direct first, then walk keys
 # and compare string forms.
+#
+# NOTE: config.sw has a parallel pair — map_get_either/find_by_string_key —
+# that does the same thing but without the nil-map guard here. The two exist
+# in separate modules and serve different callers; keep them in sync if the
+# core logic changes. The nil guard here is intentional: profile lookups can
+# receive nil when settings.json has no "profiles" key.
 fun lookup_string_key(m, key_string) {
     if (m == nil) { nil }
     else {
@@ -840,7 +846,7 @@ fun run_doctor() {
 
     # 3. settings.json
     print("\e[1m3. settings.json\e[0m")
-    settings_path = home ++ "/.swarm-code/settings.json"
+    settings_path = if (home == nil) { "~/.swarm-code/settings.json" } else { home ++ "/.swarm-code/settings.json" }
     settings = Config.load()
     if (settings == nil || length(map_keys(settings)) == 0) {
         print("   ⚠ no settings.json at " ++ settings_path ++ " — defaults will be used")
@@ -922,27 +928,31 @@ fun run_doctor() {
 
     # 6. Skills / memory inventory
     print("\e[1m6. inventory\e[0m")
-    sk_dir = home ++ "/.swarm-code/skills"
-    if (file_exists(sk_dir) == 'true') {
-        sk = file_list(sk_dir)
-        n_sk = count_subdirs_with(sk, sk_dir, "/SKILL.md", 0)
-        print("   ✓ skills:   " ++ to_string(n_sk))
+    if (home == nil) {
+        print("   ✗ $HOME not set — cannot inspect inventory")
     } else {
-        print("   - skills:   0  (dir not created yet)")
-    }
-    mem_dir = home ++ "/.swarm-code/memory"
-    if (file_exists(mem_dir) == 'true') {
-        ms = file_list(mem_dir)
-        n_m = count_md_excluding(ms, "MEMORY.md", 0)
-        print("   ✓ memories: " ++ to_string(n_m))
-    } else {
-        print("   - memories: 0  (dir not created yet)")
-    }
-    sess_dir = home ++ "/.swarm-code/sessions"
-    if (file_exists(sess_dir) == 'true') {
-        sf = file_list(sess_dir)
-        n_s = count_starting_with(sf, "journal-", 0)
-        print("   ✓ sessions: " ++ to_string(n_s) ++ " journals")
+        sk_dir = home ++ "/.swarm-code/skills"
+        if (file_exists(sk_dir) == 'true') {
+            sk = file_list(sk_dir)
+            n_sk = count_subdirs_with(sk, sk_dir, "/SKILL.md", 0)
+            print("   ✓ skills:   " ++ to_string(n_sk))
+        } else {
+            print("   - skills:   0  (dir not created yet)")
+        }
+        mem_dir = home ++ "/.swarm-code/memory"
+        if (file_exists(mem_dir) == 'true') {
+            ms = file_list(mem_dir)
+            n_m = count_md_excluding(ms, "MEMORY.md", 0)
+            print("   ✓ memories: " ++ to_string(n_m))
+        } else {
+            print("   - memories: 0  (dir not created yet)")
+        }
+        sess_dir = home ++ "/.swarm-code/sessions"
+        if (file_exists(sess_dir) == 'true') {
+            sf = file_list(sess_dir)
+            n_s = count_starting_with(sf, "journal-", 0)
+            print("   ✓ sessions: " ++ to_string(n_s) ++ " journals")
+        }
     }
     print("")
 

@@ -269,20 +269,7 @@ fun screenshot(session, path) {
     }}
 }
 
-# Local shell quoter (Tools.shell_quote isn't importable here without
-# pulling in the whole module). Uses single quotes; embedded ' becomes '\''.
-fun shell_quote_local(s) {
-    "'" ++ shell_quote_loop(s, 0, "") ++ "'"
-}
-
-fun shell_quote_loop(s, i, acc) {
-    if (i >= string_length(s)) { acc }
-    else {
-        ch = string_sub(s, i, 1)
-        next_acc = if (ch == "'") { acc ++ "'\\''" } else { acc ++ ch }
-        shell_quote_loop(s, i + 1, next_acc)
-    }
-}
+# shell quoting: use Util.shell_q (import Util at top of file if needed)
 
 # ------------------------------------------------------------
 # get_text / get_html / get_url / evaluate

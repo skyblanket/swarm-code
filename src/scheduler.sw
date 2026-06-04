@@ -43,7 +43,7 @@ export [
     load, add, remove, list_all, tick,
     schedule_path, jobs_dir,
     parse_expr, parse_interval, daily_time_ms, compute_next_fire,
-    swarm_binary_path
+    swarm_binary_path, prune_old_out_files
 ]
 
 fun schedule_path() { getenv("HOME") ++ "/.swarm-code/schedule.json" }
@@ -152,6 +152,8 @@ fun tick(opts) {
         updated = elem(r, 0)
         dirty = elem(r, 1)
         if (dirty == 'true') { save_all(updated) }
+        # Prune .out files older than 7 days so output doesn't accumulate unbounded.
+        prune_old_out_files()
         'ok'
     }
 }
@@ -173,8 +175,7 @@ fun tick_loop(jobs, now, acc, dirty) {
 # job with last_run + runs bumped.
 fun maybe_fire(job, now) {
     expr = to_string(map_get(job, 'expr'))
-    last = map_get(job, 'last_run')
-    last_run = if (last == nil) { 0 } else { last }
+    last_run = map_get(job, 'last_run', 0)
     next_fire = compute_next_fire(expr, last_run, now)
     if (next_fire == nil || next_fire > now) { {job, 'false'} }
     else {
@@ -315,6 +316,24 @@ fun previous_fire_alive(pid_file) {
             if (string_length(pid_str) == 0) { 'false' }
             else { pid_alive(pid_str) }
         }
+    }
+}
+
+# ------------------------------------------------------------
+# prune_old_out_files — delete .out files from jobs_dir() that are
+# older than 7 days. Called from tick() once per scheduler cycle so
+# scheduled-job output doesn't accumulate unbounded. Uses `find` with
+# -mtime +6 (modified more than 6*24h ago, i.e. >= 7 days old).
+# Silently skips if the dir doesn't exist or find fails.
+# ------------------------------------------------------------
+fun prune_old_out_files() {
+    dir = jobs_dir()
+    if (file_exists(dir) == 'false') { 'skipped' }
+    else {
+        cmd = "find " ++ Util.shell_q(dir) ++
+              " -maxdepth 1 -name 'scheduled-*.out' -mtime +6 -delete 2>/dev/null; true"
+        shell(cmd)
+        'pruned'
     }
 }
 

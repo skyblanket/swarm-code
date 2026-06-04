@@ -1627,8 +1627,7 @@ fun tool_crash_msg(name, reason) {
 # ------------------------------------------------------------
 fun handle_task_tool(args, opts) {
     prompt = map_get(args, 'prompt')
-    subtype_opt = map_get(args, 'subagent_type')
-    stype = if (subtype_opt == nil) { "general" } else { subtype_opt }
+    stype = map_get(args, 'subagent_type', "general")
 
     if (prompt == nil) {
         "error: task tool requires a 'prompt' argument"
@@ -1895,8 +1894,7 @@ fun show_schedule_loop(jobs) {
         id = to_string(map_get(j, 'id'))
         expr = to_string(map_get(j, 'expr'))
         prompt = to_string(map_get(j, 'prompt'))
-        runs_v = map_get(j, 'runs')
-        runs = if (runs_v == nil) { 0 } else { runs_v }
+        runs = map_get(j, 'runs', 0)
         print("  [" ++ id ++ "] " ++ expr ++ "  →  " ++
               preview_string(prompt, 70) ++
               UI.grey_text() ++ "  (" ++ to_string(runs) ++ " runs)" ++ UI.reset())

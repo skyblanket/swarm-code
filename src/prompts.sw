@@ -116,10 +116,17 @@ fun sw_pitfalls() {
     "`expect(val, msg)` (unwrap-or-panic). NO `throw`/`raise`. `hd`/`tl`/`elem` " ++
     "panic on empty/out-of-range — guard with a length check first; `map_get`/" ++
     "`ets_get` return `nil` for missing keys.\n" ++
-    "8. `fun` defines functions and lambdas — NOT `fn` (`fn` is not a keyword; " ++
-    "it compiles to `unknown function`). `main()` is the entry point; the " ++
-    "runtime EXITS when main returns (Go-style) — for a long-running server end " ++
-    "main with a permanent `receive { ... }`."
+    "8. `fun` defines named functions; `fn` is the INLINE LAMBDA keyword for " ++
+    "passing closures as arguments: `Std.map(list, fn(x) { x + 1 })`. Lambdas " ++
+    "defined with `fn` cannot self-recurse — for recursion use a top-level `fun`." ++
+    " `main()` is the entry point; the runtime EXITS when main returns (Go-style)" ++
+    " — for a long-running server end main with a permanent `receive { ... }`.\n" ++
+    "9. `map_get(m, key)` returns `nil` for missing keys (no crash) — use " ++
+    "`map_get(m, key, default)` (3-arg form) to get a default value and avoid " ++
+    "explicit nil-checks.\n" ++
+    "10. `spawn_monitor(fun_name)` returns a TUPLE `{pid, ref}` — always " ++
+    "destructure: `{pid, ref} = spawn_monitor(fun_name)`. Treating the return " ++
+    "as a bare pid will cause a type error."
 }
 
 fun sw_builtins() {
@@ -143,15 +150,40 @@ fun sw_builtins() {
     "exit_proc(pid, reason), trap_exit('true'). With trap_exit on, a linked " ++
     "child's death arrives as `{'EXIT', from, reason}` in your mailbox; " ++
     "monitor's is `{'DOWN', ref, 'process', pid, reason}`.\n" ++
+    "- spawn_monitor: `{pid, ref} = spawn_monitor(fun_name)` — spawn + monitor " ++
+    "in one call. Equivalent to spawn + monitor but atomic. Returns a tuple; " ++
+    "always destructure.\n" ++
+    "- DynSup (dynamic supervisor): `sup = dyn_supervisor()` creates a runtime " ++
+    "supervisor; `sup_start_child(sup, {name, fn, restart})` adds a supervised " ++
+    "child where restart is 'permanent'/'transient'/'temporary'.\n" ++
+    "- map_get/3: `map_get(m, key, default_val)` — returns default_val instead " ++
+    "of nil when key is missing. Use this to avoid nil-check boilerplate.\n" ++
     "- Stdlib: `import Std` (range/take/drop/zip/sort/group_by/sum/each/" ++
     "string_join/...), `import Mcp` (MCP client+server), `import Embed`+`import " ++
     "Vec` (embeddings + vector store), `import Prompt` ({{var}} templates), " ++
-    "`import Cron` (Cron.every(ms, fn), Cron.in_ms), `import Telemetry`."
+    "`import Cron` (Cron.every(ms, fn), Cron.in_ms), `import Telemetry`.\n" ++
+    "- import Record: named structured data — `Record.new(%{field: val})` creates" ++
+    " a record; `Record.build(proto, %{field: val})` derives one; access fields " ++
+    "with `.field` syntax.\n" ++
+    "- import Swarm: `Swarm.top()` lists all running processes; `Swarm.tree()` " ++
+    "renders the supervision tree. COMPILED-ONLY — not available in the REPL.\n" ++
+    "- import Math: sqrt, sin, cos, pow, floor, ceil, round, float, pi — " ++
+    "standard numeric math. E.g. `Math.sqrt(2.0)`, `Math.pi`."
 }
 
 fun sw_capabilities() {
     "NEW AGENT-BUILDING CAPABILITIES (these landed recently — use them, they " ++
     "are real):\n" ++
+    "- with error-chain (CONFIRMED working): thread fallible steps without " ++
+    "nested ifs. Each `<-` pattern-matches the 'ok' branch; any mismatch jumps " ++
+    "to the `else` block:\n" ++
+    "    with {'ok', x} <- step(\"a\", a),\n" ++
+    "         {'ok', y} <- step(\"b\", b) {\n" ++
+    "      {'ok', x + y}\n" ++
+    "    } else {\n" ++
+    "      {'error', why} -> f\"failed at {why}\"\n" ++
+    "    }\n" ++
+    "  The else block is a case-like match on the first non-ok return.\n" ++
     "- bytes type: a length-carrying, NUL-safe byte vector (`typeof` → " ++
     "\"bytes\") for raw binary (audio frames, protocol bytes). Values come from " ++
     "builtins, never a literal. bytes_from_base64(s) / bytes_to_base64(b), " ++
@@ -184,14 +216,21 @@ fun sw_verify() {
     "After you write or edit ANY .sw file, call the `sw_check` tool on it " ++
     "BEFORE telling the user it's done. sw's compiler is loud and precise: it " ++
     "names src/Module.sw:LINE and gives a did-you-mean fix (e.g. `use ++ to " ++
-    "concatenate`, `filter is a global builtin, not Std.filter`, `fn is not a " ++
-    "keyword`). On a COMPILE ERROR, fix the exact line the compiler points at, " ++
-    "then call sw_check again. Loop until it returns OK. Trust the error " ++
-    "message — it is almost always literally telling you the idiom. This " ++
-    "compile-then-fix loop is how you produce correct sw; do not single-shot " ++
-    "and assume it's right. When the file is part of a project with a Makefile " ++
-    "(swarm-code itself, or any swarmrt app), also run `make` / `make test` " ++
-    "via bash to confirm the whole build stays green."
+    "concatenate`, `filter is a global builtin, not Std.filter`). On a COMPILE " ++
+    "ERROR, fix the exact line the compiler points at, then call sw_check again. " ++
+    "Loop until it returns OK. Trust the error message — it is almost always " ++
+    "literally telling you the idiom. This compile-then-fix loop is how you " ++
+    "produce correct sw; do not single-shot and assume it's right. When the file " ++
+    "is part of a project with a Makefile (swarm-code itself, or any swarmrt " ++
+    "app), also run `make` / `make test` via bash to confirm the whole build " ++
+    "stays green.\n" ++
+    "Common new-feature pitfalls caught at compile time:\n" ++
+    "- `map_get(m, key)` (2-arg) returns nil on miss — NOT a crash. Use " ++
+    "`map_get(m, key, default)` (3-arg) to supply a default and skip the " ++
+    "nil-check.\n" ++
+    "- `spawn_monitor(f)` returns `{pid, ref}` tuple, not a bare pid. Always " ++
+    "destructure: `{pid, ref} = spawn_monitor(f)` — assigning to a plain " ++
+    "variable and then using it as a pid will fail."
 }
 
 fun preamble() {
@@ -464,13 +503,6 @@ fun heartbeat_desc() {
     "- heartbeat_status: Query the background pulse (tick count, uptime, last " ++
     "tick time). The heartbeat is a sw process spawned at startup that runs " ++
     "in the swarmrt runtime alongside the conversation.\n" ++
-    "  schema: {}"
-}
-
-fun context_meter_desc() {
-    "- context_meter: Query the current context-window usage — message count, " ++
-    "estimated tokens consumed, budget, remaining tokens, and whether " ++
-    "auto-compaction is imminent. No arguments.\n" ++
     "  schema: {}"
 }
 

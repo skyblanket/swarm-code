@@ -1412,8 +1412,7 @@ fun extract_usage(resp_body) {
     decoded = json_decode(resp_body)
     if (decoded == nil) { nil }
     else {
-        usage = map_get(decoded, 'usage')
-        if (usage == nil) { nil } else { usage }
+        map_get(decoded, 'usage', nil)
     }
 }
 

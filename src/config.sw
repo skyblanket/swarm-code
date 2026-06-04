@@ -323,6 +323,10 @@ fun run_hooks(event, tool_name, args_json, opts) {
 
 # Look up a key in a map, trying string key first then comparing every
 # key's string form. Handles the atom-vs-string mismatch from json_decode.
+#
+# NOTE: main.sw has a parallel pair — lookup_string_key/find_key_by_string —
+# with the same logic plus an extra nil-map guard. Keep the core walk in sync
+# if the algorithm changes; the nil guard lives there, not here.
 fun map_get_either(m, key_string) {
     direct = map_get(m, key_string)
     if (direct != nil) {
@@ -406,5 +410,3 @@ fun run_hook_cmd(cmd, event, tool_name, args_json) {
     code = elem(result, 0)
     if (code == 0) { 'ok' } else { 'block' }
 }
-
-# Local single-quote wrap (Config can't import Tools — circular).
