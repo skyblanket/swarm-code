@@ -133,7 +133,7 @@ fun try_mocha(output) {
 
 # pytest: "5 failed, 10 passed in 0.3s"
 fun try_pytest(output) {
-  if (string_contains(output, " passed in ") || string_contains(output, "failed")) {
+  if (string_contains(output, " passed in ")) {
     failed = extract_number_before(output, " failed")
     passed = extract_number_before(output, " passed")
     skipped = extract_number_before(output, " skipped")
