@@ -28,6 +28,7 @@ import Mcp
 import ToolGuardrails
 import Agent
 import Scheduler
+import Plan
 
 fun main() {
     print("")
@@ -78,7 +79,14 @@ fun main() {
         t_hardline_telinit(),
         t_has_markdown_tightened(),
         t_markdown_link(),
-        t_markdown_table_clamps()
+        t_markdown_table_clamps(),
+        t_plan_auto_trigger_fires(),
+        t_plan_auto_trigger_skips_question(),
+        t_plan_auto_trigger_skips_short(),
+        t_plan_auto_trigger_skips_slash(),
+        t_plan_inject_into_history(),
+        t_plan_get_mode_default(),
+        t_plan_get_mode_explicit()
     ]
 
     passed = sum_list(results, 0)
@@ -803,4 +811,66 @@ fun t_markdown_table_clamps() {
         string_contains(r, "…"),
         if (string_contains(r, "│") == 'true') { 'true' } else { 'false' })
     check("render_table clamps wide cells to terminal width (has ellipsis + separator)", ok)
+}
+
+# ------------------------------------------------------------
+# Plan — regression guards for plan mode logic
+# ------------------------------------------------------------
+
+# "implement JWT auth in src/auth.sw" contains the action keyword
+# "implement" and a file reference — must trigger auto mode.
+fun t_plan_auto_trigger_fires() {
+    result = Plan.auto_trigger("implement JWT auth in src/auth.sw")
+    check("plan auto_trigger: fires on 'implement auth'",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# A pure question must never trigger the plan flow.
+fun t_plan_auto_trigger_skips_question() {
+    result = Plan.auto_trigger("what does this function do?")
+    check("plan auto_trigger: skips questions",
+          if (result == 'false') { 'true' } else { 'false' })
+}
+
+# Very short messages (fewer than 5 words) must be skipped.
+fun t_plan_auto_trigger_skips_short() {
+    result = Plan.auto_trigger("ok")
+    check("plan auto_trigger: skips short messages",
+          if (result == 'false') { 'true' } else { 'false' })
+}
+
+# Slash commands must never trigger the plan flow.
+fun t_plan_auto_trigger_skips_slash() {
+    result = Plan.auto_trigger("/help")
+    check("plan auto_trigger: skips /slash commands",
+          if (result == 'false') { 'true' } else { 'false' })
+}
+
+# inject_into_history appends exactly one assistant message whose
+# content contains "Plan confirmed".
+fun t_plan_inject_into_history() {
+    history = [%{role: 'user', content: 'hello'}]
+    result = Plan.inject_into_history(history, "1. Do X\n2. Do Y", "implement X")
+    len_ok = if (length(result) == 2) { 'true' } else { 'false' }
+    second = hd(tl(result))
+    role_ok = if (map_get(second, 'role') == 'assistant') { 'true' } else { 'false' }
+    content_ok = string_contains(to_string(map_get(second, 'content')), "Plan confirmed")
+    ok = bool_and3(len_ok, role_ok, content_ok)
+    check("plan inject_into_history: appends plan message", ok)
+}
+
+# When opts has no 'plan_mode' key, get_mode must return "auto".
+fun t_plan_get_mode_default() {
+    opts = %{model: "test"}
+    result = Plan.get_mode(opts)
+    check("plan get_mode: defaults to auto",
+          if (result == "auto") { 'true' } else { 'false' })
+}
+
+# When opts has plan_mode: "on", get_mode must return "on".
+fun t_plan_get_mode_explicit() {
+    opts = %{plan_mode: "on"}
+    result = Plan.get_mode(opts)
+    check("plan get_mode: reads plan_mode key",
+          if (result == "on") { 'true' } else { 'false' })
 }

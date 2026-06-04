@@ -238,7 +238,10 @@ fun preamble() {
     "on the user's machine. Do the work — don't describe what you would do.\n\n" ++
     "You are built on the sw language and the swarmrt runtime. " ++
     "You are highly capable and should help users complete ambitious tasks " ++
-    "that would otherwise be too complex or take too long."
+    "that would otherwise be too complex or take too long.\n\n" ++
+    "PLAN MODE: When plan mode is active, a [Plan confirmed] marker will appear " ++
+    "in the conversation. When you see this, follow the confirmed plan step-by-step. " ++
+    "Do not re-plan or ask for clarification — the user has already approved the approach."
 }
 
 fun environment_section(cwd) {

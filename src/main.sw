@@ -364,6 +364,7 @@ fun print_usage() {
     print("  SWARM_CODE_TOOL_FORMAT   native | inband (else auto-detected)")
     print("  SWARM_CODE_ALLOW_REMOTE  set to 1 to permit non-local endpoints")
     print("  SWARM_CODE_CWD           working directory shown to the model")
+    print("  SWARM_CODE_PLAN=auto|on|off   plan mode (default: auto)")
     print("")
     print("  Profiles: add a \"profiles\" map to settings.json, e.g.")
     print("    \"profiles\": {")
@@ -402,6 +403,7 @@ fun print_config() {
     print("  tool_format  " ++ to_string(map_get(o, 'tool_format')))
     print("  temperature  " ++ to_string(map_get(o, 'temperature')))
     print("  max_tokens   " ++ to_string(map_get(o, 'max_tokens')))
+    print("  plan_mode    " ++ to_string(map_get(o, 'plan_mode')))
     print("  cwd          " ++ resolve_cwd())
 }
 
@@ -495,6 +497,16 @@ fun load_opts() {
     chat_template_kwargs = if (eb_prof != nil) { eb_prof }
                            else { if (eb_set != nil) { eb_set } else { nil }}
 
+    # Plan mode: controls when a planning step is shown before execution.
+    # on   — always show a plan before executing
+    # off  — never show a plan
+    # auto — show plan only for complex requests (default)
+    # Env override: SWARM_CODE_PLAN=on|off|auto
+    plan_env = getenv("SWARM_CODE_PLAN")
+    plan_mode = if (plan_env == "on") { "on" }
+                else { if (plan_env == "off") { "off" }
+                else { "auto" }}
+
     %{
         endpoint: endpoint,
         model: model,
@@ -503,7 +515,8 @@ fun load_opts() {
         max_tokens: max_tokens,
         tool_format: tool_format,
         chat_template_kwargs: chat_template_kwargs,
-        profile: profile_name
+        profile: profile_name,
+        plan_mode: plan_mode
     }
 }
 

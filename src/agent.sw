@@ -38,6 +38,7 @@ import ToolRegistry
 import Trajectory
 import Util
 import ToolGuardrails
+import Plan
 
 export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS]
 
@@ -434,13 +435,55 @@ fun route_input(line, history, opts) {
             # drag-drop / path-paste pattern — no read_image call needed.
             attached = Vision.auto_attach(opts, line)
             print_attachment_summary(attached)
-            new_hist = list_append(history, LLM.new_message_user(line))
-            pre_turn_hist = if (length(new_hist) > compact_threshold()) {
-                print("\e[2m[auto-compacting " ++ to_string(length(new_hist)) ++ " messages]\e[0m")
-                compact_history(new_hist, opts)
-            } else { new_hist }
-            run_turn(pre_turn_hist, opts, 0)
+            # Plan mode: optionally generate and confirm a step-by-step plan
+            # before calling the LLM with tools. Delegated to plan_gate/3
+            # which returns either a ready history (user msg + plan injected)
+            # or the sentinel atom 'cancelled' when the user declines.
+            gated = plan_gate(line, history, opts)
+            if (gated == 'cancelled') {
+                history
+            } else {
+                pre_turn_hist = if (length(gated) > compact_threshold()) {
+                    print("\e[2m[auto-compacting " ++ to_string(length(gated)) ++ " messages]\e[0m")
+                    compact_history(gated, opts)
+                } else { gated }
+                run_turn(pre_turn_hist, opts, 0)
+            }
         }}}}
+    }
+}
+
+# Plan gate — generates, displays, and confirms a plan before execution.
+# Returns the ready history (user message + plan assistant msg appended)
+# or the atom 'cancelled' when the user declines.
+# Uses Plan.is_active/2 to decide whether to trigger.
+fun plan_gate(line, history, opts) {
+    # Add the user message to history first — plan confirmation comes after.
+    with_user = list_append(history, LLM.new_message_user(line))
+    headless = map_get(opts, 'headless')
+    is_sub = map_get(opts, 'is_subagent')
+    # Never run plan mode in headless or subagent contexts.
+    active = if (headless == 'true' || is_sub == 'true') { 'false' }
+             else { Plan.is_active(line, opts) }
+    if (active != 'true') {
+        with_user
+    } else {
+        print("\e[2m[plan: generating…]\e[0m")
+        plan_text = Plan.generate(line, history, opts)
+        if (plan_text == nil) {
+            print("\e[2m[plan: skipped — no plan generated]\e[0m")
+            with_user
+        } else {
+            Plan.display(plan_text)
+            confirm_result = Plan.confirm()
+            if (confirm_result == 'no') {
+                'cancelled'
+            } else {
+                revised = if (confirm_result == 'yes') { plan_text }
+                          else { elem(confirm_result, 1) }
+                Plan.inject_into_history(with_user, revised, line)
+            }
+        }
     }
 }
 
@@ -614,6 +657,20 @@ fun slash_dispatch(cmd, history, opts) {
         clear_profile_override()
         history
     }
+    else { if (cmd == "/plan") { Plan.show_mode(opts) ; history }
+    else { if (string_starts_with(cmd, "/plan ") == 'true') {
+        plan_arg = string_trim(string_sub(cmd, 6, string_length(cmd) - 6))
+        if (plan_arg == "on" || plan_arg == "off" || plan_arg == "auto") {
+            p = Plan.plan_mode_override_path()
+            if (p != nil) { file_write(p, plan_arg) }
+            print(UI.brand_color() ++ "✓ plan mode set to " ++ plan_arg ++ UI.reset())
+            print(UI.grey_text() ++ "  takes effect on next request. " ++
+                  "Use /plan to check." ++ UI.reset())
+        } else {
+            print("\e[33musage: /plan [on | off | auto]\e[0m")
+        }
+        history
+    }
     else { if (string_starts_with(cmd, "/search ") == 'true') {
         query = string_trim(string_sub(cmd, 8, string_length(cmd) - 8))
         if (string_length(query) == 0) {
@@ -774,7 +831,7 @@ fun slash_dispatch(cmd, history, opts) {
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -784,6 +841,8 @@ fun show_help() {
     print("  /tools                list available tools")
     print("  /todos                show todo list")
     print("  /mcp                  list MCP servers and their tools")
+    print("  /plan                 show plan mode (on/off/auto)")
+    print("  /plan on|off|auto     set plan mode for this session")
     print("  /model                show active model")
     print("  /model NAME           swap model name for this session")
     print("  /profile              show active profile override (if any)")
@@ -818,6 +877,7 @@ fun show_status(history, opts) {
     print("  model    : " ++ to_string(map_get(opts, 'model')))
     print("  endpoint : " ++ to_string(map_get(opts, 'endpoint')))
     print("  cwd      : " ++ to_string(map_get(opts, 'cwd')))
+    print("  plan     : " ++ Plan.get_mode(opts))
     print("  messages : " ++ to_string(length(history)))
     print("  ~tokens  : " ++ to_string(approx_tokens(history)))
 }
@@ -1713,7 +1773,7 @@ fun run_subagent_loop(history, opts, step) {
 # subagent can't quietly mutate the user's environment.
 fun SUBAGENT_BLOCKED_TOOLS() {
     ["task", "remember", "forget", "learn_skill", "forget_skill",
-     "bg_server", "browser_launch", "git_commit", "todo_write"]
+     "bg_server", "browser_launch", "git_commit", "todo_write", "plan_check"]
 }
 
 fun subagent_blocked(name) {
@@ -1995,10 +2055,11 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/daemon") { 'true' }
     else { if (cmd == "/reflect") { 'true' }
     else { if (cmd == "/mcp") { 'true' }
+    else { if (cmd == "/plan") { 'true' }
     else { if (cmd == "/quit") { 'true' }
     else { if (cmd == "/exit") { 'true' }
     else { if (cmd == "/reset") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # String → atom for tool dispatch. Was a ~50-case if/else; now a
