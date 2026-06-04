@@ -29,6 +29,7 @@ import Browser
 import Mcp
 import Util
 import TestRunner
+import TestRunner
 
 export [exec, max_output_bytes]
 

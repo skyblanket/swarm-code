@@ -314,6 +314,7 @@ fun tool_descriptions() {
     git_status_desc() ++ "\n" ++
     git_diff_desc() ++ "\n" ++
     git_commit_desc() ++ "\n" ++
+    run_tests_desc() ++ "\n" ++
     code_search_desc() ++ "\n" ++
     sw_check_desc() ++ "\n" ++
     log_wait_desc() ++ "\n" ++
@@ -531,6 +532,14 @@ fun git_commit_desc() {
     "  schema: {\"message\":\"string\",\"files\":\"[string] (optional)\",\"cwd\":\"string (optional)\"}"
 }
 
+fun run_tests_desc() {
+    "- run_tests: Run tests in a repo and auto-detect framework (jest, mocha, " ++
+    "pytest, vitest, custom). ALWAYS call this BEFORE git_commit on any code " ++
+    "change. If tests fail, fix them before committing. Returns parsed pass/fail " ++
+    "counts plus raw output on failure.\n" ++
+    "  schema: {\"repo_path\":\"/abs/path\",\"command\":\"npm test (optional)\"}"
+}
+
 fun code_search_desc() {
     "- code_search: Fast symbol search via ripgrep (grep fallback). kind=\"def\" " ++
     "finds function/class definitions, kind=\"ref\" finds all occurrences " ++
@@ -714,7 +723,9 @@ fun rules() {
     "- If a task needs information, actually call the tool — NEVER make up file " ++
     "contents, command output, or URLs.\n" ++
     "- If an approach fails, diagnose why before switching. Don't retry blindly.\n" ++
-    "- Use absolute paths in tool arguments.\n\n" ++
+    "- Use absolute paths in tool arguments.\n" ++
+    "- ALWAYS run_tests BEFORE git_commit when you have modified code. Fix " ++
+    "failures before committing.\n\n" ++
     "# Safety\n" ++
     "- Destructive OS actions (rm -rf /, force push to main, dropping prod tables): " ++
     "ask first. Everything else: just do it.\n" ++

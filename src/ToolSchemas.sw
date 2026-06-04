@@ -27,7 +27,7 @@ fun all_schemas() {
      remember_s(), recall_s(), memory_list_s(), forget_s(),
      learn_skill_s(), recall_skill_s(), skill_list_s(), forget_skill_s(),
      session_search_s(), read_image_s(),
-     git_status_s(), git_diff_s(), git_commit_s(), code_search_s(),
+     git_status_s(), git_diff_s(), git_commit_s(), run_tests_s(), code_search_s(),
      sw_check_s(),
      log_wait_s(), file_watch_s(),
      background_s(), bg_status_s(), bg_result_s(), bg_tail_s(),
@@ -395,6 +395,18 @@ fun git_commit_s() {
             files: arr(s("A path to stage"), "Optional: paths to stage (defaults to all changes)"),
             cwd: s("Optional: repo directory (defaults to cwd)")
         }, ["message"]))
+}
+
+fun run_tests_s() {
+    tool("run_tests",
+        "Run tests in a repository, auto-detect the test framework (jest, mocha, " ++
+        "pytest, vitest, or custom PASS/FAIL/TOTAL output), and return parsed " ++
+        "results. ALWAYS call this BEFORE git_commit when you have made code " ++
+        "changes. If tests fail, fix them before committing.",
+        obj(%{
+            repo_path: s("Absolute path to the repository root"),
+            command: s("Optional: test command to run (defaults to npm test, pytest, etc)")
+        }, ["repo_path"]))
 }
 
 fun code_search_s() {
