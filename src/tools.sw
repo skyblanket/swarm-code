@@ -1065,10 +1065,38 @@ fun ddg_python_script() {
 }
 
 # ------------------------------------------------------------
-# run_tests — detect and run the project's test suite
+# run_tests  parse and gate on test output from any framework
 # ------------------------------------------------------------
+# args: {"repo_path": "/path/to/repo", "command": "npm test" (optional)}
 fun do_run_tests(args) {
-    TestRunner.run_tests(args)
+    repo = map_get(args, 'repo_path')
+    cmd = map_get(args, 'command')
+    if (repo == nil) { "error: run_tests needs 'repo_path'" }
+    else {
+        command = if (cmd == nil) { "" } else { to_string(cmd) }
+        result = TestRunner.run_tests(to_string(repo), command)
+        fw = map_get(result, 'framework')
+        passed = map_get(result, 'passed')
+        failed = map_get(result, 'failed')
+        total = map_get(result, 'total')
+        exit_code = map_get(result, 'exit_code')
+        raw = map_get(result, 'raw')
+        summary = "Framework: " ++ fw ++ "\n" ++
+                  "Passed: " ++ to_string(passed) ++ "\n" ++
+                  "Failed: " ++ to_string(failed) ++ "\n" ++
+                  "Total: " ++ to_string(total) ++ "\n" ++
+                  "Exit code: " ++ to_string(exit_code)
+        if (failed > 0) {
+            tail = if (string_length(raw) > 2000) {
+                string_sub(raw, string_length(raw) - 2000, 2000)
+            } else {
+                raw
+            }
+            summary ++ "\n\n--- raw output (last 2000 chars) ---\n" ++ tail
+        } else {
+            summary
+        }
+    }
 }
 
 # ------------------------------------------------------------
