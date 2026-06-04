@@ -28,6 +28,7 @@ import Telemetry
 import Browser
 import Mcp
 import Util
+import TestRunner
 
 export [exec, max_output_bytes]
 
@@ -105,6 +106,7 @@ fun all_tools() {
         %{atom: 'git_status',         handler: fun(args, opts) { do_git_status(args) }},
         %{atom: 'git_diff',           handler: fun(args, opts) { do_git_diff(args) }},
         %{atom: 'git_commit',         handler: fun(args, opts) { do_git_commit(args) }},
+        %{atom: 'run_tests',          handler: fun(args, opts) { do_run_tests(args) }},
         %{atom: 'code_search',        handler: fun(args, opts) { do_code_search(args) }},
         %{atom: 'sw_check',           handler: fun(args, opts) { do_sw_check(args) }},
         %{atom: 'log_wait',           handler: fun(args, opts) { do_log_wait(args, opts) }},
@@ -1059,6 +1061,13 @@ fun ddg_python_script() {
     "  except Exception as e:\n" ++
     "    sys.stderr.write('wiki failed: '+str(e)+'\\n')\n" ++
     "print(json.dumps(results))\n"
+}
+
+# ------------------------------------------------------------
+# run_tests — detect and run the project's test suite
+# ------------------------------------------------------------
+fun do_run_tests(args) {
+    TestRunner.run_tests(args)
 }
 
 # ------------------------------------------------------------
