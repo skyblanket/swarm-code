@@ -353,9 +353,12 @@ fun generate(user_msg, history, opts) {
     user_wire = %{role: "user", content: to_string(user_msg)}
     wire_msgs = [sys_wire] ++ plan_msgs_to_wire(context_msgs, []) ++ [user_wire]
 
+    # Use the model's configured temperature — some providers (Kimi K2) reject
+    # temperature:0 and require exactly 1.0. Fall back to 0 only for unknown models.
+    temp = map_get(opts, 'temperature')
     req = %{
         model: model,
-        temperature: 0,
+        temperature: if (temp != nil) { temp } else { 0 },
         max_tokens: 1024,
         stream: 'false',
         messages: wire_msgs

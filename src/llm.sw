@@ -860,7 +860,7 @@ fun retry_delay_ms(attempt) {
     # Provides reproducible spread without needing a PRNG — each attempt
     # gets a fixed offset so a fleet of agents retrying attempt 0 all at
     # the same ms won't collide on a single delay value.
-    jitter = (attempt * 7919 + 3571) mod 401
+    jitter = (attempt * 7919 + 3571) % 401
     base + jitter
 }
 
@@ -886,7 +886,11 @@ fun chat_native_retry(messages, opts, attempt) {
                 fb_opts2 = if (fb_model != nil) { map_put(fb_opts,  'model',       to_string(fb_model)) } else { fb_opts  }
                 fb_opts3 = if (fb_key   != nil) { map_put(fb_opts2, 'api_key',     to_string(fb_key))   } else { fb_opts2 }
                 fb_opts4 = if (fb_tf    != nil) { map_put(fb_opts3, 'tool_format', fb_tf)               } else { fb_opts3 }
-                chat_native(messages, fb_opts4)
+                # Re-dispatch through chat_native/chat_inband based on the fallback's tool_format,
+                # not the primary's — prevents sending a native request to an inband endpoint.
+                fb_format = map_get(fb_opts4, 'tool_format')
+                if (fb_format == 'inband') { chat_inband(messages, fb_opts4) }
+                else { chat_native(messages, fb_opts4) }
             } else {
                 print("  \e[38;5;208m✗ llm call failed after " ++
                       to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
@@ -932,7 +936,9 @@ fun chat_inband_retry(messages, opts, attempt) {
                 fb_opts2 = if (fb_model != nil) { map_put(fb_opts,  'model',       to_string(fb_model)) } else { fb_opts  }
                 fb_opts3 = if (fb_key   != nil) { map_put(fb_opts2, 'api_key',     to_string(fb_key))   } else { fb_opts2 }
                 fb_opts4 = if (fb_tf    != nil) { map_put(fb_opts3, 'tool_format', fb_tf)               } else { fb_opts3 }
-                chat_inband(messages, fb_opts4)
+                fb_format = map_get(fb_opts4, 'tool_format')
+                if (fb_format == 'native') { chat_native(messages, fb_opts4) }
+                else { chat_inband(messages, fb_opts4) }
             } else { result }
         } else { result }
     }
@@ -941,6 +947,27 @@ fun chat_inband_retry(messages, opts, attempt) {
 fun is_transport_truncated(content) {
     if (string_contains(content, "[Response cut off by transport timeout") == 'true') { 'true' }
     else { 'false' }
+}
+
+# unwrap_stream — http_post_stream returns {'ok, json_str} or {'error, reason}.
+# Old swarmrt returned a bare string; new builds return a 2-tuple.
+# This helper normalises both forms to a bare JSON string (or nil on error).
+fun unwrap_stream(raw) {
+    if (raw == nil) { nil }
+    else {
+        tag = elem(raw, 0)
+        if (tag == 'ok') { elem(raw, 1) }
+        else {
+            # tag is the error atom (not 'ok). elem(raw,1) = reason string.
+            # If elem returns nil the runtime doesn't support tagged tuples
+            # and raw is a bare JSON string — pass it through unchanged.
+            inner = elem(raw, 1)
+            if (inner != nil) {
+                Log.llm_error("stream error", to_string(inner))
+                nil
+            } else { raw }
+        }
+    }
 }
 
 # ============================================================
@@ -964,7 +991,7 @@ fun chat_native(messages, opts) {
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     record_fail(opts, "fail")
-    resp = http_post_stream(url, hdrs, body)
+    resp = unwrap_stream(http_post_stream(url, hdrs, body))
     latency = timestamp() - start_ms
 
     if (resp == nil) {
@@ -1092,7 +1119,7 @@ fun chat_inband(messages, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = http_post_stream(url, hdrs, body)
+    resp = unwrap_stream(http_post_stream(url, hdrs, body))
     latency = timestamp() - start_ms
 
     if (resp == nil) {
@@ -1315,7 +1342,7 @@ fun chat_for_subagent(messages, opts, target_pid, name) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = http_post_stream(url, hdrs, body, target_pid, name)
+    resp = unwrap_stream(http_post_stream(url, hdrs, body, target_pid, name))
     latency = timestamp() - start_ms
 
     if (resp == nil) {
