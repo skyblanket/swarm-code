@@ -525,7 +525,32 @@ fun load_opts() {
     embed_model_raw= getenv("SWARM_CODE_EMBED_MODEL")
     embed_model    = if (embed_model_raw == nil) { "text-embedding-ada-002" } else { embed_model_raw }
 
-    fallback_endpoint = getenv("SWARM_CODE_FALLBACK_ENDPOINT")
+    # Fallback profile: when the primary endpoint fails all retries, swap to
+    # a secondary profile. Env SWARM_CODE_FALLBACK_ENDPOINT wins; otherwise
+    # resolve settings.json "fallback_profile" → that profile's full config.
+    fb_ep_env  = getenv("SWARM_CODE_FALLBACK_ENDPOINT")
+    fb_pname   = if (settings == nil) { nil } else { map_get(settings, 'fallback_profile') }
+    fb_profile = if (fb_pname == nil || profiles == nil) { nil }
+                 else { lookup_string_key(profiles, to_string(fb_pname)) }
+    fallback_endpoint = if (fb_ep_env != nil) { fb_ep_env }
+                        else { if (fb_profile != nil) {
+                            fep = map_get(fb_profile, 'endpoint')
+                            if (fep != nil) { to_string(fep) } else { nil }
+                        } else { nil }}
+    fallback_model = if (fb_profile != nil) {
+                         fm = map_get(fb_profile, 'model')
+                         if (fm != nil) { to_string(fm) } else { nil }
+                     } else { nil }
+    fallback_key = if (fb_profile != nil) {
+                       fk = map_get(fb_profile, 'api_key')
+                       if (fk != nil) { to_string(fk) } else { nil }
+                   } else { nil }
+    fallback_tool_format = if (fb_profile != nil) {
+                               ftf = map_get(fb_profile, 'tool_format')
+                               if (ftf == nil) { nil }
+                               else { tfs = to_string(ftf)
+                                      if (tfs == "native") { 'native' } else { 'inband' }}
+                           } else { nil }
 
     %{
         endpoint: endpoint,
@@ -540,7 +565,10 @@ fun load_opts() {
         embed_endpoint: embed_endpoint,
         embed_api_key:  embed_key,
         embed_model:    embed_model,
-        fallback_endpoint: fallback_endpoint
+        fallback_endpoint:    fallback_endpoint,
+        fallback_model:       fallback_model,
+        fallback_key:         fallback_key,
+        fallback_tool_format: fallback_tool_format
     }
 }
 

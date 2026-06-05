@@ -879,11 +879,14 @@ fun chat_native_retry(messages, opts, attempt) {
             fb = map_get(opts, 'fallback_endpoint')
             if (fb != nil) {
                 print("  [llm] retrying on fallback endpoint...")
-                fb_key = map_get(opts, 'fallback_key')
-                fb_opts = map_put(opts, 'endpoint', to_string(fb))
-                fb_opts2 = if (fb_key != nil) { map_put(fb_opts, 'api_key', to_string(fb_key)) }
-                           else { fb_opts }
-                chat_native(messages, fb_opts2)
+                fb_key   = map_get(opts, 'fallback_key')
+                fb_model = map_get(opts, 'fallback_model')
+                fb_tf    = map_get(opts, 'fallback_tool_format')
+                fb_opts  = map_put(opts, 'endpoint', to_string(fb))
+                fb_opts2 = if (fb_model != nil) { map_put(fb_opts,  'model',       to_string(fb_model)) } else { fb_opts  }
+                fb_opts3 = if (fb_key   != nil) { map_put(fb_opts2, 'api_key',     to_string(fb_key))   } else { fb_opts2 }
+                fb_opts4 = if (fb_tf    != nil) { map_put(fb_opts3, 'tool_format', fb_tf)               } else { fb_opts3 }
+                chat_native(messages, fb_opts4)
             } else {
                 print("  \e[38;5;208m✗ llm call failed after " ++
                       to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
@@ -922,11 +925,14 @@ fun chat_inband_retry(messages, opts, attempt) {
             fb = map_get(opts, 'fallback_endpoint')
             if (fb != nil) {
                 print("  [llm] retrying on fallback endpoint...")
-                fb_key = map_get(opts, 'fallback_key')
-                fb_opts = map_put(opts, 'endpoint', to_string(fb))
-                fb_opts2 = if (fb_key != nil) { map_put(fb_opts, 'api_key', to_string(fb_key)) }
-                           else { fb_opts }
-                chat_inband(messages, fb_opts2)
+                fb_key   = map_get(opts, 'fallback_key')
+                fb_model = map_get(opts, 'fallback_model')
+                fb_tf    = map_get(opts, 'fallback_tool_format')
+                fb_opts  = map_put(opts, 'endpoint', to_string(fb))
+                fb_opts2 = if (fb_model != nil) { map_put(fb_opts,  'model',       to_string(fb_model)) } else { fb_opts  }
+                fb_opts3 = if (fb_key   != nil) { map_put(fb_opts2, 'api_key',     to_string(fb_key))   } else { fb_opts2 }
+                fb_opts4 = if (fb_tf    != nil) { map_put(fb_opts3, 'tool_format', fb_tf)               } else { fb_opts3 }
+                chat_inband(messages, fb_opts4)
             } else { result }
         } else { result }
     }

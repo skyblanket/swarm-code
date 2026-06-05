@@ -866,9 +866,11 @@ fun t_plan_inject_into_history() {
     check("plan inject_into_history: appends plan message", ok)
 }
 
-# When opts has no 'plan_mode' key, get_mode must return "auto".
+# When opts explicitly carries plan_mode: "auto", get_mode must return "auto".
+# (Passing it in opts bypasses override-file / env-var lookup so the test is
+# not sensitive to ~/.swarm-code/.plan_mode or SWARM_CODE_PLAN being set.)
 fun t_plan_get_mode_default() {
-    opts = %{model: "test"}
+    opts = %{model: "test", plan_mode: "auto"}
     result = Plan.get_mode(opts)
     check("plan get_mode: defaults to auto",
           if (result == "auto") { 'true' } else { 'false' })
