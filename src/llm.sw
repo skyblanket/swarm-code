@@ -852,22 +852,16 @@ fun last_fail(opts) {
 }
 
 fun retry_delay_ms(attempt) {
-    base = 1000
-    cap = 30000
-    # Pow-of-two with cap.
-    raw = if (attempt == 0) { base }
-          else { if (attempt == 1) { base * 2 }
-          else { if (attempt == 2) { base * 4 }
-          else { if (attempt == 3) { base * 8 }
-          else { cap }}}}
-    bounded = if (raw > cap) { cap } else { raw }
-    # Jitter: multiplicative 1.0 .. 1.5 via true per-call entropy. random_int
-    # is arc4random-backed (per-process, unseeded-shared), so a fleet of
-    # agents that hit a 5xx in the same millisecond no longer compute an
-    # identical delay and retry in lockstep — which the old timestamp-low-bits
-    # jitter did exactly when thundering-herd break-up mattered most.
-    jitter_pct = random_int(0, 50)
-    bounded + (bounded * jitter_pct / 100)
+    base = if (attempt == 0) { 1000 }
+           else { if (attempt == 1) { 2000 }
+           else { if (attempt == 2) { 4000 }
+           else { 8000 }}}
+    # Deterministic pseudo-jitter: 0..400ms range keyed on attempt number.
+    # Provides reproducible spread without needing a PRNG — each attempt
+    # gets a fixed offset so a fleet of agents retrying attempt 0 all at
+    # the same ms won't collide on a single delay value.
+    jitter = (attempt * 7919 + 3571) mod 401
+    base + jitter
 }
 
 fun max_chat_retries() { 3 }
@@ -882,9 +876,19 @@ fun chat_native_retry(messages, opts, attempt) {
         # genuine failure (nil) does. (The old `last_fail == "interrupted"`
         # guard here was dead code: record_fail is never called with that value.)
         if (attempt >= max_chat_retries()) {
-            print("  \e[38;5;208m✗ llm call failed after " ++
-                  to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
-            nil
+            fb = map_get(opts, 'fallback_endpoint')
+            if (fb != nil) {
+                print("  [llm] retrying on fallback endpoint...")
+                fb_key = map_get(opts, 'fallback_key')
+                fb_opts = map_put(opts, 'endpoint', to_string(fb))
+                fb_opts2 = if (fb_key != nil) { map_put(fb_opts, 'api_key', to_string(fb_key)) }
+                           else { fb_opts }
+                chat_native(messages, fb_opts2)
+            } else {
+                print("  \e[38;5;208m✗ llm call failed after " ++
+                      to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
+                nil
+            }
         } else {
             d = retry_delay_ms(attempt)
             print("  \e[38;5;208m↻ llm call failed — retrying in " ++
@@ -913,7 +917,19 @@ fun chat_inband_retry(messages, opts, attempt) {
               to_string(max_chat_retries() + 1) ++ ")\e[0m")
         sleep(d)
         chat_inband_retry(messages, opts, attempt + 1)
-    } else { result }
+    } else {
+        if (needs_retry == 'true') {
+            fb = map_get(opts, 'fallback_endpoint')
+            if (fb != nil) {
+                print("  [llm] retrying on fallback endpoint...")
+                fb_key = map_get(opts, 'fallback_key')
+                fb_opts = map_put(opts, 'endpoint', to_string(fb))
+                fb_opts2 = if (fb_key != nil) { map_put(fb_opts, 'api_key', to_string(fb_key)) }
+                           else { fb_opts }
+                chat_inband(messages, fb_opts2)
+            } else { result }
+        } else { result }
+    }
 }
 
 fun is_transport_truncated(content) {

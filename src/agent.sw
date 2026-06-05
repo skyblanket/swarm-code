@@ -828,10 +828,21 @@ fun slash_dispatch(cmd, history, opts) {
         run_turn(with_reflect, opts, 0)
     }
     else { if (cmd == "/mcp") { print(Mcp.list_servers(map_get(opts, 'mcp_table'))) ; history }
+    else { if (cmd == "/memory reindex") {
+        ep = map_get(opts, 'embed_endpoint', nil)
+        if (ep == nil) {
+            print("\e[33mreindex requires SWARM_CODE_EMBED_ENDPOINT to be configured\e[0m")
+        } else {
+            print("\e[2mreindexing memories...\e[0m")
+            result = Memory.embed_missing(opts)
+            print(to_string(result))
+        }
+        history
+    }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -869,6 +880,7 @@ fun show_help() {
     print("  /daemon               show daemon mode (cognitive pulse)")
     print("  /autonomy             show autonomy mode (bg_done wake)")
     print("  /reflect              trigger one-shot reflection")
+    print("  /memory reindex       embed any un-vectorized memories (requires SWARM_CODE_EMBED_ENDPOINT)")
     print("  /quit /exit           exit")
 }
 
@@ -2055,11 +2067,12 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/daemon") { 'true' }
     else { if (cmd == "/reflect") { 'true' }
     else { if (cmd == "/mcp") { 'true' }
+    else { if (cmd == "/memory") { 'true' }
     else { if (cmd == "/plan") { 'true' }
     else { if (cmd == "/quit") { 'true' }
     else { if (cmd == "/exit") { 'true' }
     else { if (cmd == "/reset") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # String → atom for tool dispatch. Was a ~50-case if/else; now a

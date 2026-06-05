@@ -423,26 +423,41 @@ fun validate_write_path(path) {
     bypass = getenv("SWARM_CODE_UNSAFE_WRITES")
     if (bypass == "1") { "ok" }
     else {
-        if (string_contains(path, "/.ssh/") == 'true') {
-            "error: refusing to write inside an .ssh directory — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-        }
-        else { if (string_starts_with(path, "/etc/") == 'true') {
-            "error: refusing to write under /etc/ — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-        }
-        else { if (string_contains(path, "/.aws/") == 'true') {
-            "error: refusing to write inside an .aws directory (credentials) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-        }
-        else { if (string_contains(path, "/.config/gh/hosts.yml") == 'true') {
-            "error: refusing to write the gh CLI hosts.yml (auth token) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-        }
-        else { if (string_contains(path, "/.config/git/credentials") == 'true') {
-            "error: refusing to write git credentials file — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-        }
-        else { if (string_contains(path, "/.swarm-code/settings.json") == 'true') {
-            "error: refusing to write swarm-code's own settings.json — edit it yourself, or set SWARM_CODE_UNSAFE_WRITES=1 to override"
-        }
-        else { "ok" }}}}}}
+        # Resolve the path via realpath -m so that ../../../etc/passwd style
+        # traversal attacks are normalised before pattern matching.
+        resolved_raw = elem(shell("realpath -m " ++ Util.shell_q(to_string(path)) ++ " 2>/dev/null || echo " ++ Util.shell_q(to_string(path))), 1)
+        resolved = string_trim(resolved_raw)
+        check_path = if (string_length(resolved) > 0) { resolved } else { path }
+        _validate_write_path_checked(check_path, path)
     }
+}
+
+fun _validate_write_path_checked(rp, orig) {
+    if (string_contains(rp, "/.ssh/") == 'true') {
+        "error: refusing to write inside an .ssh directory — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_starts_with(rp, "/etc/") == 'true') {
+        "error: refusing to write under /etc/ — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_contains(rp, "/.aws/") == 'true') {
+        "error: refusing to write inside an .aws directory (credentials) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_contains(rp, "/.config/gh/hosts.yml") == 'true') {
+        "error: refusing to write the gh CLI hosts.yml (auth token) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_contains(rp, "/.config/git/credentials") == 'true') {
+        "error: refusing to write git credentials file — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_contains(rp, "/.swarm-code/settings.json") == 'true') {
+        "error: refusing to write swarm-code's own settings.json — edit it yourself, or set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_contains(rp, "/.gnupg/") == 'true') {
+        "error: refusing to write inside a .gnupg directory (GPG keys) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { if (string_starts_with(rp, "/boot/") == 'true') {
+        "error: refusing to write under /boot/ — set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { "ok" }}}}}}}}
 }
 
 # ------------------------------------------------------------

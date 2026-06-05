@@ -525,6 +525,8 @@ fun load_opts() {
     embed_model_raw= getenv("SWARM_CODE_EMBED_MODEL")
     embed_model    = if (embed_model_raw == nil) { "text-embedding-ada-002" } else { embed_model_raw }
 
+    fallback_endpoint = getenv("SWARM_CODE_FALLBACK_ENDPOINT")
+
     %{
         endpoint: endpoint,
         model: model,
@@ -537,7 +539,8 @@ fun load_opts() {
         plan_mode: plan_mode,
         embed_endpoint: embed_endpoint,
         embed_api_key:  embed_key,
-        embed_model:    embed_model
+        embed_model:    embed_model,
+        fallback_endpoint: fallback_endpoint
     }
 }
 
