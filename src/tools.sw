@@ -804,14 +804,15 @@ fun do_remember(args, opts) {
             Memory.save(to_string(old_key),
                         "(legacy entry)",
                         "user",
-                        to_string(old_val))
+                        to_string(old_val),
+                        opts)
         }
     } else {
         d = if (desc == nil) { "(no description)" } else { to_string(desc) }
         t = if (type_ == nil) { "user" } else { to_string(type_) }
         c = if (content != nil) { to_string(content) }
             else { if (body_alt != nil) { to_string(body_alt) } else { "" } }
-        Memory.save(to_string(name), d, t, c)
+        Memory.save(to_string(name), d, t, c, opts)
     }
 }
 
@@ -824,7 +825,7 @@ fun do_recall(args, opts) {
     k3 = if (k2 == nil) { map_get(args, 'name') } else { k2 }
     if (k3 == nil) { "error: recall needs 'slug' (or 'name')" }
     else {
-        v = Memory.recall(to_string(k3))
+        v = Memory.recall(to_string(k3), opts)
         if (v == nil) { "error: no memory named '" ++ to_string(k3) ++ "'" }
         else { to_string(v) }
     }
