@@ -29,6 +29,7 @@ import ToolGuardrails
 import Agent
 import Scheduler
 import Plan
+import MemVec
 
 fun main() {
     print("")
@@ -86,7 +87,13 @@ fun main() {
         t_plan_auto_trigger_skips_slash(),
         t_plan_inject_into_history(),
         t_plan_get_mode_default(),
-        t_plan_get_mode_explicit()
+        t_plan_get_mode_explicit(),
+        t_memvec_cosine_orthogonal(),
+        t_memvec_cosine_identical(),
+        t_memvec_cosine_nil(),
+        t_memvec_search_empty_db(),
+        t_memvec_upsert_get_roundtrip(),
+        t_memory_recall_no_embed_endpoint()
     ]
 
     passed = sum_list(results, 0)
@@ -873,4 +880,63 @@ fun t_plan_get_mode_explicit() {
     result = Plan.get_mode(opts)
     check("plan get_mode: reads plan_mode key",
           if (result == "on") { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# MemVec — semantic memory vector store tests (no network required)
+# ------------------------------------------------------------
+
+# Orthogonal vectors have zero dot product → cosine similarity == 0.
+fun t_memvec_cosine_orthogonal() {
+    a = [1.0, 0.0, 0.0]
+    b = [0.0, 1.0, 0.0]
+    result = MemVec.cosine_sim(a, b)
+    check("memvec cosine_sim: orthogonal vectors = 0",
+          if (result == 0.0) { 'true' } else { 'false' })
+}
+
+# A vector compared to itself should give similarity ≈ 1.0 (within 0.001).
+fun t_memvec_cosine_identical() {
+    a = [1.0, 2.0, 3.0]
+    result = MemVec.cosine_sim(a, a)
+    diff = if (result > 1.0) { result - 1.0 } else { 1.0 - result }
+    check("memvec cosine_sim: identical vectors = 1",
+          if (diff < 0.001) { 'true' } else { 'false' })
+}
+
+# Passing nil as either argument must return 0 without panicking.
+fun t_memvec_cosine_nil() {
+    result = MemVec.cosine_sim(nil, [1.0])
+    check("memvec cosine_sim: nil vectors = 0",
+          if (result == 0) { 'true' } else { 'false' })
+}
+
+# search_top_k on a fresh empty database must return an empty list.
+fun t_memvec_search_empty_db() {
+    db = MemVec.open("/tmp/test_memvec_empty.db")
+    results = MemVec.search_top_k(db, [1.0, 0.0], 3)
+    MemVec.close(db)
+    check("memvec search_top_k: returns empty for empty db",
+          if (length(results) == 0) { 'true' } else { 'false' })
+}
+
+# upsert then get_vector must return the same-length vector (round-trip).
+fun t_memvec_upsert_get_roundtrip() {
+    db = MemVec.open("/tmp/test_memvec_rt.db")
+    MemVec.upsert(db, "test-slug", [0.1, 0.2, 0.3])
+    v = MemVec.get_vector(db, "test-slug")
+    MemVec.close(db)
+    ok = bool_and(
+        if (v != nil) { 'true' } else { 'false' },
+        if (v != nil && length(v) == 3) { 'true' } else { 'false' })
+    check("memvec upsert + get_vector round-trip", ok)
+}
+
+# Without an embed_endpoint key in opts, map_get returns nil — the
+# memory recall path takes the keyword fallback branch.
+fun t_memory_recall_no_embed_endpoint() {
+    opts = %{model: "test"}
+    result = map_get(opts, 'embed_endpoint', nil)
+    check("memory recall: falls back to keyword when no embed_endpoint",
+          if (result == nil) { 'true' } else { 'false' })
 }

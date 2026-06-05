@@ -1,6 +1,7 @@
 module Memory
 
 import Util
+import MemVec
 
 # ============================================================
 # Memory — Claude-Code-style crumbs store
@@ -41,9 +42,10 @@ import Util
 #   reference  — pointers to external systems (Linear, Grafana, etc.)
 
 export [
-    load, memory_dir, index_path, memory_file_path,
+    load, memory_dir, index_path, memory_file_path, embed_db_path,
     save, recall, list_index, forget,
-    as_prompt_section, slugify, parse_frontmatter, find_substring
+    as_prompt_section, slugify, parse_frontmatter, find_substring,
+    embed_missing
 ]
 
 fun memory_dir() {
@@ -56,6 +58,10 @@ fun index_path() {
 
 fun memory_file_path(slug) {
     memory_dir() ++ "/" ++ slug ++ ".md"
+}
+
+fun embed_db_path() {
+    memory_dir() ++ "/embed.db"
 }
 
 # Initialize: create the directory if it doesn't exist. Returns an
@@ -95,7 +101,8 @@ fun migrate_entries(keys, vals) {
     else {
         k = to_string(hd(keys))
         v = to_string(hd(vals))
-        save(k, "migrated from legacy memories.json", "user", v)
+        # Pass empty opts map — no embed key available during migration.
+        save(k, "migrated from legacy memories.json", "user", v, map_new())
         migrate_entries(tl(keys), tl(vals))
     }
 }
@@ -107,7 +114,8 @@ fun migrate_entries(keys, vals) {
 # description — one-line hook used for retrieval decisions
 # type_       — "user" | "feedback" | "project" | "reference"
 # content     — the body of the memory (markdown allowed)
-fun save(name, description, type_, content) {
+# opts        — agent opts map; used for best-effort embedding on save
+fun save(name, description, type_, content, opts) {
     slug = slugify(to_string(name))
     file_path = memory_file_path(slug)
     body =
@@ -120,6 +128,19 @@ fun save(name, description, type_, content) {
     rc = file_write(file_path, body)
     if (rc == 'ok') {
         update_index(slug, to_string(name), to_string(description), to_string(type_))
+        # Best-effort embed on save — fire-and-forget.
+        # If embed opts are missing or the network call fails, the memory
+        # is still saved correctly; we just won't have a vector for it yet.
+        embed_ep = map_get(opts, 'embed_endpoint')
+        if (embed_ep != nil && embed_ep != "") {
+            embed_text = to_string(description) ++ " " ++ to_string(content)
+            vec = MemVec.embed_text(embed_text, opts)
+            if (vec != nil) {
+                db = MemVec.open(embed_db_path())
+                MemVec.upsert(db, slug, vec)
+                MemVec.close(db)
+            }
+        }
         "ok: saved " ++ slug
     } else {
         "error: could not write " ++ file_path
@@ -333,15 +354,78 @@ fun collapse_underscores(s, acc, prev_under) {
 }
 
 # ------------------------------------------------------------
-# Recall — read one memory file by slug or by name.
+# Recall — read one or more memory files matching a query.
+#
+# When embed opts are present and Embed.create succeeds, performs
+# semantic (vector cosine) search over embed.db and returns the
+# top-5 matching memory file contents joined by a separator.
+#
+# Falls back to exact slug lookup when:
+#   a) embed_endpoint is nil / empty (embed not configured), OR
+#   b) MemVec.embed_text returns nil (network failure, bad key), OR
+#   c) No vectors are stored yet (empty embed.db).
+#
+# The fallback is the original behaviour: slugify the query, read
+# the single file at that slug path (nil if not found).
 # ------------------------------------------------------------
-fun recall(slug_or_name) {
+fun recall(query, opts) {
+    embed_ep = map_get(opts, 'embed_endpoint')
+    if (embed_ep == nil || embed_ep == "") {
+        recall_by_slug(query)
+    } else {
+        q_vec = MemVec.embed_text(to_string(query), opts)
+        if (q_vec == nil) {
+            recall_by_slug(query)
+        } else {
+            db = MemVec.open(embed_db_path())
+            results = MemVec.search_top_k(db, q_vec, 5)
+            MemVec.close(db)
+            if (length(results) == 0) {
+                recall_by_slug(query)
+            } else {
+                recall_semantic_results(results)
+            }
+        }
+    }
+}
+
+# Direct slug-based lookup — original recall behaviour.
+fun recall_by_slug(slug_or_name) {
     slug = slugify(to_string(slug_or_name))
     fp = memory_file_path(slug)
     if (file_exists(fp) == 'false') {
         nil
     } else {
         file_read(fp)
+    }
+}
+
+# Read each file from the semantic hit list and join their contents.
+# Returns a formatted multi-result string, or nil if no files could be read.
+fun recall_semantic_results(hits) {
+    contents = collect_hit_contents(hits, [])
+    if (length(contents) == 0) { nil }
+    else { join_memory_blocks(contents, "") }
+}
+
+fun collect_hit_contents(hits, acc) {
+    if (length(hits) == 0) { acc }
+    else {
+        h = hd(hits)
+        slug = to_string(map_get(h, 'slug'))
+        fp = memory_file_path(slug)
+        content = if (file_exists(fp) == 'false') { nil } else { file_read(fp) }
+        new_acc = if (content == nil) { acc }
+                  else { list_append(acc, content) }
+        collect_hit_contents(tl(hits), new_acc)
+    }
+}
+
+fun join_memory_blocks(blocks, acc) {
+    if (length(blocks) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { "\n\n---\n\n" }
+        join_memory_blocks(tl(blocks), acc ++ sep ++ hd(blocks))
     }
 }
 
@@ -374,6 +458,61 @@ fun forget(slug_or_name) {
         } else {
             "error: could not delete " ++ fp
         }
+    }
+}
+
+# ------------------------------------------------------------
+# embed_missing — backfill embed.db for any .md files that do
+# not yet have a vector. Called manually (/memory reindex) or
+# from a future startup hook. Returns the count of newly embedded
+# memories.
+#
+# opts  — agent opts map (needs embed_endpoint / embed_api_key /
+#          embed_model to be set, otherwise returns 0 immediately).
+# ------------------------------------------------------------
+fun embed_missing(opts) {
+    embed_ep = map_get(opts, 'embed_endpoint')
+    if (embed_ep == nil || embed_ep == "") { 0 }
+    else {
+        dir = memory_dir()
+        entries = file_list(dir)
+        slugs = collect_md_slugs(entries, [])
+        db = MemVec.open(embed_db_path())
+        missing = MemVec.list_slugs_without_vector(db, slugs)
+        count = embed_missing_loop(db, missing, opts, 0)
+        MemVec.close(db)
+        count
+    }
+}
+
+# Collect slugs (filename sans .md, excluding MEMORY.md) from file_list.
+fun collect_md_slugs(entries, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        new_acc = if (string_ends_with(e, ".md") == 'true' && e != "MEMORY.md") {
+            list_append(acc, strip_md_ext(e))
+        } else { acc }
+        collect_md_slugs(tl(entries), new_acc)
+    }
+}
+
+fun embed_missing_loop(db, slugs, opts, count) {
+    if (length(slugs) == 0) { count }
+    else {
+        slug = hd(slugs)
+        fp = memory_file_path(slug)
+        content = if (file_exists(fp) == 'false') { nil } else { file_read(fp) }
+        new_count = if (content == nil) { count }
+        else {
+            vec = MemVec.embed_text(content, opts)
+            if (vec == nil) { count }
+            else {
+                MemVec.upsert(db, slug, vec)
+                count + 1
+            }
+        }
+        embed_missing_loop(db, tl(slugs), opts, new_count)
     }
 }
 

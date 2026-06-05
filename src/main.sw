@@ -365,6 +365,9 @@ fun print_usage() {
     print("  SWARM_CODE_ALLOW_REMOTE  set to 1 to permit non-local endpoints")
     print("  SWARM_CODE_CWD           working directory shown to the model")
     print("  SWARM_CODE_PLAN=auto|on|off   plan mode (default: auto)")
+    print("  SWARM_CODE_EMBED_ENDPOINT   embedding API URL (enables semantic recall)")
+    print("  SWARM_CODE_EMBED_KEY        embedding API key (defaults to SWARM_CODE_API_KEY)")
+    print("  SWARM_CODE_EMBED_MODEL      embedding model (default: text-embedding-ada-002)")
     print("")
     print("  Profiles: add a \"profiles\" map to settings.json, e.g.")
     print("    \"profiles\": {")
@@ -405,6 +408,15 @@ fun print_config() {
     print("  max_tokens   " ++ to_string(map_get(o, 'max_tokens')))
     print("  plan_mode    " ++ to_string(map_get(o, 'plan_mode')))
     print("  cwd          " ++ resolve_cwd())
+    ee = map_get(o, 'embed_endpoint')
+    ee_shown = if (ee == nil) { "(not set — semantic recall disabled)" } else { to_string(ee) }
+    eak = map_get(o, 'embed_api_key')
+    eak_shown = if (eak == nil) { "(not set)" }
+                else { if (string_length(to_string(eak)) == 0) { "(empty)" }
+                else { "(set)" }}
+    print("  embed_endpoint  " ++ ee_shown)
+    print("  embed_api_key   " ++ eak_shown)
+    print("  embed_model     " ++ to_string(map_get(o, 'embed_model')))
 }
 
 fun load_opts() {
@@ -507,6 +519,12 @@ fun load_opts() {
                 else { if (plan_env == "off") { "off" }
                 else { "auto" }}
 
+    embed_endpoint = getenv("SWARM_CODE_EMBED_ENDPOINT")
+    embed_key_raw  = getenv("SWARM_CODE_EMBED_KEY")
+    embed_key      = if (embed_key_raw == nil) { api_key } else { embed_key_raw }
+    embed_model_raw= getenv("SWARM_CODE_EMBED_MODEL")
+    embed_model    = if (embed_model_raw == nil) { "text-embedding-ada-002" } else { embed_model_raw }
+
     %{
         endpoint: endpoint,
         model: model,
@@ -516,7 +534,10 @@ fun load_opts() {
         tool_format: tool_format,
         chat_template_kwargs: chat_template_kwargs,
         profile: profile_name,
-        plan_mode: plan_mode
+        plan_mode: plan_mode,
+        embed_endpoint: embed_endpoint,
+        embed_api_key:  embed_key,
+        embed_model:    embed_model
     }
 }
 
