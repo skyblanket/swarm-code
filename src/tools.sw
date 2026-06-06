@@ -30,6 +30,8 @@ import Mcp
 import Util
 import TestRunner
 import TestRunner
+import PathGuard
+import Hooks
 
 export [exec, max_output_bytes]
 
@@ -42,16 +44,25 @@ fun max_output_bytes() { 6000 }
 # their name is dynamic (mcp__server__tool) and they route through
 # Mcp.call_tool rather than a static handler.
 fun exec(name, args, opts) {
-    if (string_starts_with(to_string(name), "mcp__") == 'true') {
-        truncate_output(Mcp.call_tool(to_string(name), args, opts), max_output_bytes())
-    }
-    else {
-        handler = find_handler(all_tools(), name)
-        if (handler == nil) {
-            "error: unknown tool '" ++ to_string(name) ++ "'"
+    # Run pre_tool hook — may veto or modify args.
+    hook_pre = Hooks.run_pre_tool(name, args, opts)
+    if (map_get(hook_pre, 'veto') == 'true') {
+        "blocked by pre_tool hook"
+    } else {
+        effective_args = map_get(hook_pre, 'args')
+        raw_result = if (string_starts_with(to_string(name), "mcp__") == 'true') {
+            truncate_output(Mcp.call_tool(to_string(name), effective_args, opts), max_output_bytes())
         } else {
-            handler(args, opts)
+            handler = find_handler(all_tools(), name)
+            if (handler == nil) {
+                "error: unknown tool '" ++ to_string(name) ++ "'"
+            } else {
+                handler(effective_args, opts)
+            }
         }
+        # Run post_tool hook (fire-and-forget).
+        Hooks.run_post_tool(name, raw_result, 0, opts)
+        raw_result
     }
 }
 
@@ -295,7 +306,11 @@ fun do_read(args) {
     if (p == nil) {
         "error: missing 'path' argument"
     } else {
-        read_file_capped(p, offset, limit)
+        rguard = PathGuard.validate_read(to_string(p))
+        if (rguard != "ok") { rguard }
+        else {
+            read_file_capped(p, offset, limit)
+        }
     }
 }
 
@@ -388,7 +403,7 @@ fun do_write(args) {
         if (content == nil) {
             "error: missing content"
         } else {
-            guard = validate_write_path(to_string(path))
+            guard = PathGuard.validate_write(to_string(path))
             if (guard != "ok") { guard }
             else {
                 rc = file_write(path, content)
@@ -400,64 +415,6 @@ fun do_write(args) {
             }
         }
     }
-}
-
-# ------------------------------------------------------------
-# validate_write_path — block sensitive paths on WRITE tools only.
-# ------------------------------------------------------------
-# Returns "ok" if the write is allowed, or an error string describing
-# the blocked pattern. Reads (do_read/do_glob/do_grep) deliberately
-# do NOT call this — the agent needs to inspect those files for
-# debugging and auditing. This guard is write-only.
-#
-# Bypass: export SWARM_CODE_UNSAFE_WRITES=1 to disable.
-#
-# Blocked:
-#   * any path containing "/.ssh/"        (SSH keys / authorized_keys)
-#   * any path under "/etc/"               (system config)
-#   * any path containing "/.aws/"        (AWS credentials)
-#   * "/.config/gh/hosts.yml"             (gh CLI token)
-#   * "/.config/git/credentials"          (git credentials)
-#   * "/.swarm-code/settings.json"        (our own config)
-fun validate_write_path(path) {
-    bypass = getenv("SWARM_CODE_UNSAFE_WRITES")
-    if (bypass == "1") { "ok" }
-    else {
-        # Resolve the path via realpath -m so that ../../../etc/passwd style
-        # traversal attacks are normalised before pattern matching.
-        resolved_raw = elem(shell("realpath -m " ++ Util.shell_q(to_string(path)) ++ " 2>/dev/null || echo " ++ Util.shell_q(to_string(path))), 1)
-        resolved = string_trim(resolved_raw)
-        check_path = if (string_length(resolved) > 0) { resolved } else { path }
-        _validate_write_path_checked(check_path, path)
-    }
-}
-
-fun _validate_write_path_checked(rp, orig) {
-    if (string_contains(rp, "/.ssh/") == 'true') {
-        "error: refusing to write inside an .ssh directory — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_starts_with(rp, "/etc/") == 'true') {
-        "error: refusing to write under /etc/ — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_contains(rp, "/.aws/") == 'true') {
-        "error: refusing to write inside an .aws directory (credentials) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_contains(rp, "/.config/gh/hosts.yml") == 'true') {
-        "error: refusing to write the gh CLI hosts.yml (auth token) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_contains(rp, "/.config/git/credentials") == 'true') {
-        "error: refusing to write git credentials file — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_contains(rp, "/.swarm-code/settings.json") == 'true') {
-        "error: refusing to write swarm-code's own settings.json — edit it yourself, or set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_contains(rp, "/.gnupg/") == 'true') {
-        "error: refusing to write inside a .gnupg directory (GPG keys) — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { if (string_starts_with(rp, "/boot/") == 'true') {
-        "error: refusing to write under /boot/ — set SWARM_CODE_UNSAFE_WRITES=1 to override"
-    }
-    else { "ok" }}}}}}}}
 }
 
 # ------------------------------------------------------------
@@ -478,7 +435,7 @@ fun do_edit(args) {
 }
 
 fun do_edit_impl(path, old_s, new_s) {
-    guard = validate_write_path(to_string(path))
+    guard = PathGuard.validate_write(to_string(path))
     if (guard != "ok") { guard }
     else { do_edit_impl_inner(path, old_s, new_s) }
 }
@@ -1437,7 +1394,7 @@ fun do_multi_edit(args) {
     else {
         if (edits == nil) { "error: missing edits list" }
         else {
-            guard = validate_write_path(to_string(path))
+            guard = PathGuard.validate_write(to_string(path))
             if (guard != "ok") { guard }
             else {
                 original = file_read(path)

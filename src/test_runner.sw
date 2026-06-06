@@ -93,7 +93,35 @@ fun main() {
         t_memvec_cosine_nil(),
         t_memvec_search_empty_db(),
         t_memvec_upsert_get_roundtrip(),
-        t_memory_recall_no_embed_endpoint()
+        t_memory_recall_no_embed_endpoint(),
+        # --- new tests (27 added) ---
+        t_markdown_empty_table(),
+        t_markdown_code_block_preserved(),
+        t_markdown_bold_inline(),
+        t_markdown_inline_code_no_ticks(),
+        t_markdown_heading_no_raw_hash(),
+        t_plan_auto_trigger_refactor(),
+        t_plan_auto_trigger_migrate(),
+        t_plan_auto_trigger_deploy_skips(),
+        t_plan_auto_trigger_sequence_connector(),
+        t_plan_auto_trigger_just_prefix(),
+        t_plan_inject_content_has_plan(),
+        t_scheduler_parse_expr_30m(),
+        t_scheduler_parse_expr_2h(),
+        t_scheduler_parse_expr_daily_hhmm(),
+        t_scheduler_next_id_empty(),
+        t_scheduler_next_id_nonempty(),
+        t_scheduler_jobs_dir_suffix(),
+        t_memory_embed_db_path(),
+        t_memory_dir_suffix(),
+        t_memory_slugify_spaces(),
+        t_memory_slugify_special_chars(),
+        t_memory_save_recall_roundtrip(),
+        t_hardline_shutdown_now(),
+        t_hardline_rm_rf_root(),
+        t_hardline_ls_la_allowed(),
+        t_hardline_fork_bomb(),
+        t_to_string_nil()
     ]
 
     passed = sum_list(results, 0)
@@ -941,4 +969,237 @@ fun t_memory_recall_no_embed_endpoint() {
     result = map_get(opts, 'embed_endpoint', nil)
     check("memory recall: falls back to keyword when no embed_endpoint",
           if (result == nil) { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# MARKDOWN — additional edge-case guards
+# ------------------------------------------------------------
+
+# A table with zero data rows (header + separator only) must not crash
+# and must still render the header line.
+fun t_markdown_empty_table() {
+    tbl = "| col1 | col2 |\n|---|---|\n"
+    r = Markdown.render(tbl, 80)
+    check("markdown empty table (no data rows) renders without crash",
+          if (string_contains(r, "col1") == 'true') { 'true' } else { 'false' })
+}
+
+# A fenced code block must preserve its content as-is (no word-wrap or
+# table transformation applied to lines inside the block).
+fun t_markdown_code_block_preserved() {
+    src = "```\n    indented_code();\n    more_code();\n```"
+    r = Markdown.render(src, 80)
+    check("markdown fenced code block: content preserved",
+          string_contains(r, "indented_code"))
+}
+
+# Bold (**text**) inside a line must render the text without the raw
+# asterisks leaking through.
+fun t_markdown_bold_inline() {
+    r = Markdown.render("This is **important** text.", 80)
+    ok = bool_and(
+        string_contains(r, "important"),
+        if (string_contains(r, "**") == 'false') { 'true' } else { 'false' })
+    check("markdown bold: renders text, no raw ** leaked", ok)
+}
+
+# Inline code `fn()` must render the text without the raw backticks.
+fun t_markdown_inline_code_no_ticks() {
+    r = Markdown.render("Call `do_thing()` now.", 80)
+    ok = bool_and(
+        string_contains(r, "do_thing"),
+        if (string_contains(r, "`do_thing`") == 'false') { 'true' } else { 'false' })
+    check("markdown inline code: text visible, raw backticks gone", ok)
+}
+
+# A heading line (## Heading) must not appear literally in output — it
+# should be rendered with some treatment (bold ANSI or stripped of ##).
+fun t_markdown_heading_no_raw_hash() {
+    r = Markdown.render("## My Section\n\nsome body text", 80)
+    check("markdown heading: ## prefix not in raw output",
+          if (string_contains(r, "## My Section") == 'false') { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# PLAN — additional keyword and edge-case guards
+# ------------------------------------------------------------
+
+# "refactor the auth module for clarity" contains the keyword "refactor"
+# and enough words — must trigger.
+fun t_plan_auto_trigger_refactor() {
+    result = Plan.auto_trigger("refactor the auth module for clarity")
+    check("plan auto_trigger: fires on 'refactor' keyword",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# "migrate the database schema to v2" contains "migrate" — must trigger.
+fun t_plan_auto_trigger_migrate() {
+    result = Plan.auto_trigger("migrate the database schema to v2")
+    check("plan auto_trigger: fires on 'migrate' keyword",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# "deploy to staging" — short and contains "deploy" but only 3 words.
+# auto_trigger requires >=4 words, so must NOT fire.
+fun t_plan_auto_trigger_deploy_skips() {
+    result = Plan.auto_trigger("deploy to staging")
+    check("plan auto_trigger: 'deploy to staging' (3 words) does NOT trigger",
+          if (result == 'false') { 'true' } else { 'false' })
+}
+
+# "update foo and then fix bar" — contains the sequence connector "and then"
+# which has >=4 words — must trigger.
+fun t_plan_auto_trigger_sequence_connector() {
+    result = Plan.auto_trigger("update foo and then fix bar")
+    check("plan auto_trigger: fires on sequence connector 'and then'",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# "just fix a typo" — "just" prefix suppresses auto-trigger.
+fun t_plan_auto_trigger_just_prefix() {
+    result = Plan.auto_trigger("just fix a typo in the docs")
+    check("plan auto_trigger: 'just' prefix suppresses trigger",
+          if (result == 'false') { 'true' } else { 'false' })
+}
+
+# inject_into_history with an active plan returns a non-empty history list.
+fun t_plan_inject_content_has_plan() {
+    mode_opts = %{plan_mode: 'on'}
+    history = Plan.inject_into_history("do the thing", [], mode_opts)
+    check("plan inject_into_history: returns non-empty list when plan_mode=on",
+          if (length(history) > 0) { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# SCHEDULER — parse_expr and next_id guards
+# ------------------------------------------------------------
+
+# parse_expr("30m") must return 30*60*1000 = 1800000 ms.
+fun t_scheduler_parse_expr_30m() {
+    result = Scheduler.parse_expr("30m")
+    check("scheduler parse_expr('30m'): returns 1800000",
+          if (result == 1800000) { 'true' } else { 'false' })
+}
+
+# parse_expr("2h") must return 2*3600*1000 = 7200000 ms.
+fun t_scheduler_parse_expr_2h() {
+    result = Scheduler.parse_expr("2h")
+    check("scheduler parse_expr('2h'): returns 7200000",
+          if (result == 7200000) { 'true' } else { 'false' })
+}
+
+# parse_expr("daily 09:30") must return 86400000 (24h in ms).
+fun t_scheduler_parse_expr_daily_hhmm() {
+    result = Scheduler.parse_expr("daily 09:30")
+    check("scheduler parse_expr('daily 09:30'): returns 86400000",
+          if (result == 86400000) { 'true' } else { 'false' })
+}
+
+# next_id of empty list must return 1.
+fun t_scheduler_next_id_empty() {
+    result = Scheduler.next_id([], 0)
+    check("scheduler next_id: empty list returns 1",
+          if (result == 1) { 'true' } else { 'false' })
+}
+
+# next_id of [3,1,7] must return 8.
+fun t_scheduler_next_id_nonempty() {
+    jobs = [%{id: "3"}, %{id: "1"}, %{id: "7"}]
+    result = Scheduler.next_id(jobs, 0)
+    check("scheduler next_id: max of [3,1,7] + 1 = 8",
+          if (result == 8) { 'true' } else { 'false' })
+}
+
+# jobs_dir() must return a path string that ends with "telemetry".
+fun t_scheduler_jobs_dir_suffix() {
+    d = Scheduler.jobs_dir()
+    check("scheduler jobs_dir() ends with 'telemetry'",
+          string_ends_with(d, "telemetry"))
+}
+
+# ------------------------------------------------------------
+# MEMORY — save/recall round-trip and path guards
+# ------------------------------------------------------------
+
+# embed_db_path() must end with "embed.db".
+fun t_memory_embed_db_path() {
+    p = Memory.embed_db_path()
+    check("memory embed_db_path() ends with 'embed.db'",
+          string_ends_with(p, "embed.db"))
+}
+
+# memory_dir() must end with "memory" (path sanity).
+fun t_memory_dir_suffix() {
+    d = Memory.memory_dir()
+    check("memory memory_dir() ends with 'memory'",
+          string_ends_with(d, "memory"))
+}
+
+# slugify collapses spaces and strips special chars.
+fun t_memory_slugify_spaces() {
+    s = Memory.slugify("Hello World")
+    check("memory slugify: spaces become underscores",
+          if (s == "hello_world") { 'true' } else { 'false' })
+}
+
+# slugify strips punctuation and collapses consecutive underscores.
+fun t_memory_slugify_special_chars() {
+    s = Memory.slugify("user's ADHD workflow!")
+    # Expected: "user_s_adhd_workflow" (apostrophe → _, spaces → _, ! stripped)
+    check("memory slugify: special chars stripped, underscores collapsed",
+          if (string_contains(s, "adhd") == 'true' &&
+              string_contains(s, "__") == 'false') { 'true' } else { 'false' })
+}
+
+# save + recall_by_slug round-trip: write a memory, read it back.
+fun t_memory_save_recall_roundtrip() {
+    rc = Memory.save("test_rt_mem", "a test memory", "user",
+                     "body content here", %{})
+    ok_save = string_contains(rc, "ok")
+    recalled = Memory.recall_by_slug("test_rt_mem")
+    ok_recall = if (recalled != nil && string_contains(recalled, "body content here") == 'true') {
+        'true'
+    } else { 'false' }
+    ok = bool_and(ok_save, ok_recall)
+    check("memory save + recall_by_slug round-trip", ok)
+}
+
+# ------------------------------------------------------------
+# SESSION / TOOLS — additional hardline and contract guards
+# ------------------------------------------------------------
+
+# "shutdown now" must be blocked by the hardline floor.
+fun t_hardline_shutdown_now() {
+    result = Config.is_hardline_bash(%{command: "shutdown now"})
+    check("is_hardline_bash: 'shutdown now' blocked",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# "rm -rf /*" is the exact whole-disk wipe pattern in the hardline list.
+fun t_hardline_rm_rf_root() {
+    result = Config.is_hardline_bash(%{command: "rm -rf /*"})
+    check("is_hardline_bash: 'rm -rf /*' blocked",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# "ls -la /tmp" is a safe read command — must NOT be blocked.
+fun t_hardline_ls_la_allowed() {
+    result = Config.is_hardline_bash(%{command: "ls -la /tmp"})
+    check("is_hardline_bash: 'ls -la /tmp' allowed",
+          if (result == 'false') { 'true' } else { 'false' })
+}
+
+# The fork-bomb literal (no spaces — exact string the config checks for)
+# must be blocked.
+fun t_hardline_fork_bomb() {
+    result = Config.is_hardline_bash(%{command: ":(){:|:&};:"})
+    check("is_hardline_bash: fork bomb blocked",
+          if (result == 'true') { 'true' } else { 'false' })
+}
+
+# to_string(nil) must return the string "nil" (language contract).
+fun t_to_string_nil() {
+    result = to_string(nil)
+    check("to_string(nil) returns \"nil\"",
+          if (result == "nil") { 'true' } else { 'false' })
 }

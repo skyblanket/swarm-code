@@ -45,8 +45,17 @@ import Telemetry
 import Log
 import Mcp
 import ToolGuardrails
+import McpServer
 
 fun main() {
+    # MCP server mode: `swarm --mcp-server` boots as a stdio JSON-RPC
+    # server exposing bash/read/write/edit/glob/grep/web_fetch tools.
+    # No LLM, no agent loop — pure tool execution for orchestrators.
+    if (has_flag(os_args(), "--mcp-server") == 'true') {
+        mcp_server_opts = %{cwd: resolve_cwd()}
+        McpServer.run(mcp_server_opts)
+        sys_exit(0)
+    }
     # CLI flags (--help / --version / --print-config) print and exit
     # before any runtime setup. Returns "ok" when no flag was given.
     handle_cli_flags(os_args())
@@ -349,6 +358,7 @@ fun print_usage() {
     print("  swarm -p \"...\" --json   headless + a final JSON result line")
     print("  swarm -p \"...\" --no-resume   start fresh, ignore .active session")
     print("  swarm doctor           validate config, endpoint, dirs, version")
+    print("  swarm --mcp-server     start as a stdio MCP tool server (JSON-RPC 2.0)")
     print("  swarm --help, -h       show this help and exit")
     print("  swarm --version, -V    print the version and exit")
     print("  swarm --print-config   show the resolved config and exit")
@@ -552,6 +562,15 @@ fun load_opts() {
                                       if (tfs == "native") { 'native' } else { 'inband' }}
                            } else { nil }
 
+    # Multi-provider failover chain. SWARM_CODE_PROVIDERS_JSON env var wins;
+    # otherwise read "providers" array from settings.json root.
+    # Each entry: {"endpoint":"...","model":"...","api_key":"...","tool_format":"native"|"inband"}
+    # Max 3 providers. When set, overrides primary endpoint/model/api_key.
+    providers_env_raw = getenv("SWARM_CODE_PROVIDERS_JSON")
+    providers_settings_raw = if (settings == nil) { nil } else { map_get(settings, 'providers') }
+    providers = if (providers_env_raw != nil) { json_decode(providers_env_raw) }
+                else { providers_settings_raw }
+
     %{
         endpoint: endpoint,
         model: model,
@@ -568,7 +587,8 @@ fun load_opts() {
         fallback_endpoint:    fallback_endpoint,
         fallback_model:       fallback_model,
         fallback_key:         fallback_key,
-        fallback_tool_format: fallback_tool_format
+        fallback_tool_format: fallback_tool_format,
+        providers: providers
     }
 }
 
@@ -598,7 +618,8 @@ fun find_positional_profile(args, profiles) {
                            else { if (a == "--print") { 'true' }
                            else { if (a == "--profile") { 'true' }
                            else { if (a == "-P") { 'true' }
-                           else { 'false' }}}}
+                           else { if (a == "--mcp-server") { 'false' }
+                           else { 'false' }}}}}
             if (value_taking == 'true' && length(rest) > 0) {
                 find_positional_profile(tl(rest), profiles)
             } else {

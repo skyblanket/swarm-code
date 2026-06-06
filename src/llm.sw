@@ -3,6 +3,7 @@ module LLM
 import Log
 import ToolSchemas
 import Markdown
+import Hooks
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -823,15 +824,75 @@ fun inband_tc_loop(tcs, acc) {
 }
 
 # ============================================================
+# chat_with_providers — try each provider in order, falling back on nil
+# ============================================================
+# providers is a list of maps: [{endpoint, model, api_key, tool_format}, ...]
+# idx is the current provider index (0-based).
+# Builds per-provider opts by overlaying provider fields onto base opts,
+# then calls chat_native_retry/chat_inband_retry. On nil, advances to idx+1.
+fun chat_with_providers(messages, opts, providers, idx) {
+    plen = length(providers)
+    if (idx >= plen) {
+        print("  \e[38;5;208m✗ all " ++ to_string(plen) ++ " providers failed\e[0m")
+        nil
+    } else {
+        p = nth_safe(providers, idx)
+        p_ep  = map_get(p, 'endpoint')
+        p_mod = map_get(p, 'model')
+        p_key = map_get(p, 'api_key')
+        p_tf  = map_get(p, 'tool_format')
+        p_opts0 = if (p_ep  != nil) { map_put(opts,   'endpoint',    to_string(p_ep))  } else { opts   }
+        p_opts1 = if (p_mod != nil) { map_put(p_opts0, 'model',       to_string(p_mod)) } else { p_opts0 }
+        p_opts2 = if (p_key != nil) { map_put(p_opts1, 'api_key',     to_string(p_key)) } else { p_opts1 }
+        p_opts3 = if (p_tf  != nil) {
+                      tfs = to_string(p_tf)
+                      tf_atom = if (tfs == "native") { 'native' } else { 'inband' }
+                      map_put(p_opts2, 'tool_format', tf_atom)
+                  } else { p_opts2 }
+        # Show which provider we are trying (1-based display)
+        ep_display = if (p_ep != nil) { to_string(p_ep) } else { to_string(map_get(opts, 'endpoint')) }
+        if (idx > 0) {
+            print("  \e[38;5;245m↳ provider " ++ to_string(idx + 1) ++ "/" ++ to_string(plen) ++ ": " ++ ep_display ++ "\e[0m")
+        }
+        eff = apply_override(p_opts3)
+        tf = map_get(eff, 'tool_format')
+        result = if (tf == 'native') { chat_native_retry(messages, eff, 0) }
+                 else { chat_inband_retry(messages, eff, 0) }
+        if (result == nil) {
+            chat_with_providers(messages, opts, providers, idx + 1)
+        } else {
+            result
+        }
+    }
+}
+
+# ============================================================
 # chat — public entry, dispatches on tool_format
 # ============================================================
 fun chat(messages, opts) {
-    eff = apply_override(opts)
-    tool_format = map_get(eff, 'tool_format')
-    if (tool_format == 'native') {
-        chat_native_retry(messages, eff, 0)
+    providers = map_get(opts, 'providers')
+    if (providers != nil && length(providers) > 0) {
+        chat_with_providers(messages, opts, providers, 0)
     } else {
-        chat_inband_retry(messages, eff, 0)
+        eff = apply_override(opts)
+        model = map_get(eff, 'model')
+        Hooks.run_pre_llm(model, length(messages), eff)
+        start_ms = timestamp()
+        tool_format = map_get(eff, 'tool_format')
+        result = if (tool_format == 'native') {
+            chat_native_retry(messages, eff, 0)
+        } else {
+            chat_inband_retry(messages, eff, 0)
+        }
+        latency = timestamp() - start_ms
+        tokens = if (result == nil) { 0 }
+                 else {
+                     table = map_get(eff, 'llm_stats_table')
+                     tt = if (table == nil) { nil } else { ets_get(table, 'total_tokens') }
+                     if (tt == nil) { 0 } else { tt }
+                 }
+        Hooks.run_post_llm(model, tokens, latency, eff)
+        result
     }
 }
 
