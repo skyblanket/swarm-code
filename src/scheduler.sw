@@ -16,7 +16,8 @@ import Util
 #         "prompt": "review open PRs",
 #         "created_at": 1779635000000, # ms since epoch
 #         "last_run": 0,
-#         "runs": 0
+#         "runs": 0,
+#         "paused": false
 #       },
 #       ...
 #     ]
@@ -43,7 +44,8 @@ export [
     load, add, remove, list_all, tick,
     schedule_path, jobs_dir,
     parse_expr, parse_interval, daily_time_ms, compute_next_fire,
-    swarm_binary_path, prune_old_out_files
+    swarm_binary_path, prune_old_out_files,
+    pause_job, resume_job
 ]
 
 fun schedule_path() { getenv("HOME") ++ "/.swarm-code/schedule.json" }
@@ -101,7 +103,8 @@ fun add(expr, prompt) {
             # heartbeat fires the job immediately on creation (and a past-slot
             # daily HH:MM fires right away) instead of after one interval.
             last_run: timestamp(),
-            runs: 0
+            runs: 0,
+            paused: 'false'
         }
         save_all(list_append(jobs, job))
         id
@@ -145,6 +148,9 @@ fun remove_loop(jobs, target, acc) {
 # ------------------------------------------------------------
 fun tick(opts) {
     jobs = list_all()
+    # Always prune output files, even when the job list is empty or corrupt,
+    # so .out files don't accumulate unbounded if schedule.json is wiped.
+    prune_old_out_files(jobs)
     if (length(jobs) == 0) { 'noop' }
     else {
         now = timestamp()
@@ -152,8 +158,6 @@ fun tick(opts) {
         updated = elem(r, 0)
         dirty = elem(r, 1)
         if (dirty == 'true') { save_all(updated) }
-        # Prune .out files older than 7 days so output doesn't accumulate unbounded.
-        prune_old_out_files()
         'ok'
     }
 }
@@ -174,16 +178,22 @@ fun tick_loop(jobs, now, acc, dirty) {
 # unchanged (no mutation). When fire: dispatches and returns a new
 # job with last_run + runs bumped.
 fun maybe_fire(job, now) {
-    expr = to_string(map_get(job, 'expr'))
-    last_run = map_get(job, 'last_run', 0)
-    next_fire = compute_next_fire(expr, last_run, now)
-    if (next_fire == nil || next_fire > now) { {job, 'false'} }
+    # Skip paused jobs entirely — do not advance last_run so they
+    # fire immediately on resume (not wait another full interval).
+    paused = map_get(job, 'paused', 'false')
+    if (to_string(paused) == "true") { {job, 'false'} }
     else {
-        dispatch(job)
-        runs = map_get(job, 'runs')
-        new_runs = if (runs == nil) { 1 } else { runs + 1 }
-        new_job = map_put(map_put(job, 'last_run', now), 'runs', new_runs)
-        {new_job, 'true'}
+        expr = to_string(map_get(job, 'expr'))
+        last_run = map_get(job, 'last_run', 0)
+        next_fire = compute_next_fire(expr, last_run, now)
+        if (next_fire == nil || next_fire > now) { {job, 'false'} }
+        else {
+            dispatch(job)
+            runs = map_get(job, 'runs')
+            new_runs = if (runs == nil) { 1 } else { runs + 1 }
+            new_job = map_put(map_put(job, 'last_run', now), 'runs', new_runs)
+            {new_job, 'true'}
+        }
     }
 }
 
@@ -252,7 +262,7 @@ fun parse_interval(s) {
     }
 }
 
-# daily_time_ms — parse "daily HH:MM" → ms since midnight, or nil
+# daily_time_ms — parse "daily HH:MM" -> ms since midnight, or nil
 # if the expression isn't a daily-with-time form. Used by
 # compute_next_fire to schedule wallclock-aligned fires.
 fun daily_time_ms(s) {
@@ -286,6 +296,10 @@ fun daily_time_ms(s) {
 #      on top ("swarm-bomb").
 # ------------------------------------------------------------
 fun dispatch(job) {
+    # Re-create jobs_dir() if it was deleted externally since startup.
+    # Without this, the nohup redirect and pid echo both silently fail,
+    # causing an infinite silent-retry loop on every subsequent tick.
+    file_mkdir(jobs_dir())
     id = to_string(map_get(job, 'id'))
     pid_file = jobs_dir() ++ "/scheduled-" ++ id ++ ".pid"
     if (previous_fire_alive(pid_file) == 'true') { 'skipped_busy' }
@@ -320,20 +334,89 @@ fun previous_fire_alive(pid_file) {
 }
 
 # ------------------------------------------------------------
-# prune_old_out_files — delete .out files from jobs_dir() that are
-# older than 7 days. Called from tick() once per scheduler cycle so
-# scheduled-job output doesn't accumulate unbounded. Uses `find` with
-# -mtime +6 (modified more than 6*24h ago, i.e. >= 7 days old).
-# Silently skips if the dir doesn't exist or find fails.
+# prune_old_out_files — keep only the newest MAX_OUT_FILES .out files
+# per job. Called from tick() unconditionally (even when the job list
+# is empty/corrupt) so output can never accumulate unbounded.
+#
+# Strategy: for each known job ID, list all matching
+# scheduled-<id>-<ts>.out files sorted by mtime newest-first.
+# Delete everything beyond the newest 10. Also runs a single global
+# sweep to catch orphaned .out files left behind by removed jobs
+# (any file whose ID is no longer in the jobs list AND age > 7 days).
 # ------------------------------------------------------------
-fun prune_old_out_files() {
+fun max_out_files() { 10 }
+
+fun prune_old_out_files(jobs) {
     dir = jobs_dir()
     if (file_exists(dir) == 'false') { 'skipped' }
     else {
-        cmd = "find " ++ Util.shell_q(dir) ++
-              " -maxdepth 1 -name 'scheduled-*.out' -mtime +6 -delete 2>/dev/null; true"
-        shell(cmd)
+        # Per-job retention: keep newest max_out_files() per job.
+        prune_jobs_loop(jobs, dir)
+        # Global sweep: remove orphan .out files older than 7 days.
+        orphan_cmd = "find " ++ Util.shell_q(dir) ++
+                     " -maxdepth 1 -name 'scheduled-*.out' -mtime +6 -delete 2>/dev/null; true"
+        shell(orphan_cmd)
         'pruned'
+    }
+}
+
+fun prune_jobs_loop(jobs, dir) {
+    if (length(jobs) == 0) { 'ok' }
+    else {
+        j = hd(jobs)
+        id = to_string(map_get(j, 'id'))
+        prune_job_outputs(id, dir)
+        prune_jobs_loop(tl(jobs), dir)
+    }
+}
+
+# Keep the newest max_out_files() .out files for job `id`.
+# Uses `ls -1t` (sort newest-first by mtime) and pipes through
+# tail to find the excess, then deletes them.
+fun prune_job_outputs(id, dir) {
+    pattern = Util.shell_q(dir) ++ "/scheduled-" ++ Util.shell_q(id) ++ "-*.out"
+    keep = to_string(max_out_files())
+    # ls -1t: one-file-per-line, newest first. tail -n +N: lines after the
+    # Nth (i.e. the oldest beyond the keep window). xargs rm -f: delete them.
+    # If fewer than keep files exist, tail -n +N produces nothing, xargs is a no-op.
+    cmd = "ls -1t " ++ pattern ++ " 2>/dev/null | tail -n +" ++ keep ++
+          " | xargs rm -f 2>/dev/null; true"
+    shell(cmd)
+    'ok'
+}
+
+# ------------------------------------------------------------
+# pause_job / resume_job — toggle the 'paused' flag on a job and
+# persist the change to schedule.json. Returns 'true' on success,
+# 'false' if no job with that ID exists.
+# ------------------------------------------------------------
+fun pause_job(id) {
+    set_paused(to_string(id), 'true')
+}
+
+fun resume_job(id) {
+    set_paused(to_string(id), 'false')
+}
+
+fun set_paused(target_id, paused_val) {
+    jobs = list_all()
+    r = set_paused_loop(jobs, target_id, paused_val, [], 'false')
+    new_jobs = elem(r, 0)
+    found = elem(r, 1)
+    if (found == 'true') { save_all(new_jobs) ; 'true' }
+    else { 'false' }
+}
+
+fun set_paused_loop(jobs, target_id, paused_val, acc, found) {
+    if (length(jobs) == 0) { {acc, found} }
+    else {
+        j = hd(jobs)
+        if (to_string(map_get(j, 'id')) == target_id) {
+            new_j = map_put(j, 'paused', paused_val)
+            set_paused_loop(tl(jobs), target_id, paused_val, list_append(acc, new_j), 'true')
+        } else {
+            set_paused_loop(tl(jobs), target_id, paused_val, list_append(acc, j), found)
+        }
     }
 }
 

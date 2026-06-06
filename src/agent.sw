@@ -828,6 +828,15 @@ fun slash_dispatch(cmd, history, opts) {
         run_turn(with_reflect, opts, 0)
     }
     else { if (cmd == "/mcp") { print(Mcp.list_servers(map_get(opts, 'mcp_table'))) ; history }
+    else { if (cmd == "/mcp reconnect") {
+        Mcp.reconnect(map_get(opts, 'mcp_table'), 'all', map_get(opts, 'settings'))
+        history
+    }
+    else { if (string_starts_with(cmd, "/mcp reconnect ") == 'true') {
+        server_name = string_trim(string_sub(cmd, 15, string_length(cmd) - 15))
+        Mcp.reconnect(map_get(opts, 'mcp_table'), server_name, map_get(opts, 'settings'))
+        history
+    }
     else { if (cmd == "/memory reindex") {
         ep = map_get(opts, 'embed_endpoint', nil)
         if (ep == nil) {
@@ -839,10 +848,13 @@ fun slash_dispatch(cmd, history, opts) {
         }
         history
     }
+    else { if (cmd == "/debug") { show_debug(history, opts) ; history }
+    else { if (cmd == "/debug llm") { show_debug_llm() ; history }
+    else { if (cmd == "/debug tools") { show_debug_tools() ; history }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -852,6 +864,7 @@ fun show_help() {
     print("  /tools                list available tools")
     print("  /todos                show todo list")
     print("  /mcp                  list MCP servers and their tools")
+    print("  /mcp reconnect [NAME] reconnect all (or one) MCP server(s)")
     print("  /plan                 show plan mode (on/off/auto)")
     print("  /plan on|off|auto     set plan mode for this session")
     print("  /model                show active model")
@@ -881,6 +894,9 @@ fun show_help() {
     print("  /autonomy             show autonomy mode (bg_done wake)")
     print("  /reflect              trigger one-shot reflection")
     print("  /memory reindex       embed any un-vectorized memories (requires SWARM_CODE_EMBED_ENDPOINT)")
+    print("  /debug                runtime diagnostics (model, tokens, bg tasks, MCP, schedules)")
+    print("  /debug llm            last 3 LLM calls (model, latency, tokens)")
+    print("  /debug tools          last 10 tool calls")
     print("  /quit /exit           exit")
 }
 
@@ -892,6 +908,83 @@ fun show_status(history, opts) {
     print("  plan     : " ++ Plan.get_mode(opts))
     print("  messages : " ++ to_string(length(history)))
     print("  ~tokens  : " ++ to_string(approx_tokens(history)))
+}
+
+fun show_debug(history, opts) {
+    print("\e[1mdebug\e[0m")
+    print("  model    : " ++ to_string(map_get(opts, 'model')))
+    print("  endpoint : " ++ to_string(map_get(opts, 'endpoint')))
+    print("  messages : " ++ to_string(length(history)))
+    print("  ~tokens  : " ++ to_string(approx_tokens(history)))
+    bg_table = map_get(opts, 'bg_table')
+    bg_count = if (bg_table == nil) { "0" }
+               else {
+                   raw = ets_get(bg_table, 'next_id')
+                   if (raw == nil) { "0" } else { to_string(raw) }
+               }
+    print("  bg tasks : " ++ bg_count)
+    sched_jobs = Scheduler.list_all()
+    print("  schedules: " ++ to_string(length(sched_jobs)))
+    mcp_table = map_get(opts, 'mcp_table')
+    mcp_info = if (mcp_table == nil) { "none" } else { Mcp.list_servers(mcp_table) }
+    print("  mcp      :")
+    print(mcp_info)
+    print(UI.grey_text() ++ "  /debug llm   â last 3 LLM calls" ++ UI.reset())
+    print(UI.grey_text() ++ "  /debug tools â last 10 tool calls" ++ UI.reset())
+}
+
+fun show_debug_llm() {
+    p = Log.path()
+    if (file_exists(p) == 'false') {
+        print("(no telemetry log yet)")
+    } else {
+        print("\e[1mlast 3 LLM calls\e[0m")
+        q = Util.shell_q(p)
+        cmd = "grep 'llm_request\\|llm_response\\|llm_error' " ++ q ++
+              " | tail -30 | python3 -c \"" ++
+              "import sys,json;" ++
+              "rows=[];" ++
+              "[rows.append(json.loads(l)) for l in sys.stdin if l.strip()];" ++
+              "reqs=[r for r in rows if r.get('type')=='llm_request'][-3:];" ++
+              "resps=[r for r in rows if r.get('type')=='llm_response'][-3:];" ++
+              "errs=[r for r in rows if r.get('type')=='llm_error'][-1:];" ++
+              "[print('  req  model=' + str(r.get('model','?')) + ' msgs=' + str(r.get('msgs','?')) + ' chars=' + str(r.get('chars','?'))) for r in reqs];" ++
+              "[print('  resp latency=' + str(r.get('latency_ms','?')) + 'ms chars=' + str(r.get('chars','?')) + ' tools=' + str(r.get('had_tools','?'))) for r in resps];" ++
+              "[print('  ERR  reason=' + str(r.get('reason','?'))) for r in errs]" ++
+              "\""
+        r = shell(cmd)
+        out = elem(r, 1)
+        if (string_length(string_trim(out)) == 0) {
+            print("  (no LLM calls recorded yet)")
+        } else {
+            print(out)
+        }
+    }
+}
+
+fun show_debug_tools() {
+    p = Log.path()
+    if (file_exists(p) == 'false') {
+        print("(no telemetry log yet)")
+    } else {
+        print("\e[1mlast 10 tool calls\e[0m")
+        q = Util.shell_q(p)
+        cmd = "grep 'tool_call' " ++ q ++
+              " | tail -10 | python3 -c \"" ++
+              "import sys,json;" ++
+              "rows=[];" ++
+              "[rows.append(json.loads(l)) for l in sys.stdin if l.strip()];" ++
+              "calls=[r for r in rows if r.get('type')=='tool_call'];" ++
+              "[print('  ' + str(r.get('name','?')) + '  ' + str(r.get('args',''))[:60]) for r in calls]" ++
+              "\""
+        r = shell(cmd)
+        out = elem(r, 1)
+        if (string_length(string_trim(out)) == 0) {
+            print("  (no tool calls recorded yet)")
+        } else {
+            print(out)
+        }
+    }
 }
 
 # ------------------------------------------------------------
@@ -2067,12 +2160,15 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/daemon") { 'true' }
     else { if (cmd == "/reflect") { 'true' }
     else { if (cmd == "/mcp") { 'true' }
+    else { if (cmd == "/mcp reconnect") { 'true' }
+    else { if (string_starts_with(cmd, "/mcp reconnect ") == 'true') { 'true' }
     else { if (cmd == "/memory") { 'true' }
     else { if (cmd == "/plan") { 'true' }
     else { if (cmd == "/quit") { 'true' }
     else { if (cmd == "/exit") { 'true' }
     else { if (cmd == "/reset") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { if (cmd == "/debug") { 'true' }
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # String → atom for tool dispatch. Was a ~50-case if/else; now a

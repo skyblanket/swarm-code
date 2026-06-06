@@ -42,7 +42,7 @@ module Mcp
 # Mcp imports nothing: Tools imports Mcp (for dispatch), so Mcp must
 # not import Tools — the dependency graph stays acyclic.
 
-export [init, call_tool, all_schemas, as_prompt_section, list_servers, shutdown]
+export [init, call_tool, all_schemas, as_prompt_section, list_servers, shutdown, reconnect]
 
 # ------------------------------------------------------------
 # Tunables
@@ -719,4 +719,88 @@ fun mcp_shutdown_loop(table, servers) {
         if (handle != nil && handle >= 0) { subprocess_close(handle) }
         mcp_shutdown_loop(table, tl(servers))
     }
+}
+
+# ============================================================
+# reconnect — re-run the boot sequence for one or all servers
+# ============================================================
+# Re-reads each server's spec from settings, tears down any old handle,
+# then re-runs the subprocess spawn + handshake in this process (no
+# background workers — reconnect is interactive and we want the result
+# synchronously for the status message).
+
+fun reconnect(table, name_or_all, settings) {
+    if (table == nil) {
+        print(mcp_warn_c() ++ "mcp: not initialised" ++ mcp_reset())
+    } else {
+        servers_raw = ets_get(table, 'all_servers')
+        servers = if (servers_raw == nil) { [] } else { servers_raw }
+        if (name_or_all == 'all') {
+            mcp_reconnect_loop(table, servers, settings)
+        } else {
+            name = to_string(name_or_all)
+            mcp_reconnect_one(table, name, settings)
+        }
+    }
+}
+
+fun mcp_reconnect_loop(table, servers, settings) {
+    if (length(servers) == 0) { 'ok' }
+    else {
+        mcp_reconnect_one(table, to_string(hd(servers)), settings)
+        mcp_reconnect_loop(table, tl(servers), settings)
+    }
+}
+
+fun mcp_reconnect_one(table, name, settings) {
+    print("  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " mcp: reconnecting " ++ name ++ "...")
+    old_handle = ets_get(table, name ++ "/handle")
+    if (old_handle != nil && old_handle >= 0) { subprocess_close(old_handle) }
+    ets_put(table, name ++ "/status", "reconnecting")
+    ets_put(table, name ++ "/pid", nil)
+    ets_put(table, name ++ "/handle", nil)
+    ets_put(table, name ++ "/tools", nil)
+    spec = mcp_spec_for(name, settings)
+    if (spec == nil) {
+        print("  " ++ mcp_warn_c() ++ "! mcp: no spec for '" ++ name ++
+              "' in settings.json" ++ mcp_reset())
+        ets_put(table, name ++ "/status", "failed")
+        ets_put(table, name ++ "/error", "no spec in settings.json")
+    } else {
+        mcp_ensure_registered(table, name)
+        cmd = mcp_build_command(name, spec)
+        handle = if (cmd == nil) { 0 - 1 } else { subprocess_spawn(cmd) }
+        if (handle >= 0) {
+            subprocess_send_line(handle, mcp_initialize_request())
+        }
+        result = mcp_handshake_one(table, name, handle)
+        if (result == 'ok') {
+            tools = ets_get(table, name ++ "/tools")
+            n = if (tools == nil) { 0 } else { length(tools) }
+            print("  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " mcp: " ++ name ++
+                  " reconnected (" ++ to_string(n) ++ " tools)")
+        }
+    }
+}
+
+fun mcp_spec_for(name, settings) {
+    if (settings == nil) { nil }
+    else {
+        servers = map_get(settings, 'mcpServers')
+        if (servers == nil) { nil }
+        else { map_get(servers, name) }
+    }
+}
+
+fun mcp_ensure_registered(table, name) {
+    servers = ets_get(table, 'all_servers')
+    cur = if (servers == nil) { [] } else { servers }
+    if (mcp_list_contains(cur, name) == 'true') { 'ok' }
+    else { ets_put(table, 'all_servers', cur ++ [name]) }
+}
+
+fun mcp_list_contains(lst, val) {
+    if (length(lst) == 0) { 'false' }
+    else { if (to_string(hd(lst)) == to_string(val)) { 'true' }
+    else { mcp_list_contains(tl(lst), val) } }
 }
