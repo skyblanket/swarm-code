@@ -46,6 +46,7 @@ import Log
 import Mcp
 import ToolGuardrails
 import McpServer
+import Version
 
 fun main() {
     # MCP server mode: `swarm --mcp-server` boots as a stdio JSON-RPC
@@ -280,8 +281,10 @@ fun ensure_gitignore() {
     }
 }
 
-# Keep in sync with the release tag — see .github/workflows/release.yml.
-fun swarm_version() { "0.2.0" }
+# Version comes from the VERSION file at the repo root, via the
+# src/Version.sw module make generates at build time. Release tags in
+# .github/workflows/release.yml should match VERSION.
+fun swarm_version() { Version.version() }
 
 # Presence test for a flag anywhere in argv. argv[0] is the binary
 # path; position and order of the rest don't matter.

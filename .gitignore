@@ -15,6 +15,7 @@
 !/src/
 !/docs/
 !/tests/
+!/VERSION
 
 # Inside scripts/, only install.* belongs to swarm-code; the rest is
 # noise from earlier sessions and stays untracked.
@@ -22,9 +23,11 @@ scripts/*
 !scripts/install.sh
 !scripts/install.ps1
 
-# Inside src/, ignore generated C output from `swc build`.
+# Inside src/, ignore generated C output from `swc build` and the
+# version module make generates from the VERSION file.
 src/*.gen.c
 src/*.gen.h
+src/Version.sw
 
 # Editor / OS noise (anywhere)
 .DS_Store
