@@ -70,9 +70,14 @@ fun launch(table, command, label) {
     # nohup + disown + save pid + capture exit code.
     # The wrapper shell runs the command, then writes its exit code to
     # exit_file. disown detaches it so swarm-code can exit freely.
+    # The rm -f first is load-bearing: bg-N ids restart at 0 every
+    # session and /tmp/swarm-code-bg-N.* files are never cleaned, so a
+    # stale exit file from a previous session would instantly mark this
+    # fresh task done (poll_and_notify and Flows both file_exists it).
     exit_file = "/tmp/swarm-code-" ++ task_id ++ ".exit"
     wrapped = "(" ++ command ++ "); echo $? > " ++ exit_file
     detach_cmd =
+        "rm -f " ++ exit_file ++ " " ++ pid_file ++ " " ++ log_file ++ "; " ++
         "nohup sh -c " ++ Util.shell_q(wrapped) ++
         " > " ++ log_file ++ " 2>&1 & " ++
         "echo $! > " ++ pid_file ++ "; " ++

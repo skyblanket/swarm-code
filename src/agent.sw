@@ -39,6 +39,7 @@ import Trajectory
 import Util
 import ToolGuardrails
 import Plan
+import Flows
 
 export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS]
 
@@ -851,10 +852,20 @@ fun slash_dispatch(cmd, history, opts) {
     else { if (cmd == "/debug") { show_debug(history, opts) ; history }
     else { if (cmd == "/debug llm") { show_debug_llm() ; history }
     else { if (cmd == "/debug tools") { show_debug_tools() ; history }
+    else { if (first_token(cmd) == "/flows") {
+        path = string_sub(cmd, 7, string_length(cmd) - 7)
+        if (string_length(path) == 0) {
+            print("\e[33musage: /flows <workflow-definition.json>\e[0m")
+            history
+        } else {
+            Flows.run_flows(string_trim(path), opts)
+            history
+        }
+    }
     else {
         print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 fun show_help() {
@@ -884,6 +895,7 @@ fun show_help() {
     print("  /cost                 session cost (local = $0)")
     print("  /telemetry            last 30 events (LLM, tools, errors)")
     print("  /stats                today's session summary")
+    print("  /flows <workflow.json>  run a multi-agent workflow with live TUI")
     print("  /clear                clear screen")
     print("  /reset                clear conversation history")
     print("  /compact              summarize history to save context")
@@ -908,6 +920,18 @@ fun show_status(history, opts) {
     print("  plan     : " ++ Plan.get_mode(opts))
     print("  messages : " ++ to_string(length(history)))
     print("  ~tokens  : " ++ to_string(approx_tokens(history)))
+}
+
+# Truncate string for inline preview.
+fun preview_string(s, cap) {
+    if (string_length(s) <= cap) { s }
+    else { string_sub(s, 0, cap) ++ " ..." }
+}
+
+# String → atom for tool dispatch. Walks ToolRegistry; unknown names
+# pass through as strings (MCP tools use mcp__* prefix, resolve in tools.sw).
+fun string_to_atom(s) {
+    ToolRegistry.atom_for(s)
 }
 
 fun show_debug(history, opts) {
@@ -2168,19 +2192,8 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/exit") { 'true' }
     else { if (cmd == "/reset") { 'true' }
     else { if (cmd == "/debug") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { if (cmd == "/flows") { 'true' }
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
-# String → atom for tool dispatch. Was a ~50-case if/else; now a
-# one-liner that walks the central ToolRegistry. Unknown names pass
-# through as strings (MCP tools have the mcp__* prefix and resolve
-# in tools.sw exec).
-fun string_to_atom(s) {
-    ToolRegistry.atom_for(s)
-}
-
-# Truncate string for inline preview.
-fun preview_string(s, cap) {
-    if (string_length(s) <= cap) { s }
-    else { string_sub(s, 0, cap) ++ " ..." }
-}
+# (preview_string and string_to_atom moved earlier — see below)
