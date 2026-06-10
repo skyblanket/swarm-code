@@ -188,11 +188,18 @@ fun maybe_fire(job, now) {
         next_fire = compute_next_fire(expr, last_run, now)
         if (next_fire == nil || next_fire > now) { {job, 'false'} }
         else {
-            dispatch(job)
-            runs = map_get(job, 'runs')
-            new_runs = if (runs == nil) { 1 } else { runs + 1 }
-            new_job = map_put(map_put(job, 'last_run', now), 'runs', new_runs)
-            {new_job, 'true'}
+            d = dispatch(job)
+            # skipped_busy (previous fire still running): do NOT bump
+            # last_run/runs — leave the job due so it retries on the
+            # next tick once the child exits, instead of silently
+            # swallowing the fire for a whole interval.
+            if (d == 'skipped_busy') { {job, 'false'} }
+            else {
+                runs = map_get(job, 'runs')
+                new_runs = if (runs == nil) { 1 } else { runs + 1 }
+                new_job = map_put(map_put(job, 'last_run', now), 'runs', new_runs)
+                {new_job, 'true'}
+            }
         }
     }
 }
@@ -308,27 +315,61 @@ fun dispatch(job) {
         ts = to_string(timestamp())
         out_path = jobs_dir() ++ "/scheduled-" ++ id ++ "-" ++ ts ++ ".out"
         bin = swarm_binary_path()
+        # Pidfile records "PID LSTART" (process start-time) so
+        # previous_fire_alive can detect a recycled PID — kill(pid,0)
+        # alone returns alive on EPERM, wedging the job in skipped_busy.
         inner =
             "nohup " ++ Util.shell_q(bin) ++ " --no-resume -p " ++ Util.shell_q(prompt) ++
-            " > " ++ Util.shell_q(out_path) ++ " 2>&1 & echo $! > " ++ Util.shell_q(pid_file)
+            " > " ++ Util.shell_q(out_path) ++ " 2>&1 & SW_PID=$!; " ++
+            "echo \"$SW_PID $(ps -o lstart= -p \"$SW_PID\" 2>/dev/null)\" > " ++ Util.shell_q(pid_file)
         shell("bash -c " ++ Util.shell_q(inner))
         'dispatched'
     }
 }
 
 # Has the previous fire's child exited? Cheap kill(pid, 0) check via
-# the pid_alive builtin — no shell() overhead. Returns 'true' if the
-# previous child is still alive (so we should back off), 'false'
-# otherwise (no pidfile, parse fail, or process gone).
+# the pid_alive builtin first — no shell() overhead on the common
+# (dead) path. pid_alive returns 'true' on EPERM too, so a recycled
+# PID owned by another user would wedge the job in skipped_busy
+# forever; when the pidfile carries an LSTART field we re-verify the
+# process start-time via ps and treat a mismatch as "recycled, gone".
+# Returns 'true' if the previous child is still alive (so we should
+# back off), 'false' otherwise (no pidfile, parse fail, process gone,
+# or PID recycled).
 fun previous_fire_alive(pid_file) {
     if (file_exists(pid_file) == 'false') { 'false' }
     else {
         pid_content = file_read(pid_file)
         if (pid_content == nil) { 'false' }
         else {
-            pid_str = string_trim(to_string(pid_content))
-            if (string_length(pid_str) == 0) { 'false' }
-            else { pid_alive(pid_str) }
+            content = string_trim(to_string(pid_content))
+            if (string_length(content) == 0) { 'false' }
+            else {
+                # Pidfile format: "PID LSTART". LSTART itself contains
+                # spaces ("Tue Jun 10 08:15:01 2026"), so take the first
+                # token as the PID and slice the remainder as LSTART
+                # instead of rejoining split parts.
+                parts = string_split(content, " ")
+                pid_str = hd(parts)
+                lstart = if (length(parts) > 1) {
+                    string_trim(string_sub(content, string_length(pid_str) + 1,
+                                           string_length(content) - string_length(pid_str) - 1))
+                } else { "" }
+                if (pid_alive(pid_str) == 'false') { 'false' }
+                else {
+                    # Old-format pidfile (bare PID, pre start-time): fall
+                    # back to the pid_alive answer for back-compat.
+                    if (string_length(lstart) == 0) { 'true' }
+                    else {
+                        # Alive — but is it OUR child or a recycled PID?
+                        # shell() polls at ~1s, so only pay for this on the
+                        # already-rare path where pid_alive says 'true'.
+                        r = shell("ps -o lstart= -p " ++ Util.shell_q(pid_str) ++ " 2>/dev/null")
+                        current = string_trim(elem(r, 1))
+                        if (current == lstart) { 'true' } else { 'false' }
+                    }
+                }
+            }
         }
     }
 }
@@ -375,9 +416,11 @@ fun prune_jobs_loop(jobs, dir) {
 # tail to find the excess, then deletes them.
 fun prune_job_outputs(id, dir) {
     pattern = Util.shell_q(dir) ++ "/scheduled-" ++ Util.shell_q(id) ++ "-*.out"
-    keep = to_string(max_out_files())
-    # ls -1t: one-file-per-line, newest first. tail -n +N: lines after the
-    # Nth (i.e. the oldest beyond the keep window). xargs rm -f: delete them.
+    # tail -n +N prints from line N onward, so keeping the newest
+    # max_out_files() means deleting from line max_out_files()+1.
+    keep = to_string(max_out_files() + 1)
+    # ls -1t: one-file-per-line, newest first. tail -n +N: lines from the
+    # Nth onward (i.e. the oldest beyond the keep window). xargs rm -f: delete them.
     # If fewer than keep files exist, tail -n +N produces nothing, xargs is a no-op.
     cmd = "ls -1t " ++ pattern ++ " 2>/dev/null | tail -n +" ++ keep ++
           " | xargs rm -f 2>/dev/null; true"

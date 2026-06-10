@@ -79,8 +79,10 @@ fun mcp_log_path(server) {
 #
 # Table layout:
 #   'all_servers'        → [server_name, ...]  (every configured one)
-#   <server>/status      → "ok" | "failed"
+#   <server>/status      → "starting" | "ok" | "failed" | "reconnecting"
 #   <server>/error       → failure reason (when failed)
+#   <server>/fail_count  → consecutive tools/call timeouts (resets on success)
+#   <server>/last_retry  → timestamp of last automatic reconnect attempt
 #   <server>/handle      → subprocess handle int (when ok)
 #   <server>/pid         → owner process pid    (when ok)
 #   <server>/tools       → raw tool maps from tools/list (when ok)
@@ -101,11 +103,16 @@ fun init(settings) {
             print("  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " \e[1mMCP\e[0m " ++
                   mcp_dim() ++ "— starting " ++ to_string(length(names)) ++
                   " server(s)…" ++ mcp_reset())
+            # Pre-register every configured server in 'all_servers' with
+            # status "starting" BEFORE spawning workers — a server whose
+            # handshake finishes after the boot deadline below still lands
+            # visible (its worker writes status/handle/pid/tools regardless),
+            # so it isn't an invisible orphan and shutdown can close it.
+            mcp_preregister(table, names)
             # One boot worker per server — they spawn + handshake in
             # parallel, so total boot time is max(server), not sum.
             # Each worker writes its own <server>/* keys (distinct, no
-            # race); this process is the sole writer of 'all_servers',
-            # appending each name as its worker reports done.
+            # race); 'all_servers' is already complete from pre-registration.
             mcp_spawn_boot_workers(table, names, specs, self())
             mcp_collect_boots(table, length(names), timestamp() + mcp_boot_deadline_ms())
             table
@@ -139,8 +146,21 @@ fun mcp_boot_worker(table, name, spec, parent) {
     'ok'
 }
 
-# Collect one {'mcp_boot_done', name} per server, appending each name
-# to 'all_servers' (single-writer — workers never touch that list).
+# Register every configured server name (as a string) up front, each
+# with status "starting" — workers overwrite that with "ok"/"failed".
+fun mcp_preregister(table, names) {
+    if (length(names) == 0) { 'ok' }
+    else {
+        name = to_string(hd(names))
+        mcp_ensure_registered(table, name)
+        ets_put(table, name ++ "/status", "starting")
+        mcp_preregister(table, tl(names))
+    }
+}
+
+# Collect one {'mcp_boot_done', name} per server — purely the boot
+# pause; names are already in 'all_servers' from mcp_preregister, so a
+# worker finishing after the deadline still shows up everywhere.
 fun mcp_collect_boots(table, remaining, deadline) {
     if (remaining <= 0) { 'ok' }
     else {
@@ -149,8 +169,7 @@ fun mcp_collect_boots(table, remaining, deadline) {
         else {
             receive {
                 {'mcp_boot_done', name} ->
-                    cur = ets_get(table, 'all_servers')
-                    ets_put(table, 'all_servers', cur ++ [name])
+                    mcp_ensure_registered(table, name)
                     mcp_collect_boots(table, remaining - 1, deadline)
                 after wait { 'ok' }
             }
@@ -248,7 +267,7 @@ fun mcp_handshake_one(table, name, handle) {
             } else {
                 subprocess_send_line(handle,
                     json_encode(%{jsonrpc: "2.0", method: "notifications/initialized"}))
-                tools = mcp_list_tools(handle, 1, nil, [])
+                tools = mcp_list_tools(handle, 1, nil, [], deadline)
                 if (tools == nil) {
                     mcp_fail(table, name, handle, "tools/list failed")
                 } else {
@@ -268,14 +287,19 @@ fun mcp_fail(table, name, handle, why) {
 }
 
 # tools/list with cursor pagination. Returns the full tool list, or
-# nil on a transport / protocol failure.
-fun mcp_list_tools(handle, id, cursor, acc) {
+# nil on a transport / protocol failure. The whole pagination shares
+# one cumulative `deadline` (the handshake's) — per-page budgets would
+# let a cursor-looping server hold boot hostage indefinitely. Pages
+# are also capped outright as a second guard.
+fun mcp_list_tools(handle, id, cursor, acc, deadline) {
+    if (id > 50) { acc }
+    else {
     params = if (cursor == nil) { %{} } else { %{cursor: cursor} }
     req = %{jsonrpc: "2.0", id: id, method: "tools/list", params: params}
     sent = subprocess_send_line(handle, json_encode(req))
     if (sent != 'ok') { nil }
     else {
-        resp = mcp_read_response(handle, id, timestamp() + mcp_handshake_timeout_ms())
+        resp = mcp_read_response(handle, id, deadline)
         if (resp == nil) { nil }
         else {
             err = map_get(resp, 'error')
@@ -289,10 +313,11 @@ fun mcp_list_tools(handle, id, cursor, acc) {
                            else { if (is_list(page) == 'true') { acc ++ page } else { acc } }
                     nxt = map_get(result, 'nextCursor')
                     if (nxt == nil) { acc2 }
-                    else { mcp_list_tools(handle, id + 1, nxt, acc2) }
+                    else { mcp_list_tools(handle, id + 1, nxt, acc2, deadline) }
                 }
             }
         }
+    }
     }
 }
 
@@ -304,6 +329,7 @@ fun mcp_register(table, name, handle, tools) {
     ets_put(table, name ++ "/handle", handle)
     ets_put(table, name ++ "/pid", owner)
     ets_put(table, name ++ "/tools", tools)
+    ets_put(table, name ++ "/fail_count", 0)
     mcp_index_tools(table, name, tools)
     print("  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " " ++ name ++
           mcp_dim() ++ " — " ++ to_string(length(tools)) ++ " tool(s) ready" ++ mcp_reset())
@@ -351,6 +377,10 @@ fun mcp_owner_loop(name, handle, next_id) {
             result = mcp_do_call(handle, next_id, tool_name, args)
             if (reply_pid != nil) { send(reply_pid, {'mcp_result', token, result}) }
             mcp_owner_loop(name, handle, next_id + 1)
+        {'mcp_shutdown'} ->
+            # Reconnect retired this owner's handle — exit instead of
+            # parking forever on a dead pipe.
+            'ok'
         _other ->
             mcp_owner_loop(name, handle, next_id)
     }
@@ -395,7 +425,9 @@ fun mcp_read_response(handle, want_id, deadline) {
                 mcp_read_response(handle, want_id, deadline)
             } else {
                 rid = map_get(decoded, 'id')
-                if (rid == want_id) { decoded }
+                # Compare ids as strings — some servers echo numeric ids
+                # back as strings, which would otherwise never match.
+                if (rid != nil && to_string(rid) == to_string(want_id)) { decoded }
                 else { mcp_read_response(handle, want_id, deadline) }
             }
         }
@@ -481,12 +513,58 @@ fun mcp_await_result(server, token, deadline) {
     }
 }
 
-# A connection-level failure string means the server process is gone.
-fun mcp_is_dead_result(r) {
-    rs = to_string(r)
-    if (string_contains(rs, "connection lost") == 'true') { 'true' }
-    else { if (string_contains(rs, "did not respond") == 'true') { 'true' }
-    else { 'false' }}
+# A write failure means the pipe (and so the server process) is gone.
+fun mcp_is_conn_lost(r) {
+    if (string_contains(to_string(r), "connection lost") == 'true') { 'true' }
+    else { 'false' }
+}
+
+# A read timeout — the server may just have been slow on this one call.
+fun mcp_is_timeout_result(r) {
+    if (string_contains(to_string(r), "did not respond") == 'true') { 'true' }
+    else { 'false' }
+}
+
+# A failed server gets one automatic reconnect attempt when a call next
+# needs it, at most once per this cooldown — beyond that it stays
+# fast-fail until the user runs /mcp reconnect.
+fun mcp_lazy_retry_cooldown_ms() { 60000 }
+
+# Lazy retry on next use: re-run the boot sequence for a "failed"
+# server, rate-limited by last_retry. Returns the (re-read) status.
+fun mcp_maybe_lazy_reconnect(table, server, opts) {
+    settings = map_get(opts, 'settings')
+    last = ets_get(table, server ++ "/last_retry")
+    now = timestamp()
+    fresh = if (last == nil) { 'false' }
+            else { if (now - last < mcp_lazy_retry_cooldown_ms()) { 'true' } else { 'false' } }
+    if (settings != nil && fresh == 'false') {
+        ets_put(table, server ++ "/last_retry", now)
+        mcp_reconnect_one(table, server, settings)
+    }
+    ets_get(table, server ++ "/status")
+}
+
+# Record a call outcome against the server's health. A lost connection
+# marks it failed at once; a timeout only after two in a row (one slow
+# call shouldn't kill the server); anything else resets the strikes.
+fun mcp_note_result(table, server, r) {
+    if (mcp_is_conn_lost(r) == 'true') {
+        ets_put(table, server ++ "/status", "failed")
+        ets_put(table, server ++ "/error", "stopped responding mid-session")
+    } else {
+        if (mcp_is_timeout_result(r) == 'true') {
+            prev = ets_get(table, server ++ "/fail_count")
+            n = if (prev == nil) { 1 } else { prev + 1 }
+            ets_put(table, server ++ "/fail_count", n)
+            if (n >= 2) {
+                ets_put(table, server ++ "/status", "failed")
+                ets_put(table, server ++ "/error", "stopped responding mid-session")
+            } else { 'ok' }
+        } else {
+            ets_put(table, server ++ "/fail_count", 0)
+        }
+    }
 }
 
 fun call_tool(prefixed, args, opts) {
@@ -502,8 +580,16 @@ fun call_tool(prefixed, args, opts) {
             server = to_string(map_get(info, 'server'))
             tool = to_string(map_get(info, 'tool'))
             status = ets_get(table, server ++ "/status")
-            if (status != "ok") {
-                "error: MCP server '" ++ server ++ "' is not running"
+            # Only a "failed" server gets the lazy retry — "starting" /
+            # "reconnecting" means a handshake is already in flight and
+            # spawning a second subprocess would race it.
+            status2 = if (status == "ok") { status }
+                      else { if (status == "failed") {
+                          mcp_maybe_lazy_reconnect(table, server, opts)
+                      } else { status } }
+            if (status2 != "ok") {
+                "error: MCP server '" ++ server ++ "' is not running (status: " ++
+                    to_string(status2) ++ " — run /mcp reconnect " ++ server ++ " to retry)"
             } else {
                 owner = ets_get(table, server ++ "/pid")
                 if (owner == nil) {
@@ -512,13 +598,7 @@ fun call_tool(prefixed, args, opts) {
                     token = to_string(self()) ++ "/" ++ to_string(timestamp())
                     send(owner, {'mcp_call', tool, args, self(), token})
                     r = mcp_await_result(server, token, timestamp() + mcp_reply_deadline_ms())
-                    # A connection-level failure means the server is gone —
-                    # mark it offline so later calls fail fast instead of
-                    # each blocking for the full timeout.
-                    if (mcp_is_dead_result(r) == 'true') {
-                        ets_put(table, server ++ "/status", "failed")
-                        ets_put(table, server ++ "/error", "stopped responding mid-session")
-                    }
+                    mcp_note_result(table, server, r)
                     r
                 }
             }
@@ -671,13 +751,16 @@ fun mcp_list_loop(table, servers, acc) {
             "  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " " ++ server ++
                 mcp_dim() ++ "  ok · " ++ to_string(n) ++ " tools" ++ mcp_reset() ++ "\n" ++
                 mcp_list_tool_names(server, tools, "")
+        } else { if (status == "starting" || status == "reconnecting") {
+            "  " ++ mcp_dim() ++ "○" ++ mcp_reset() ++ " " ++ server ++
+                mcp_dim() ++ "  " ++ to_string(status) ++ "…" ++ mcp_reset() ++ "\n"
         } else {
             err = ets_get(table, server ++ "/error")
             "  " ++ mcp_warn_c() ++ "⚠" ++ mcp_reset() ++ " " ++ server ++
                 mcp_dim() ++ "  failed — " ++
                 (if (err == nil) { "unknown" } else { to_string(err) }) ++
                 mcp_reset() ++ "\n"
-        }
+        }}
         mcp_list_loop(table, tl(servers), acc ++ line)
     }
 }
@@ -756,6 +839,11 @@ fun mcp_reconnect_one(table, name, settings) {
     print("  " ++ mcp_brand() ++ "⏺" ++ mcp_reset() ++ " mcp: reconnecting " ++ name ++ "...")
     old_handle = ets_get(table, name ++ "/handle")
     if (old_handle != nil && old_handle >= 0) { subprocess_close(old_handle) }
+    # Retire the old owner process too — otherwise it parks forever on
+    # the closed handle's mailbox, leaked, and could even grab a stray
+    # {'mcp_call'} sent before the table was updated.
+    old_pid = ets_get(table, name ++ "/pid")
+    if (old_pid != nil) { send(old_pid, {'mcp_shutdown'}) }
     ets_put(table, name ++ "/status", "reconnecting")
     ets_put(table, name ++ "/pid", nil)
     ets_put(table, name ++ "/handle", nil)
