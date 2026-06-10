@@ -1,5 +1,7 @@
 module Trajectory
 
+import Log
+
 # ============================================================
 # Trajectory — export session journals as OpenAI fine-tuning JSONL
 # ============================================================
@@ -34,9 +36,11 @@ module Trajectory
 #     journal (which already excludes the runtime system prompt by
 #     design — see Agent.encode_journal).
 #
-# Privacy: review before publishing. Sessions can contain API keys
-# in tool output, file paths, conversation content. The exporter
-# does NOT redact.
+# Privacy: every exported line passes through Log.redact, which masks
+# common secret shapes (sk-/AKIA/ghp_-style tokens, Bearer headers,
+# *_key / *_token / *_secret fields, long letter+digit blobs). The
+# heuristics are not exhaustive — still review exports manually before
+# publishing them anywhere.
 
 export [
     export_all, export_current,
@@ -101,7 +105,7 @@ fun export_one(journal_path, out_path) {
         else {
             wire = clean_messages(messages, [])
             example = %{messages: wire}
-            file_append(out_path, json_encode(example) ++ "\n")
+            file_append(out_path, Log.redact(json_encode(example)) ++ "\n")
             'true'
         }
     }
@@ -118,7 +122,7 @@ fun export_current(out_path, history) {
     if (length(wire) < 2) {
         %{path: out_path, kept: 0, reason: "session too short"}
     } else {
-        file_write(out_path, json_encode(%{messages: wire}) ++ "\n")
+        file_write(out_path, Log.redact(json_encode(%{messages: wire})) ++ "\n")
         %{path: out_path, kept: 1}
     }
 }
