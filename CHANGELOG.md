@@ -5,7 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2026-06-01
+## [0.4.0] - 2026-06-10
+
+### Added — launch sweep
+
+- **`/flows` — multi-agent parallel workflow orchestrator.** JSON workflow
+  definitions or inline task pairs fan out as headless swarm-code children
+  with a live 3-panel TUI. Children run with `SWARM_CODE_DENY_DANGEROUS=1`
+  so dangerous bash hard-denies instead of headless auto-approving;
+  `Background.launch` clears stale `/tmp` exit/pid/log files so a previous
+  session can never instantly mark a fresh task done.
+- **Secret redaction** (`Log.redact`) applied to every `events.jsonl` write
+  and both trajectory-export paths. Live env keys, known token prefixes
+  (word-boundary checked), Bearer tokens, key/value shapes, and a long-blob
+  heuristic tuned to skip git SHAs and file paths.
+- **Integration test suite** (`make integration`): mock OpenAI SSE endpoint
+  + the real binary under an isolated `HOME` — prompt round-trip, tool_call
+  round-trip, read/write tools, hardline-block refusal, journal resume.
+- **Single-source version**: `VERSION` file → generated `src/Version.sw` at
+  build time; the binary reports the real release version.
+
+### Fixed — launch sweep
+
+- **MCP lifecycle (audit #14/#15/#16)**: configured servers pre-register as
+  `starting` so late handshakes attach instead of orphaning; failed servers
+  lazily auto-reconnect on next use (60s cooldown) with a 2-strike timeout
+  policy; response-id matching via `to_string` (numeric-vs-string id echo no
+  longer times out every call); pagination under one cumulative deadline.
+- **Scheduler PID-reuse wedge (audit #23)**: pidfile records PID + process
+  start-time and liveness re-verifies `lstart`, so a recycled PID can no
+  longer wedge a job in `skipped_busy`; `skipped_busy` no longer bumps
+  `last_run`; retention off-by-one (keeps the documented 10 newest).
 
 ### Fixed — UI/markdown + full multi-agent audit (39 verified findings, see AUDIT.md)
 

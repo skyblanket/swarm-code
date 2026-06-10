@@ -85,13 +85,18 @@ See `CHANGELOG.md` for the per-fix detail.
 | **P2** | #7 authoritative repaint row count (`stream_content_rows()`) · #8 viewport-aware threshold (`term_rows()`) · #9 markdown links · #10 `finish_reason` recovery via marker · #11 `tok_budget` divide-by-zero clamp · #12 inband marker alignment · #17 hardline word-boundary · #18 `forget` schema · #19 `web_fetch` schema · #20 `max_tokens` int coercion · #21 FTS5 escaping · #22 vision docstring |
 | **P3** | #24 `has_markdown` tightening · #25 `display_width` CSI range · #26 bold flanking guard · #27 `record_usage` no-wipe · #28 dead `"interrupted"` branch · #29 retry jitter `random_int` · #30 subagent `todo_write` block · #31 background `ets_cas` race · #33 (partial — dead `context_meter` schema removed) |
 
+### Closed in the 2026-06-10 launch sweep
+
+| # | Sev | Resolution |
+|---|-----|------------|
+| 14 / 15 / 16 | P2 | MCP lifecycle: servers pre-register as `starting` before boot workers (late handshakes attach); failed servers lazily auto-reconnect on next use (60s cooldown, 2-strike timeout policy); response ids compared via `to_string`; pagination under one cumulative deadline + 50-page cap. |
+| 23 | P2 | Scheduler PID-reuse: pidfile records `PID LSTART`, liveness re-verifies start-time on match; `skipped_busy` no longer bumps `last_run` (job stays due). |
+| 32 | P3 | Retention was already in (56a3e79); fixed keep-count off-by-one (10 newest, as documented). |
+| 33 | P3 | Verified fully removed by b530bce (`context_meter_desc` + `do_context_meter`); nothing dispatches it. |
+
 ### Remaining (follow-up — feature-shaped or low-impact, deliberately deferred)
 
 | # | Sev | Why deferred |
 |---|-----|--------------|
 | 13 | P2 | Daemon `cognitive_pulse` native tool-calls — needs a new native-aware silent chat path (the naive swap breaks `chat_silent`'s string contract); daemon-mode-only, off by default. |
-| 14 / 15 / 16 | P2 | MCP lifecycle (pre-register late servers, `/mcp reconnect`, drain-on-timeout) — genuine features, not one-line fixes; only bites configured-MCP users on a transient failure. |
-| 23 | P2 | Scheduler PID-reuse wedge — needs `pid:starttime` re-verification or child-side pidfile cleanup + not bumping `last_run` on `skipped_busy`; rare trigger (PID recycle within one interval). |
-| 32 | P3 | Scheduled-output retention sweep — slow disk growth only for long-lived frequent jobs. |
-| 33 | P3 | Remove the two remaining dead `context_meter` defs (`prompts.sw`, `tools.sw`); the native-mode-relevant schema is already gone. |
 | 35 | P3 | `run_doctor` nil-`$HOME` graceful exit — needs control-flow restructure (`sw` has no `return`); diagnostics-only, rare env. |
