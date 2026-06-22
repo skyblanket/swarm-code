@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Added `ToolExecutor.sw` as the shared execution-policy boundary for Agent,
+  subagent, and MCP server calls. Context allow-lists, argument-rewriting
+  hooks, guardrails, permissions, and post hooks now follow one path.
+- Centralized MCP server and subagent tool-context policy in `ToolRegistry.sw`.
+- MCP client and server metadata now use the generated single-source version.
+- Added `make check` as the production verification gate and wired CI/release
+  jobs to run unit, smoke, integration, and focused module checks.
+- Switched the built-in and installer-seeded default model to Kimi K2.7 Code
+  (`kimi-k2.7-code`).
+- Added an experimental bounded council runner with read-only panel and
+  no-tools judge execution contexts.
+- Added integration coverage proving council panel children cannot execute
+  shell commands.
+
+### Fixed
+
+- MCP server tool calls can no longer bypass hardline command policy.
+- Hook-rewritten arguments are checked by guardrails and permissions before
+  raw handlers execute.
+- Tool execution now fails closed when its execution context is missing or
+  unknown.
+
+### Documentation
+
+- Replaced the stale comparison review with a current maintainability roadmap.
+- Updated README architecture, source size, and MCP server capability.
+
 ## [0.4.0] - 2026-06-10
 
 ### Added — launch sweep

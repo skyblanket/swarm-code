@@ -35,7 +35,8 @@ fun all_schemas() {
      task_s(),
      browser_launch_s(), browser_navigate_s(), browser_click_s(),
      browser_type_s(), browser_screenshot_s(), browser_get_text_s(),
-     browser_get_html_s(), browser_evaluate_s(), browser_close_s()]
+     browser_get_html_s(), browser_evaluate_s(), browser_close_s(),
+     browser_console_s()]
 }
 
 # Return the schemas as JSON array string, ready for embedding in a
@@ -344,6 +345,14 @@ fun browser_get_text_s() {
 fun browser_get_html_s() {
     tool("browser_get_html",
         "Return document.documentElement.outerHTML — full live DOM.",
+        obj(%{}, []))
+}
+
+fun browser_console_s() {
+    tool("browser_console",
+        "Read the page's captured console output + JS errors (console.log/warn/error, " ++
+        "uncaught exceptions, promise rejections) since page load. Use it to debug a " ++
+        "misbehaving page — e.g. why a WebGL canvas is blank/black. No arguments.",
         obj(%{}, []))
 }
 

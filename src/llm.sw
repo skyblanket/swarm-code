@@ -833,7 +833,7 @@ fun inband_tc_loop(tcs, acc) {
 fun chat_with_providers(messages, opts, providers, idx) {
     plen = length(providers)
     if (idx >= plen) {
-        print("  \e[38;5;208m✗ all " ++ to_string(plen) ++ " providers failed\e[0m")
+        diag(opts, "  \e[38;5;208m✗ all " ++ to_string(plen) ++ " providers failed\e[0m")
         nil
     } else {
         p = nth_safe(providers, idx)
@@ -953,13 +953,13 @@ fun chat_native_retry(messages, opts, attempt) {
                 if (fb_format == 'inband') { chat_inband(messages, fb_opts4) }
                 else { chat_native(messages, fb_opts4) }
             } else {
-                print("  \e[38;5;208m✗ llm call failed after " ++
+                diag(opts, "  \e[38;5;208m✗ llm call failed after " ++
                       to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
                 nil
             }
         } else {
             d = retry_delay_ms(attempt)
-            print("  \e[38;5;208m↻ llm call failed — retrying in " ++
+            diag(opts, "  \e[38;5;208m↻ llm call failed — retrying in " ++
                   to_string(d / 1000) ++ "s (attempt " ++
                   to_string(attempt + 2) ++ "/" ++
                   to_string(max_chat_retries() + 1) ++ ")\e[0m")
@@ -979,7 +979,7 @@ fun chat_inband_retry(messages, opts, attempt) {
     if (needs_retry == 'true' && attempt < max_chat_retries()) {
         d = retry_delay_ms(attempt)
         print("")
-        print("  \e[38;5;208m↻ transport failure — retrying in " ++
+        diag(opts, "  \e[38;5;208m↻ transport failure — retrying in " ++
               to_string(d / 1000) ++ "s (attempt " ++
               to_string(attempt + 2) ++ "/" ++
               to_string(max_chat_retries() + 1) ++ ")\e[0m")
@@ -1032,6 +1032,66 @@ fun unwrap_stream(raw) {
 }
 
 # ============================================================
+# Live-wait feedback — turn the silent TTFT spinner into a real signal
+# ============================================================
+# The swarmrt C runtime owns the terminal line during http_post_stream
+# (spinner + streamed tokens land there). The only window sw controls is
+# BEFORE that call, so we print one dim-grey status line stating the
+# request size and, when we have it, the speed learned from the PREVIOUS
+# turn (latency + completion_tokens already live in llm_stats_table).
+# No disk read, no C-runtime change. First turn degrades to a size-only
+# line — still strictly more than a blank spinner.
+fun wait_hint(opts, body_chars, model) {
+    table = map_get(opts, 'llm_stats_table')
+    kb = body_chars / 1024
+    base = "  \e[38;5;240m↑ " ++ to_string(model) ++ " · " ++
+           to_string(kb) ++ " KB request"
+    line = if (table == nil) { base ++ " · waiting for first token…\e[0m" }
+           else {
+        last_ms = ets_get(table, 'last_latency_ms')
+        last_ct = ets_get(table, 'last_completion_tokens')
+        if (last_ms == nil || last_ct == nil || last_ms == 0 || last_ct == 0) {
+            base ++ " · waiting for first token…\e[0m"
+        } else {
+            # tok/s from the prior turn (latency is ms).
+            tps = (last_ct * 1000) / last_ms
+            if (tps == 0) {
+                # sub-1 tok/s turn — show the warning without a bogus "~0 tok/s".
+                base ++ " · slow model, this can take a while\e[0m"
+            } else {
+                slow = if (tps < 40) { " · slow model, this can take a while" } else { "" }
+                base ++ " · ~" ++ to_string(tps) ++ " tok/s last turn" ++ slow ++ "\e[0m"
+            }
+        }
+    }
+    line
+}
+
+# Persist this turn's observed speed so the NEXT wait_hint reflects real
+# throughput. completion_tokens may be omitted by some servers on
+# truncation — nil-guard skips the update and the prior value stands.
+fun record_turn_speed(opts, latency, ct) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'ok' }
+    else {
+        if (latency != nil && latency > 0) { ets_put(table, 'last_latency_ms', latency) }
+        if (ct != nil && ct > 0) { ets_put(table, 'last_completion_tokens', ct) }
+        'ok'
+    }
+}
+
+# Operator diagnostics (retries, provider/transport failures). swc has no
+# stderr builtin, so these go through print — but stdout is the captured
+# RESULT in headless `-p` and the JSON-RPC stream under --mcp-server, so
+# suppress there (failure is signalled by exit 1 / the --json status).
+# Interactive (TTY) keeps the colored diagnostics.
+fun diag(opts, msg) {
+    if (map_get(opts, 'headless') == 'true') { 'ok' }
+    else { if (map_get(opts, 'execution_context') == "mcp_server") { 'ok' }
+    else { print(msg) } }
+}
+
+# ============================================================
 # Native streaming path — structured tool_calls preserved end-to-end
 # ============================================================
 fun chat_native(messages, opts) {
@@ -1045,6 +1105,9 @@ fun chat_native(messages, opts) {
     file_mkdir(getenv("HOME") ++ "/.swarm-code")
     file_write(getenv("HOME") ++ "/.swarm-code/last-body.json", body)
     Log.llm_request(to_string(model), length(messages), body_chars)
+    # Substantive live-wait line shown for the whole TTFT window; the C
+    # spinner renders beneath it and tokens stream in after.
+    if (map_get(opts, 'headless') != 'true') { print(wait_hint(opts, body_chars, model)) }
     start_ms = timestamp()
 
     base_hdrs = [{"Content-Type", "application/json"}]
@@ -1067,7 +1130,7 @@ fun chat_native(messages, opts) {
             err = map_get(decoded, 'error')
             if (err != nil) {
                 em = map_get(err, 'message')
-                print("  \e[38;5;208m[llm error] " ++ to_string(em) ++ "\e[0m")
+                diag(opts, "  \e[38;5;208m[llm error] " ++ to_string(em) ++ "\e[0m")
                 Log.llm_error("server error", to_string(em))
                 nil
             } else {
@@ -1110,6 +1173,9 @@ fun chat_native(messages, opts) {
 
                     had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
+                    # Feed the learned-speed signal for the next wait_hint.
+                    record_turn_speed(opts, latency,
+                        if (usage == nil) { nil } else { map_get(usage, 'completion_tokens') })
 
                     # Post-stream re-render: wipe the C-streamed prose
                     # and reprint it formatted with the 2-col gutter.
@@ -1174,6 +1240,8 @@ fun chat_inband(messages, opts) {
 
     file_write("/tmp/swarm-code-last-body.json", body)
     Log.llm_request(to_string(model), length(messages), body_chars)
+    # Same live-wait line for the inband (Gemma-style) path.
+    if (map_get(opts, 'headless') != 'true') { print(wait_hint(opts, body_chars, model)) }
     start_ms = timestamp()
 
     base_hdrs = [{"Content-Type", "application/json"}]
@@ -1216,6 +1284,9 @@ fun chat_inband(messages, opts) {
 
             had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
             Log.llm_response(latency, string_length(to_string(prose)), had_tools)
+            # Feed the learned-speed signal for the next wait_hint.
+            record_turn_speed(opts, latency,
+                if (usage == nil) { nil } else { map_get(usage, 'completion_tokens') })
 
             # Sick-server detection: empty response in <500ms with a
             # small body = fingerprint of a wedged / OOM'd serving
@@ -1224,7 +1295,7 @@ fun chat_inband(messages, opts) {
                     && length(tool_calls) == 0
             if (empty == 'true' && latency < 500 && body_chars < 30000) {
                 print("")
-                print("  \e[38;5;208m⚠ server at " ++ to_string(endpoint) ++
+                diag(opts, "  \e[38;5;208m⚠ server at " ++ to_string(endpoint) ++
                       " returned empty in " ++ to_string(latency) ++ "ms\e[0m")
                 print("  \e[38;5;240m(fingerprint of a wedged / OOM'd serving process. " ++
                       "Try restarting vllm on the host.)\e[0m")

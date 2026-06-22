@@ -48,7 +48,7 @@ fun read_as_data_url(path) {
         mime = detect_mime(path)
         if (mime == nil) { nil }
         else {
-            r = shell("base64 -i " ++ Util.shell_q(path) ++ " 2>/dev/null | tr -d '\\n'")
+            r = shell_managed("base64 -i " ++ Util.shell_q(path) ++ " 2>/dev/null | tr -d '\\n'", 30000)
             code = elem(r, 0)
             b64 = string_trim(elem(r, 1))
             if (code != 0 || string_length(b64) == 0) { nil }
@@ -318,12 +318,13 @@ fun paste_from_clipboard(opts) {
         "        -e 'close access fh' 2>/dev/null || " ++
         "xclip -selection clipboard -t image/png -o > " ++ Util.shell_q(tmp_path) ++
         " 2>/dev/null"
-    # 8s timeout via perl alarm — a wedged X server on a remote Linux
-    # session would otherwise hang xclip (and the REPL) indefinitely.
-    guarded = "perl -e 'alarm shift; exec @ARGV' 8 sh -c " ++ Util.shell_q(cmd)
-    r = shell(guarded)
-    code = elem(r, 0)
-    if (code == 142) { file_delete(tmp_path) ; nil }
+    # 8s timeout — a wedged X server on a remote Linux session would otherwise
+    # hang xclip (and the REPL). shell_managed enforces the timeout in C and
+    # kills the whole process group; the old perl-alarm wrapper leaked the
+    # xclip/osascript grandchild and could wedge swarmrt's shell() exit-poll.
+    r = shell_managed(cmd, 8000)
+    interrupted = elem(r, 2)
+    if (interrupted == 'true') { file_delete(tmp_path) ; nil }
     else { if (file_exists(tmp_path) == 'false') { nil }
     else {
         # Empty file = clipboard didn't have an image

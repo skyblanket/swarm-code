@@ -41,10 +41,40 @@ fun reader_loop() {
             handle_permission(prompt_text, reply_pid)
         {'picker_ask', header, options, reply_pid, token} ->
             handle_picker(header, options, reply_pid, token)
+        {'confirm_ask', prompt_text, reply_pid, token} ->
+            handle_confirm(prompt_text, reply_pid, token)
+        {'watch_interrupt', tok} ->
+            watch_loop(tok)
         _other ->
             'ignore'
     }
     reader_loop()
+}
+
+# Interrupt-watch mode — entered while a NON-shell tool runs in a worker.
+# Polls stdin for ESC (27) / Ctrl-C (3) and, on one, tells main_agent to
+# interrupt the in-flight tool. Exits back to reader_loop when main sends
+# {'stop_watch'} (the tool finished). Only ESC/Ctrl-C are forwarded; any
+# other keystroke is dropped — matching the shell_managed + streaming
+# interrupt convention. Shell tools (bash/log_wait) self-watch stdin inside
+# shell_managed, so main never starts this watcher for them — stdin therefore
+# always has exactly one reader at a time.
+fun watch_loop(token) {
+    # Check the stop signal first (non-blocking) so a tool that already
+    # finished doesn't make us sit through a full poll slice.
+    stop = receive { {'stop_watch'} -> 'stop' after 0 -> 'go' }
+    if (stop == 'stop') { 'ok' }
+    else {
+        k = read_key(150)
+        if (k == 27 || k == 3) {
+            # Tag the interrupt with the dispatch token so collect_tool_result
+            # only acts on it for the tool it was aimed at (read_key already
+            # filters out arrow/F-key escape sequences, so k==27 is a bare Esc).
+            main_pid = whereis('main_agent')
+            if (main_pid != nil) { send(main_pid, {'interrupt', token}) }
+        }
+        watch_loop(token)
+    }
 }
 
 # Arrow-key picker — render header + options, read a selection via
@@ -82,5 +112,17 @@ fun handle_permission(prompt_text, reply_pid) {
     answer = read_line("  > ")
     reply = if (answer == nil) { "" } else { answer }
     if (reply_pid != nil) { send(reply_pid, {'permission_answer', reply}) }
+    'ok'
+}
+
+# Plan-confirmation path: print the prompt, read one line, hand the RAW
+# line straight back to the caller (plan.sw parses y/n/edit). Echoes the
+# correlation token so a late answer can be matched/dropped — same
+# discipline as handle_picker.
+fun handle_confirm(prompt_text, reply_pid, token) {
+    print(prompt_text)
+    answer = read_line("  > ")
+    line = if (answer == nil) { "" } else { to_string(answer) }
+    if (reply_pid != nil) { send(reply_pid, {'confirm_answer', token, line}) }
     'ok'
 }

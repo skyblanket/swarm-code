@@ -1,5 +1,8 @@
 module Mcp
 
+import Version
+import UI
+
 # ============================================================
 # Mcp — Model Context Protocol client (stdio transport)
 # ============================================================
@@ -31,7 +34,7 @@ module Mcp
 #     interleave and no process steals another's response line. This
 #     is precisely an Erlang port: a foreign process with exactly one
 #     connected owner.
-#   * call_tool(), invoked from Tools.exec, messages the owner and
+#   * call_tool(), invoked from Tools.exec_raw, messages the owner and
 #     blocks on the reply — the same pattern as Agents.ask_tool.
 #
 # Transport detail: swarmrt's subprocess_* builtins give a
@@ -114,7 +117,9 @@ fun init(settings) {
             # Each worker writes its own <server>/* keys (distinct, no
             # race); 'all_servers' is already complete from pre-registration.
             mcp_spawn_boot_workers(table, names, specs, self())
-            mcp_collect_boots(table, length(names), timestamp() + mcp_boot_deadline_ms())
+            mcp_collect_boots(table, mcp_name_strings(names, []),
+                              timestamp() + mcp_boot_deadline_ms(),
+                              timestamp(), 'false')
             table
         }
     }
@@ -161,20 +166,97 @@ fun mcp_preregister(table, names) {
 # Collect one {'mcp_boot_done', name} per server — purely the boot
 # pause; names are already in 'all_servers' from mcp_preregister, so a
 # worker finishing after the deadline still shows up everywhere.
-fun mcp_collect_boots(table, remaining, deadline) {
-    if (remaining <= 0) { 'ok' }
+#
+# `pending` is the list of server-name strings not yet done; the loop
+# exits the moment it empties (same as the old remaining<=0 / wait<=0
+# guards). `started` + `shown` carry the boot-wait heartbeat: past
+# ~4s a dim "⋯ mcp:<server> still running (Ns)" line is surfaced on its
+# own \r line and refreshed on a <=2s tick, cleared on every exit.
+# It runs ONLY in Main's process at boot (subagents never call init);
+# `mcp_boot_pg_on` no-ops it in headless/-p runs. The handshake itself
+# (mcp_read_response, the shared leaf) is untouched — workers report
+# only completion here, so request/response correctness is unchanged.
+fun mcp_collect_boots(table, pending, deadline, started, shown) {
+    if (length(pending) <= 0) { mcp_boot_pg_clear(shown) }
     else {
-        wait = deadline - timestamp()
-        if (wait <= 0) { 'ok' }
+        full_wait = deadline - timestamp()
+        if (full_wait <= 0) { mcp_boot_pg_clear(shown) }
         else {
+            wait = if (full_wait > 2000) { 2000 } else { full_wait }
             receive {
                 {'mcp_boot_done', name} ->
                     mcp_ensure_registered(table, name)
-                    mcp_collect_boots(table, remaining - 1, deadline)
-                after wait { 'ok' }
+                    rest = mcp_list_remove(pending, to_string(name), [])
+                    if (length(rest) <= 0) { mcp_boot_pg_clear(shown) }
+                    else { mcp_collect_boots(table, rest, deadline, started, shown) }
+                after wait {
+                    next_shown = mcp_boot_pg_tick(pending, started, shown)
+                    mcp_collect_boots(table, pending, deadline, started, next_shown)
+                }
             }
         }
     }
+}
+
+# Boot-wait heartbeat helpers — same shape/threshold as browser.sw's
+# pg_tick / pg_clear and agent.sw's collect_tool_result, reusing
+# UI.tool_progress / UI.tool_progress_clear. NOT the shared leaf.
+fun MCP_BOOT_PROGRESS_THRESHOLD_MS() { 4000 }
+
+# Headless/-p runs have no interactive terminal to refresh — no-op there.
+# (Subagents never reach init(), so headless is the only gate that
+# applies; detected from os_args the same way main.sw derives `headless`.)
+fun mcp_boot_pg_on() {
+    if (mcp_args_has(os_args(), "-p") == 'true') { 'false' }
+    else { if (mcp_args_has(os_args(), "--print") == 'true') { 'false' }
+    else { 'true' } }
+}
+
+fun mcp_boot_pg_tick(pending, started, shown) {
+    if (mcp_boot_pg_on() == 'false') { shown }
+    else {
+        elapsed = timestamp() - started
+        if (elapsed >= MCP_BOOT_PROGRESS_THRESHOLD_MS()) {
+            UI.tool_progress(mcp_boot_label(pending), elapsed / 1000)
+            'true'
+        } else { shown }
+    }
+}
+
+fun mcp_boot_pg_clear(shown) {
+    if (shown == 'true') { UI.tool_progress_clear() }
+    'ok'
+}
+
+# Label the still-pending boots. UI.tool_progress renders this as
+# "⋯ <label> still running (Ns)", so the label omits a verb:
+# "mcp:<server>" for one, or "mcp: N servers" when several are handshaking.
+fun mcp_boot_label(pending) {
+    if (length(pending) == 1) { "mcp:" ++ to_string(hd(pending)) }
+    else { "mcp: " ++ to_string(length(pending)) ++ " servers" }
+}
+
+# Map a list to string elements (server names may arrive as atoms).
+fun mcp_name_strings(names, acc) {
+    if (length(names) == 0) { acc }
+    else { mcp_name_strings(tl(names), acc ++ [to_string(hd(names))]) }
+}
+
+# Remove the first element equal (as string) to `val`.
+fun mcp_list_remove(lst, val, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        if (to_string(h) == val) { acc ++ tl(lst) }
+        else { mcp_list_remove(tl(lst), val, acc ++ [h]) }
+    }
+}
+
+# Local arg scan (mcp.sw can't import main.sw's has_flag).
+fun mcp_args_has(args, flag) {
+    if (length(args) == 0) { 'false' }
+    else { if (to_string(hd(args)) == flag) { 'true' }
+    else { mcp_args_has(tl(args), flag) } }
 }
 
 fun mcp_initialize_request() {
@@ -185,7 +267,7 @@ fun mcp_initialize_request() {
         params: %{
             protocolVersion: mcp_protocol_version(),
             capabilities: %{},
-            clientInfo: %{ name: "swarm-code", version: "0.1.0" }
+            clientInfo: %{ name: "swarm-code", version: Version.version() }
         }
     })
 }
@@ -485,7 +567,7 @@ fun mcp_extract_text(items, acc) {
 }
 
 # ============================================================
-# call_tool — dispatch entry, invoked from Tools.exec
+# call_tool — dispatch entry, invoked from Tools.exec_raw
 # ============================================================
 # `prefixed` is the full mcp__<server>__<tool> name the model called.
 

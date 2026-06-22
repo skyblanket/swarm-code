@@ -1,6 +1,6 @@
 # swarm-code
 
-⚡ Terminal coding agent written in `sw` on the [swarmrt](https://github.com/skyblanket/swarmrt) BEAM-shaped C runtime. ~3K LoC, single native binary (~3 MB), BYOM via JSON profiles. Bring your own OpenAI-compatible endpoint — local llama.cpp/vLLM or a hosted provider — and get structured tool calls, subagents, vision, session search, skills, cron scheduling, and MCP in one headless/interactive REPL.
+⚡ Terminal coding agent written in `sw` on the [swarmrt](https://github.com/skyblanket/swarmrt) BEAM-shaped C runtime. ~19K LoC, single native binary (~3 MB), BYOM via JSON profiles. Bring your own OpenAI-compatible endpoint — local llama.cpp/vLLM or a hosted provider — and get structured tool calls, subagents, vision, session search, skills, cron scheduling, and MCP in one headless/interactive REPL.
 
 ## Demo
 
@@ -37,7 +37,7 @@ Minimal `~/.swarm-code/settings.json`:
 ```json
 {
   "endpoint": "http://localhost:8000",
-  "model": "kimi-k2.6",
+  "model": "kimi-k2.7-code",
   "profiles": {
     "kimi": { "vision": "true" },
     "glm":  { "endpoint": "https://api.z.ai/api/paas/v4/chat/completions",
@@ -46,29 +46,61 @@ Minimal `~/.swarm-code/settings.json`:
 }
 ```
 
-## Feature matrix
+## Features
 
-|                        | swarm-code | claude-code | hermes-agent |
-|------------------------|------------|-------------|--------------|
-| Profiles (BYOM)        | yes        | no          | no           |
-| Reusable skills        | yes        | no          | yes          |
-| Vision (paste / path)  | yes        | yes         | no           |
-| FTS session search     | yes        | no          | no           |
-| Cron scheduling        | yes        | no          | no           |
-| MCP client             | yes        | yes         | no           |
-| MCP server             | no         | no          | no           |
-| Trajectory export      | yes        | no          | no           |
-| Local-only network     | default    | no          | n/a          |
-| Boot time              | ~600 ms     | ~2 s        | ~1 s         |
+| Capability | Support |
+|---|---|
+| Profiles / BYOM | JSON profiles and OpenAI-compatible endpoints |
+| Reusable skills | `SKILL.md` playbooks |
+| Vision | Clipboard paste and image paths |
+| Session search | SQLite FTS5 |
+| Scheduling | Heartbeat-driven interval and daily jobs |
+| MCP | Client and stdio server |
+| Multi-agent work | Subagents and `/flows` parallel workflows |
+| Experimental council | Bounded read-only panel plus judge synthesis |
+| Trajectory export | Fine-tuning JSONL |
+| Network policy | Local-only by default |
+| Distribution | Single native binary |
+
+## Experimental council
+
+Run three repository-reading agents in parallel, then synthesize their
+independent findings with a no-tools judge:
+
+```bash
+scripts/council.sh "What are the highest-risk production gaps in this repository?"
+```
+
+The default self-fusion panel uses the `kimi` profile for all perspectives.
+Use diverse configured profiles and tighter budgets through environment
+variables:
+
+```bash
+SWARM_COUNCIL_PROFILES=kimi,gemma-local,qwen \
+SWARM_COUNCIL_JUDGE_PROFILE=kimi \
+SWARM_COUNCIL_PANEL_TIMEOUT=60 \
+scripts/council.sh "Review the current architecture"
+```
+
+Panel agents run under the fail-closed `council_panel` execution context:
+they may inspect repository files and diffs, but cannot use shell, write,
+background, browser, memory-mutation, or nested-agent tools.
+This is tool-level read-only isolation, not yet a workspace filesystem
+sandbox; panelists inherit the existing read tool's filesystem visibility.
+
+See [`docs/FUSION.md`](docs/FUSION.md) for the researched OpenRouter pipeline,
+prototype findings, and remaining production gaps.
 
 ## Architecture
 
-The runtime is a single `sw` program compiled by `swc` and linked against `libswarmrt`. The agent loop (`Agent.run`) reads stdin, calls the LLM (`LLM.chat`), and dispatches structured `tool_calls` through `Tools.exec`. State lives in ETS tables (in-memory) and `~/.swarm-code/` (persistent). Subagents are real OS processes spawned via `swarmrt` links/monitors, not threads.
+The runtime is a single `sw` program compiled by `swc` and linked against `libswarmrt`. The agent loop (`Agent.run`) reads stdin, calls the LLM (`LLM.chat`), and sends structured `tool_calls` through the shared `ToolExecutor` policy boundary before raw handlers run. State lives in ETS tables (in-memory) and `~/.swarm-code/` (persistent). Subagents are real isolated swarmrt processes linked to their parent, not threads.
 
 Critical modules:
 - `src/main.sw:1` — CLI flags, headless mode, local-network gate, heartbeat spawn
 - `src/agent.sw:1` — REPL loop, context compaction, session save/resume, permission model
-- `src/tools.sw:1` — tool registry dispatch; wraps swarmrt builtins (shell, file, http)
+- `src/ToolExecutor.sw:1` — shared context, hook, guardrail, and permission boundary
+- `src/tools.sw:1` — raw tool handlers wrapping swarmrt builtins (shell, file, http)
+- `src/ToolRegistry.sw:1` — tool identity and execution-context policy
 - `src/llm.sw:1` — OpenAI wire format, streaming parse, structured tool_calls, multimodal
 - `src/Scheduler.sw:1` — heartbeat-driven cron jobs that shell out `swarm-code -p`
 

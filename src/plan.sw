@@ -195,11 +195,12 @@ fun has_action_keyword(t) {
     else { has_action_kw_c(t) }}
 }
 
+# Strong multi-step intent only. We deliberately do NOT match bare " also " or
+# "finally" — those are everyday conversational filler ("qwen 3.5 also there",
+# "finally working") and spuriously triggered plan generation on casual chat.
+# "and then" genuinely signals a sequenced request.
 fun has_sequence_connector(t) {
-    if (string_contains(t, "and then") == 'true') { 'true' }
-    else { if (string_contains(t, " also ") == 'true') { 'true' }
-    else { if (string_contains(t, "finally") == 'true') { 'true' }
-    else { 'false' }}}
+    string_contains(t, "and then")
 }
 
 # Rough sentence count — each ". " or ".\n" is a sentence break
@@ -369,7 +370,15 @@ fun generate(user_msg, history, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
+    # Pre-flight feedback: this http_post is synchronous and can block
+    # 10-30s with no spinner of its own. Print one dim grey line before
+    # the call and clear it right after so Plan.display() renders cleanly.
+    # Gated off in headless/subagent — no TTY to draw on.
+    show_wait = if (map_get(opts, 'headless') == 'true') { 'false' }
+                else { if (map_get(opts, 'is_subagent') == 'true') { 'false' } else { 'true' } }
+    if (show_wait == 'true') { print_inline("\r\e[K  \e[38;5;240m⋯ generating plan…\e[0m") }
     resp = http_post(url, hdrs, body)
+    if (show_wait == 'true') { UI.tool_progress_clear() }
     if (resp == nil) { nil }
     else { plan_extract_content(resp) }
 }
@@ -575,19 +584,41 @@ fun repeat_ch(ch, n) {
 }
 
 # ============================================================
-# confirm — present the confirmation prompt and parse input.
+# confirm(opts) — present the confirmation prompt and parse input.
 # Returns: 'yes' | 'no' | {'edit', text}
 #
-# Reads via read_line() directly (plan.sw runs in the main agent
-# process where stdin is available).
+# Routes through the Reader process (the sole owner of stdin) using the
+# same correlation-token protocol as permission/picker prompts. The old
+# behavior called read_line() directly from the main_agent process, which
+# raced the Reader for stdin and could wedge the REPL. Falls back to a
+# direct read_line only when no reader_pid is in opts (headless / tests).
 # ============================================================
-fun confirm() {
-    print(UI.warn_color() ++ "  Proceed? [y / n]  " ++ UI.reset() ++
-          UI.brand_color() ++ "❯" ++ UI.reset() ++ " ")
-    raw = read_line("  " ++ UI.brand_color() ++ "❯" ++ UI.reset() ++ " ")
-    t = string_trim(if (raw == nil) { "" } else { to_string(raw) })
+fun confirm(opts) {
+    reader_pid = if (opts == nil) { nil } else { map_get(opts, 'reader_pid') }
+    prompt = UI.warn_color() ++ "  Proceed? [y / n, or type a revised plan]  " ++
+             UI.reset() ++ UI.brand_color() ++ "❯" ++ UI.reset() ++ " "
+    line = if (reader_pid == nil) {
+        print(prompt)
+        raw = read_line("  " ++ UI.brand_color() ++ "❯" ++ UI.reset() ++ " ")
+        if (raw == nil) { "" } else { to_string(raw) }
+    } else {
+        token = to_string(self()) ++ "/" ++ to_string(timestamp())
+        send(reader_pid, {'confirm_ask', prompt, self(), token})
+        await_confirm(token)
+    }
+    t = string_trim(line)
     lower = string_lower(t)
     parse_confirm(lower, t)
+}
+
+# Wait for THIS confirmation's answer; drop stale tokens. The 600s backstop
+# is only for a dead Reader — a plan confirmation is a human action, so we
+# don't impose a short deadline (mirrors agent.sw await_picker).
+fun await_confirm(token) {
+    receive {
+        {'confirm_answer', t, line} -> if (t == token) { line } else { await_confirm(token) }
+        after 600000 { "" }
+    }
 }
 
 fun is_yes_input(lower) {

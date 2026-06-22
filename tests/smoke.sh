@@ -24,7 +24,15 @@ echo "$OUT" | grep -q "^swarm-code [0-9]" || FAIL "--version: $OUT"
 # 2. --print-config (no LLM call)
 $BIN --print-config >/dev/null 2>&1 || FAIL "--print-config crashed"
 
-# 3. swarm doctor — accept exits 0 (green), 1 (warn), 2 (error).
+# 3. Built-in model default, isolated from user settings and env overrides.
+EMPTY_HOME=$(mktemp -d -t swarm-smoke-home.XXXXXX)
+trap 'rm -rf "$EMPTY_HOME"' EXIT INT TERM
+CFG=$(HOME="$EMPTY_HOME" env -u SWARM_CODE_MODEL -u SWARM_CODE_ENDPOINT \
+    $BIN --print-config 2>&1) || FAIL "--print-config default resolution crashed"
+echo "$CFG" | grep -q "model        kimi-k2.7-code" ||
+    FAIL "unexpected built-in model default"
+
+# 4. swarm doctor — accept exits 0 (green), 1 (warn), 2 (error).
 #    Disable `set -e` around the call so a non-zero exit doesn't
 #    short-circuit the script before we can inspect $?.
 set +e
@@ -33,4 +41,19 @@ RC=$?
 set -e
 if [ "$RC" -gt 2 ]; then FAIL "doctor crashed with exit $RC"; fi
 
+# 5. --mcp-server must NOT leak ANSI/feedback onto stdout (it is reserved for
+#    JSON-RPC framing). Regression guard for the execution_context gate: a
+#    web_fetch tools/call prints a "⋯ fetching…" line if the gate breaks.
+#    Fast-failing local URL keeps this hermetic (connection refused, no network).
+MCP_OUT=$(printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_fetch","arguments":{"url":"http://127.0.0.1:1/"}}}' \
+  | $BIN --mcp-server 2>/dev/null) || true
+ESC=$(printf '\033')
+case "$MCP_OUT" in
+    *"$ESC"*) FAIL "--mcp-server leaked ANSI onto stdout (execution_context feedback gate broken)" ;;
+esac
+
+rm -rf "$EMPTY_HOME"
+trap - EXIT INT TERM
 echo "smoke ok"

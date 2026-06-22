@@ -40,6 +40,7 @@ import Util
 import ToolGuardrails
 import Plan
 import Flows
+import ToolExecutor
 
 export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS]
 
@@ -476,7 +477,7 @@ fun plan_gate(line, history, opts) {
             with_user
         } else {
             Plan.display(plan_text)
-            confirm_result = Plan.confirm()
+            confirm_result = Plan.confirm(opts)
             if (confirm_result == 'no') {
                 'cancelled'
             } else {
@@ -976,7 +977,7 @@ fun show_debug_llm() {
               "[print('  resp latency=' + str(r.get('latency_ms','?')) + 'ms chars=' + str(r.get('chars','?')) + ' tools=' + str(r.get('had_tools','?'))) for r in resps];" ++
               "[print('  ERR  reason=' + str(r.get('reason','?'))) for r in errs]" ++
               "\""
-        r = shell(cmd)
+        r = shell_managed(cmd ++ " 2>&1", 10000)
         out = elem(r, 1)
         if (string_length(string_trim(out)) == 0) {
             print("  (no LLM calls recorded yet)")
@@ -1001,7 +1002,7 @@ fun show_debug_tools() {
               "calls=[r for r in rows if r.get('type')=='tool_call'];" ++
               "[print('  ' + str(r.get('name','?')) + '  ' + str(r.get('args',''))[:60]) for r in calls]" ++
               "\""
-        r = shell(cmd)
+        r = shell_managed(cmd ++ " 2>&1", 10000)
         out = elem(r, 1)
         if (string_length(string_trim(out)) == 0) {
             print("  (no tool calls recorded yet)")
@@ -1564,7 +1565,10 @@ fun run_turn(history, opts, step) {
                   to_string(map_keys(result)) ++ "]\e[0m")
         }
         if (result == nil) {
-            print("\e[31m[error] llm call failed\e[0m")
+            # Headless stdout is the captured result — keep it clean; failure
+            # is signalled by exit 1 / the --json status. (Transport detail is
+            # on stderr via the runtime.) Interactive keeps the inline error.
+            if (map_get(opts, 'headless') != 'true') { print("\e[31m[error] llm call failed\e[0m") }
             working_hist
         } else {
             content = to_string(map_get(result, 'content'))
@@ -1760,6 +1764,22 @@ fun resolve_path_key(args_map) {
 # runs in an isolated linked worker so a panicking tool can't kill
 # the REPL.
 fun dispatch_tool(name, args, opts) {
+    pre = ToolExecutor.preflight(name, args, opts)
+    if (map_get(pre, 'ok') != 'true') {
+        to_string(map_get(pre, 'error'))
+    } else {
+        effective_args = map_get(pre, 'args')
+        dispatch_tool_prepared(name, effective_args, opts)
+    }
+}
+
+fun dispatch_tool_prepared(name, args, opts) {
+    result = dispatch_tool_raw(name, args, opts)
+    ToolExecutor.postflight(name, args, result, opts)
+    result
+}
+
+fun dispatch_tool_raw(name, args, opts) {
     if (name == 'task') {
         if (map_get(opts, 'is_subagent') == 'true') {
             "error: nested `task` is not allowed — a subagent can't spawn its own subagent"
@@ -1767,7 +1787,7 @@ fun dispatch_tool(name, args, opts) {
     }
     else {
         if (string_starts_with(to_string(name), "browser_") == 'true') {
-            Tools.exec(name, args, opts)
+            Tools.exec_raw(name, args, opts)
         } else {
             exec_tool_isolated(name, args, opts)
         }
@@ -1780,27 +1800,148 @@ fun dispatch_tool(name, args, opts) {
 # ------------------------------------------------------------
 fun exec_tool_isolated(name, args, opts) {
     trap_exit('true')
-    w = spawn(tool_worker(self(), name, args, opts))
+    # Unique per-dispatch token so a previously-interrupted worker's late
+    # {'tool_done'} can never be mis-attributed to THIS (or a later) tool.
+    token = to_string(timestamp()) ++ "-" ++ to_string(random_int(1, 1000000000))
+    watch = tool_needs_watcher(name, opts)
+    reader_pid = map_get(opts, 'reader_pid')
+    if (watch == 'true' && reader_pid != nil) { send(reader_pid, {'watch_interrupt', token}) }
+    w = spawn(tool_worker(self(), name, args, opts, token))
     link(w)
-    collect_tool_result(name, nil)
+    started = timestamp()
+    r = collect_tool_result(name, nil, w, token, opts, started, 'false')
+    if (watch == 'true' && reader_pid != nil) { send(reader_pid, {'stop_watch'}) }
+    r
 }
 
-fun tool_worker(parent, name, args, opts) {
-    result = Tools.exec(name, args, opts)
-    send(parent, {'tool_done', result})
+# Whether a long-tool-wait heartbeat line should be shown. No-op in
+# headless/one-shot and subagent runs (no interactive terminal to refresh,
+# and a subagent's line would interleave with the parent's output). Same
+# gate llm.sw uses for wait_hint.
+fun tool_progress_enabled(opts) {
+    if (map_get(opts, 'headless') == 'true') { 'false' }
+    else { if (map_get(opts, 'is_subagent') == 'true') { 'false' }
+    # mcp_server mode reserves stdout for JSON-RPC — never print there.
+    else { if (map_get(opts, 'execution_context') == "mcp_server") { 'false' } else { 'true' } } }
 }
 
-fun collect_tool_result(name, pending) {
+# How long a tool must run before we first surface a "still running" line.
+fun TOOL_PROGRESS_THRESHOLD_MS() { 4000 }
+# How often the line refreshes once shown.
+fun TOOL_PROGRESS_TICK_MS() { 2000 }
+# Hard ceiling — a worker that never replies is abandoned after this.
+fun TOOL_WAIT_DEADLINE_MS() { 600000 }
+
+# How long the next receive should block. Before any line is shown, sleep
+# right up to the threshold so a sub-threshold (fast) tool is woken at most
+# once and never draws. After the line is up, tick on the refresh interval.
+# Either way, never block past the hard deadline.
+fun tool_wait_tick_ms(started, shown) {
+    elapsed = timestamp() - started
+    base = if (shown == 'true') { TOOL_PROGRESS_TICK_MS() }
+           else {
+        rem = TOOL_PROGRESS_THRESHOLD_MS() - elapsed
+        if (rem < 1) { TOOL_PROGRESS_TICK_MS() } else { rem }
+    }
+    to_deadline = TOOL_WAIT_DEADLINE_MS() - elapsed
+    capped = if (to_deadline < 1) { 1 } else { to_deadline }
+    if (base > capped) { capped } else { base }
+}
+
+# Which tools get the reader's ESC interrupt-watcher. ONLY tools whose blocking
+# work is NOT a shell_managed call, interactive mode only. Most shelling tools
+# (bash/log_wait/web_search/git_*/code_search/glob/grep/file_watch/read-probes)
+# run through shell_managed, which SELF-watches stdin in C and killpg's its
+# process group on ESC — `_sw_rl.saved_ok` is a shared global, so that self-watch
+# is active even inside a worker. Having the reader ALSO watch those would split
+# the ESC byte between two readers (and a worker that lost the race could orphan
+# its child). The reader therefore watches only the tools that block in a
+# NON-shell_managed builtin:
+#   - mcp__*    : subprocess_recv_line (MCP stdio)
+#   - web_fetch : its primary fetch is http_get (curl to a file), which is
+#     --max-time-bounded but does NOT self-watch stdin. Its later HTML-strip step
+#     DOES use shell_managed; the brief overlap is harmless (the strip is fast,
+#     local, and either reader winning the ESC yields the same "interrupted").
+# headless/subagent have no interactive stdin.
+fun tool_needs_watcher(name, opts) {
+    headless = map_get(opts, 'headless')
+    is_sub = map_get(opts, 'is_subagent')
+    if (headless == 'true' || is_sub == 'true') { 'false' }
+    else {
+        ns = to_string(name)
+        if (string_starts_with(ns, "mcp__") == 'true') { 'true' }
+        else { if (ns == "web_fetch") { 'true' } else { 'false' } }
+    }
+}
+
+fun tool_worker(parent, name, args, opts, token) {
+    result = Tools.exec_raw(name, args, opts)
+    send(parent, {'tool_done', token, result})
+}
+
+# `started` is the dispatch timestamp; `shown` is 'true' once a "still
+# running" line has been drawn (so we know to clear it on completion). The
+# `after` arm is the heartbeat: it fires on a short tick, surfaces a dim
+# progress line past the threshold, and enforces the absolute deadline. No
+# spawned ticker and no dependence on Heartbeat — self-contained, so it can
+# never swallow a {'heartbeat_tick'} that main_loop / Scheduler.tick needs.
+fun collect_tool_result(name, pending, worker, token, opts, started, shown) {
     receive {
-        {'tool_done', result} -> collect_tool_result(name, result)
-        {'EXIT', _, ex_reason} ->
-            if (pending == nil) { tool_crash_msg(name, ex_reason) }
-            else { pending }
-        after 600000 {
-            if (pending == nil) {
-                "error: tool '" ++ to_string(name) ++ "' timed out (worker did not respond)"
+        {'tool_done', tok, result} ->
+            # Match our dispatch token. A non-matching tool_done is a late reply
+            # from an earlier INTERRUPTED worker — drop it and keep waiting for
+            # ours (it must never be mis-attributed to this tool).
+            if (tok == token) {
+                if (shown == 'true') { UI.tool_progress_clear() }
+                collect_tool_result(name, result, worker, token, opts, started, 'false')
+            }
+            else { collect_tool_result(name, pending, worker, token, opts, started, shown) }
+        {'interrupt', itok} ->
+            # User pressed ESC — the reader's watch_loop forwarded it tagged
+            # with this dispatch's token. Act ONLY on our token; a stale
+            # interrupt (a previous tool's watcher firing late, within the
+            # ~150ms stop lag) carries a different token and is dropped so it
+            # can't mis-fire on this tool. If the tool already finished, prefer
+            # its real result; otherwise unlink the still-running worker (its
+            # late {'tool_done'} carries the stale token and is dropped above)
+            # and return an interrupted marker without blocking on it. (Shell
+            # tools never reach here — shell_managed kills their group in C.)
+            if (itok != token) { collect_tool_result(name, pending, worker, token, opts, started, shown) }
+            else { if (pending == nil) {
+                if (shown == 'true') { UI.tool_progress_clear() }
+                unlink(worker)
+                "[interrupted] tool '" ++ to_string(name) ++ "' was stopped by the user (ESC)."
             } else {
                 pending
+            } }
+        {'EXIT', _, ex_reason} ->
+            if (pending == nil) {
+                if (shown == 'true') { UI.tool_progress_clear() }
+                tool_crash_msg(name, ex_reason)
+            }
+            else { pending }
+        after tool_wait_tick_ms(started, shown) {
+            # Heartbeat tick (or, before the first result, a short poll). If the
+            # result has ALREADY arrived (pending set, e.g. between tool_done and
+            # the linked worker's EXIT) just keep waiting for EXIT — don't redraw.
+            if (pending != nil) {
+                collect_tool_result(name, pending, worker, token, opts, started, shown)
+            } else {
+                elapsed = timestamp() - started
+                if (elapsed >= TOOL_WAIT_DEADLINE_MS()) {
+                    if (shown == 'true') { UI.tool_progress_clear() }
+                    "error: tool '" ++ to_string(name) ++ "' timed out (worker did not respond)"
+                } else {
+                    # Past the threshold and on an interactive terminal: surface a
+                    # dim, self-overwriting "still running (Ns)" line. Otherwise a
+                    # no-op — fast tools finish before the threshold and never draw.
+                    next_shown = if (elapsed >= TOOL_PROGRESS_THRESHOLD_MS() &&
+                                     tool_progress_enabled(opts) == 'true') {
+                        UI.tool_progress(name, elapsed / 1000)
+                        'true'
+                    } else { shown }
+                    collect_tool_result(name, pending, worker, token, opts, started, next_shown)
+                }
             }
         }
     }
@@ -1826,7 +1967,8 @@ fun handle_task_tool(args, opts) {
             LLM.new_message_system(sub_sys),
             LLM.new_message_user(prompt)
         ]
-        sub_opts = map_put(opts, 'is_subagent', 'true')
+        sub_opts0 = map_put(opts, 'is_subagent', 'true')
+        sub_opts = map_put(sub_opts0, 'execution_context', "subagent")
         result = run_subagent_loop(sub_history, sub_opts, 0)
         "[subagent:" ++ stype ++ "]\n" ++ result
     }
@@ -1901,12 +2043,12 @@ fun run_subagent_loop(history, opts, step) {
 # git commits, nested task spawns) is locked to the main agent so a
 # subagent can't quietly mutate the user's environment.
 fun SUBAGENT_BLOCKED_TOOLS() {
-    ["task", "remember", "forget", "learn_skill", "forget_skill",
-     "bg_server", "browser_launch", "git_commit", "todo_write", "plan_check"]
+    ToolRegistry.subagent_blocked_tools()
 }
 
 fun subagent_blocked(name) {
-    ToolGuardrails.in_list(SUBAGENT_BLOCKED_TOOLS(), name)
+    if (ToolRegistry.allowed_in("subagent", name) == 'true') { 'false' }
+    else { 'true' }
 }
 
 fun subagent_exec_all(tool_calls, history, opts) {
@@ -1949,47 +2091,27 @@ fun execute_all(tool_calls, history, opts) {
         UI.tool_header(name_atom, format_tool_args(name_atom, args_map_safe, args_raw))
         Log.tool_call(name_atom, args_raw)
 
-        # Pre-dispatch guardrail check. Returns 'ok' or an error
-        # string when a loop / no-progress threshold trips. On trip
-        # we synthesize a tool_result and skip the real dispatch so
-        # the model sees the brake feedback in-band.
-        guard = ToolGuardrails.observe_before(opts, name_str, args_raw)
-        if (guard != 'ok') {
-            UI.tool_result(guard)
-            hist_g = list_append(history, LLM.new_message_tool(id, guard))
-            journal_sync(opts, hist_g)
-            execute_all(tl(tool_calls), hist_g, opts)
+        prepared = ToolExecutor.prepare(name_atom, args_map_safe, opts)
+        result = if (map_get(prepared, 'ok') != 'true') {
+            to_string(map_get(prepared, 'error'))
         } else {
-        decision = resolve_permission(name_atom, args_map_safe, opts)
-        if (decision == 'deny') {
-            denial = "error: permission denied for tool '" ++ name_str ++ "'"
-            print("\e[31m" ++ denial ++ "\e[0m")
-            hist_denied = list_append(history, LLM.new_message_tool(id, denial))
-            journal_sync(opts, hist_denied)
-            execute_all(tl(tool_calls), hist_denied, opts)
-        } else {
-            pre = Config.run_hooks("PreToolUse", name_atom, args_raw, opts)
-            if (pre == 'block') {
-                blocked = "error: tool '" ++ name_str ++ "' blocked by PreToolUse hook"
-                print("\e[31m" ++ blocked ++ "\e[0m")
-                hist_blocked = list_append(history, LLM.new_message_tool(id, blocked))
-                journal_sync(opts, hist_blocked)
-                execute_all(tl(tool_calls), hist_blocked, opts)
+            effective_args = map_get(prepared, 'args')
+            decision = resolve_permission(name_atom, effective_args, opts)
+            if (decision == 'deny') {
+                denial = "error: permission denied for tool '" ++ name_str ++ "'"
+                print("\e[31m" ++ denial ++ "\e[0m")
+                denial
             } else {
-                result = dispatch_tool(name_atom, args_map_safe, opts)
-                UI.tool_result(result)
-                had_err = if (string_starts_with(result, "error:") == 'true') { 'true' } else { 'false' }
-                Log.tool_result(name_atom, string_length(result), had_err)
-                ToolGuardrails.observe_after(opts, name_str, result)
-
-                Config.run_hooks("PostToolUse", name_atom, args_raw, opts)
-
-                hist_ok = list_append(history, LLM.new_message_tool(id, result))
-                journal_sync(opts, hist_ok)
-                execute_all(tl(tool_calls), hist_ok, opts)
+                dispatch_tool_prepared(name_atom, effective_args, opts)
             }
         }
-        }
+
+        UI.tool_result(result)
+        had_err = if (string_starts_with(result, "error:") == 'true') { 'true' } else { 'false' }
+        Log.tool_result(name_atom, string_length(result), had_err)
+        hist_done = list_append(history, LLM.new_message_tool(id, result))
+        journal_sync(opts, hist_done)
+        execute_all(tl(tool_calls), hist_done, opts)
     }
 }
 
@@ -2061,7 +2183,7 @@ fun interpret_picker(idx, table, cache_key) {
 
 # Convert tool-name string → atom. Used by execute_all when iterating
 # structured tool_calls (which carry name as string) to dispatch into
-# Tools.exec / dispatch_tool (which compare against atoms).
+# Tools.exec_raw / dispatch_tool (which compare against atoms).
 # Unknown strings return the string as-is so MCP names (mcp__*) and
 # any future tools still resolve.
 # ---------- /schedule helpers --------------------------------

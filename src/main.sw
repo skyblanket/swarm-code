@@ -16,8 +16,8 @@ module Main
 #                          use the /v1/ path).
 #   SWARM_CODE_MODEL       default: google/gemma-4-31B-it
 #   SWARM_CODE_API_KEY     default: (none)
-#   SWARM_CODE_MAX_TOKENS  default: 262144 (Kimi K2.6 context window)
-#   SWARM_CODE_OUTPUT_RESERVE  default: 16384 (Kimi K2.6 max output)
+#   SWARM_CODE_MAX_TOKENS  default: 262144 (Kimi K2.7 context window)
+#   SWARM_CODE_OUTPUT_RESERVE  default: 16384 (Kimi K2.7 max output)
 #   SWARM_CODE_TEMP        default: "0.2" (string — parsed to float)
 #   SWARM_CODE_CWD         default: "." (used in system prompt)
 #
@@ -53,7 +53,12 @@ fun main() {
     # server exposing bash/read/write/edit/glob/grep/web_fetch tools.
     # No LLM, no agent loop — pure tool execution for orchestrators.
     if (has_flag(os_args(), "--mcp-server") == 'true') {
-        mcp_server_opts = %{cwd: resolve_cwd()}
+        mcp_server_opts = %{
+            cwd: resolve_cwd(),
+            settings: Config.load(),
+            guardrails_table: ToolGuardrails.init(),
+            execution_context: "mcp_server"
+        }
         McpServer.run(mcp_server_opts)
         sys_exit(0)
     }
@@ -166,7 +171,11 @@ fun main() {
         if (m == nil) { "" } else { m }
     } else { "" }
 
-    opts = map_put(base_opts, 'cwd', cwd)
+    context_env = getenv("SWARM_CODE_EXECUTION_CONTEXT")
+    execution_context = if (context_env == nil) { "main" }
+                        else { to_string(context_env) }
+    opts0 = map_put(base_opts, 'execution_context', execution_context)
+    opts = map_put(opts0, 'cwd', cwd)
     opts2 = map_put(opts, 'todos_table', todos_table)
     opts3 = map_put(opts2, 'perms_table', perms_table)
     opts3a = map_put(opts3, 'memory_table', memory_table)
@@ -372,7 +381,7 @@ fun print_usage() {
     print("  ~/.swarm-code/settings.json root, then built-in defaults.")
     print("")
     print("  SWARM_CODE_ENDPOINT      LLM endpoint (OpenAI-compatible)")
-    print("  SWARM_CODE_MODEL         model name (default: kimi-k2.6)")
+    print("  SWARM_CODE_MODEL         model name (default: kimi-k2.7-code)")
     print("  SWARM_CODE_API_KEY       API key for a remote provider")
     print("  SWARM_CODE_TOOL_FORMAT   native | inband (else auto-detected)")
     print("  SWARM_CODE_ALLOW_REMOTE  set to 1 to permit non-local endpoints")
@@ -461,7 +470,7 @@ fun load_opts() {
     model = if (model_env != nil) { model_env }
             else { if (model_prof != nil) { to_string(model_prof) }
             else { if (model_set != nil) { to_string(model_set) }
-            else { "kimi-k2.6" }}}
+            else { "kimi-k2.7-code" }}}
 
     api_env = getenv("SWARM_CODE_API_KEY")
     api_prof = if (profile == nil) { nil } else { map_get(profile, 'api_key') }

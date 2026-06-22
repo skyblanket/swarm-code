@@ -480,6 +480,7 @@ fun embed_missing(opts) {
         db = MemVec.open(embed_db_path())
         missing = MemVec.list_slugs_without_vector(db, slugs)
         count = embed_missing_loop(db, missing, opts, 0)
+        if (reindex_show(opts) == 'true') { print_inline("\r\e[K") }
         MemVec.close(db)
         count
     }
@@ -497,10 +498,25 @@ fun collect_md_slugs(entries, acc) {
     }
 }
 
+# Whether to draw the per-item reindex progress line — interactive only,
+# never in headless/subagent/mcp_server (same policy as the tool heartbeat,
+# so it can't corrupt -p output or the MCP-server JSON-RPC stream).
+fun reindex_show(opts) {
+    if (map_get(opts, 'headless') == 'true') { 'false' }
+    else { if (map_get(opts, 'is_subagent') == 'true') { 'false' }
+    else { if (map_get(opts, 'execution_context') == "mcp_server") { 'false' } else { 'true' } } }
+}
+
 fun embed_missing_loop(db, slugs, opts, count) {
     if (length(slugs) == 0) { count }
     else {
         slug = hd(slugs)
+        # Per-item progress so a long /memory reindex isn't silent.
+        if (reindex_show(opts) == 'true') {
+            print_inline("\r\e[K  \e[38;5;240m⋯ indexing " ++ to_string(slug) ++
+                         " (" ++ to_string(count + 1) ++ "/" ++
+                         to_string(count + length(slugs)) ++ ")\e[0m")
+        }
         fp = memory_file_path(slug)
         content = if (file_exists(fp) == 'false') { nil } else { file_read(fp) }
         new_count = if (content == nil) { count }

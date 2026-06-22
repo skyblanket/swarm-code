@@ -32,6 +32,7 @@ export [
     input_prompt, input_box_top, input_box_bottom, input_box_bottom_full,
     input_divider, footer_hint,
     status_line, spinner_start, spinner_stop,
+    tool_progress, tool_progress_clear,
     enter_alt_screen, leave_alt_screen,
     term_width,
     todo_list_render, todo_summary,
@@ -333,6 +334,19 @@ fun input_divider() {
 # ------------------------------------------------------------
 fun status_line(text) {
     print_inline("\r\e[K" ++ grey_text() ++ text ++ reset())
+}
+
+# Transient "still running" line for a long non-LLM tool wait. Mirrors the
+# LLM wait_hint look (dim grey ⋯) but lives on its own \r line so each
+# refresh overwrites the prior one. Cleared by tool_progress_clear() on
+# completion. No C-runtime coupling — the LLM spinner owns http_post_stream.
+fun tool_progress(label, elapsed_sec) {
+    print_inline("\r\e[K  \e[38;5;240m⋯ " ++ to_string(label) ++
+                 " still running (" ++ to_string(elapsed_sec) ++ "s)\e[0m")
+}
+
+fun tool_progress_clear() {
+    print_inline("\r\e[K")
 }
 
 # Footer hint line below input divider

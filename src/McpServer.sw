@@ -23,10 +23,11 @@ module McpServer
 # Transport: stdout carries JSON-RPC responses only. The startup
 # "ready" banner goes to stderr so it doesn't corrupt the stream.
 
-import Tools
+import ToolExecutor
 import ToolSchemas
 import ToolRegistry
 import Util
+import Version
 
 export [run]
 
@@ -34,7 +35,7 @@ export [run]
 # Server info
 # ============================================================
 fun server_name()    { "swarm-code" }
-fun server_version() { "0.2.0" }
+fun server_version() { Version.version() }
 fun protocol_version() { "2025-06-18" }
 
 # The subset of ToolSchemas tools we expose as an MCP server.
@@ -42,7 +43,7 @@ fun protocol_version() { "2025-06-18" }
 # skills, background, browser, todo_write) — those require a live
 # agent context. The caller already HAS an agent; it needs execution.
 fun exposed_tool_names() {
-    ["bash", "read", "write", "edit", "glob", "grep", "web_fetch"]
+    ToolRegistry.names_for("mcp_server")
 }
 
 # Filter all_schemas() down to the names we expose.
@@ -165,13 +166,15 @@ fun handle_tools_call(id, params, opts) {
         if (list_member(exposed_tool_names(), name_s) == 'false') {
             err_response(id, -32601, "tool not found: " ++ name_s)
         } else {
-            # ToolRegistry.atom_for converts "bash" → 'bash' so that
-            # Tools.exec can match against atom keys in the handler registry.
+            # ToolRegistry.atom_for converts "bash" → 'bash' so the shared
+            # execution boundary can reach the raw handler registry.
             name_atom = ToolRegistry.atom_for(name_s)
-            result = Tools.exec(name_atom, args, opts)
-            result_s = to_string(result)
-            # If the tool returned an error string, surface it as isError
-            if (string_starts_with(result_s, "error:") == 'true') {
+            # Determine isError STRUCTURALLY from the execution outcome, not
+            # by sniffing the payload for an "error:" prefix (which mis-flags
+            # legitimate file content and misses non-zero bash exits).
+            outcome = ToolExecutor.execute_outcome(name_atom, args, opts)
+            result_s = to_string(map_get(outcome, 'text'))
+            if (map_get(outcome, 'ok') == 'false') {
                 tool_error_response(id, result_s)
             } else {
                 tool_result_response(id, result_s)
@@ -190,11 +193,26 @@ fun dispatch(msg, opts) {
     params = map_get(msg, 'params')
     method_s = if (method == nil) { "" } else { to_string(method) }
 
-    if (method_s == "initialize") {
+    # JSON-RPC 2.0 §4.1: a message without `id` is a Notification — the
+    # server MUST NOT reply. The only notification we act on is
+    # "notifications/initialized"; every other notification (including
+    # notification-shaped initialize/tools/list/tools/call) is silently
+    # ignored, with NO tool side-effects, mirroring the spec. Returning
+    # nil here suppresses output in server_loop (the `response != nil` gate).
+    if (id == nil) {
+        nil
+    }
+    else { if (method == nil) {
+        # Request with no method member is an Invalid Request, not an
+        # unknown method (which would be -32601).
+        err_response(id, -32600, "invalid request: missing method")
+    }
+    else { if (method_s == "initialize") {
         handle_initialize(id)
     }
     else { if (method_s == "notifications/initialized") {
-        # Notification — no id, no response needed
+        # A request-shaped (id-bearing) "initialized" is unusual but the
+        # notification path above already handles the normal no-id case.
         nil
     }
     else { if (method_s == "tools/list") {
@@ -204,10 +222,9 @@ fun dispatch(msg, opts) {
         handle_tools_call(id, params, opts)
     }
     else {
-        # Unknown method — only reply if this is a request (has id)
-        if (id == nil) { nil }
-        else { err_response(id, -32601, "method not found: " ++ method_s) }
-    }}}}
+        # Known shape, unrecognized method name.
+        err_response(id, -32601, "method not found: " ++ method_s)
+    }}}}}}
 }
 
 # ============================================================
@@ -241,13 +258,26 @@ fun server_loop(opts) {
                 })
                 print(resp)
                 server_loop(opts)
+            } else { if (is_map(msg) == 'false') {
+                # Structurally-valid JSON that is NOT a request object — a
+                # batch array, or a bare scalar. We do not support batching,
+                # so per JSON-RPC 2.0 §4.2 reject with a single Invalid
+                # Request error rather than silently dropping it (which would
+                # hang a client waiting for responses).
+                resp = json_encode(%{
+                    jsonrpc: "2.0",
+                    id: nil,
+                    error: %{code: -32600, message: "invalid request: batch requests are not supported"}
+                })
+                print(resp)
+                server_loop(opts)
             } else {
                 response = dispatch(msg, opts)
                 if (response != nil) {
                     print(to_string(response))
                 }
                 server_loop(opts)
-            }
+            }}
         }
     }
 }

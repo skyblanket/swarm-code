@@ -180,7 +180,7 @@ if [ ! -f "$CFGDIR/settings.json" ]; then
     cat > "$CFGDIR/settings.json" <<'JSON'
 {
   "endpoint": "https://api.moonshot.ai/v1/chat/completions",
-  "model":    "kimi-k2.6",
+  "model":    "kimi-k2.7-code",
   "api_key":  "",
   "permissions": {
     "bash":  "allow",

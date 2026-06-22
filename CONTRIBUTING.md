@@ -6,8 +6,9 @@
 |------|------|
 | `main.sw` | CLI flags, env config, headless mode, the main loop |
 | `agent.sw` | Prompt assembly, tool-call parsing/serialising, turn loop |
-| `tools.sw` | Tool handlers (`do_bash`, `do_read`, …) and `exec()` dispatch |
-| `ToolRegistry.sw` | Single source of truth: name → atom mapping (`all_tools`) |
+| `ToolExecutor.sw` | Shared context, hook, guardrail, and permission boundary |
+| `tools.sw` | Raw tool handlers (`do_bash`, `do_read`, …) and `exec_raw()` dispatch |
+| `ToolRegistry.sw` | Tool identity plus execution-context allow/block policy |
 | `ToolSchemas.sw` | OpenAI-compatible function schemas for native tool calling |
 | `prompts.sw` | System prompt template and prose tool descriptions |
 | `llm.sw` | HTTP requests to the inference endpoint, response streaming |
@@ -54,7 +55,11 @@ Four files, lock-step:
 
 4. **`prompts.sw`** — if you skipped the schema, add a prose description in `tool_desc()` so the model sees it in the system prompt.
 
-Run `make test` before committing.
+All production entry points must execute tools through `ToolExecutor`. Direct
+`Tools.exec_raw()` calls are reserved for `ToolExecutor`, Agent's isolated
+worker, and focused handler tests.
+
+Run `make check` before committing.
 
 ## 3. Build & test
 
@@ -62,6 +67,7 @@ Run `make test` before committing.
 cd /Users/sky/swarm-code
 make          # builds bin/swarm-code
 make test     # builds and runs bin/swarm-code-test
+make check    # unit + smoke + integration + focused module checks
 make run      # build + launch interactively
 ```
 
@@ -104,5 +110,5 @@ sw has no `return` statement; `if` is an expression and every branch must close.
 ## 5. Reporting bugs / opening PRs
 
 - **Bug reports**: Open an issue with (a) the command you ran, (b) the output you got, (c) what you expected, (d) `swarm-code --version` or commit hash.
-- **PRs**: Branch from `main`, keep changes focused, run `make test`, and include a headless smoke test if you added a tool.
+- **PRs**: Branch from `main`, keep changes focused, run `make check`, and include an integration case when changing an execution boundary.
 - **No marketing prose** in docs or comments — be terse.

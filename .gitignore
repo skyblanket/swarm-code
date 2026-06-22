@@ -22,6 +22,7 @@
 scripts/*
 !scripts/install.sh
 !scripts/install.ps1
+!scripts/council.sh
 
 # Inside src/, ignore generated C output from `swc build` and the
 # version module make generates from the VERSION file.

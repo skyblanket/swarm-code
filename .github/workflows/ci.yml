@@ -45,10 +45,9 @@ jobs:
           SWARMRT: ${{ github.workspace }}/swarmrt
         run: make
 
-      - name: Smoke + test-all
+      - name: Production verification gate
         working-directory: swarm-code
         env:
           SWARMRT: ${{ github.workspace }}/swarmrt
         run: |
-          SWARM_CODE_NO_RESUME=1 make smoke
-          make test-all
+          make check

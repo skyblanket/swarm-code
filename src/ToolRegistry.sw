@@ -4,11 +4,10 @@ module ToolRegistry
 # ToolRegistry — single source of truth for tool metadata
 # ============================================================
 #
-# The old layout had three parallel if/else chains over the same
-# ~55 tool names:
+# The old layout had parallel if/else chains over the same tool names:
 #
 #   * agent.sw    string_to_atom   (name → atom for dispatch)
-#   * tools.sw    exec             (atom → handler function)
+#   * tools.sw    exec_raw         (atom → handler function)
 #   * ToolSchemas.sw   all_schemas (atom → OpenAI tool schema)
 #   * prompts.sw  tool_desc        (atom → inband description)
 #
@@ -24,9 +23,12 @@ module ToolRegistry
 #   2. Wire ToolSchemas.all_schemas to read entries[].schema.
 #   3. Drive prompts.sw tool docs from entries[].desc.
 #   4. (Hardest) confirm sw allows storing handler funs in a map,
-#      then drive Tools.exec() from entries[].handler.
+#      then drive Tools.exec_raw() from entries[].handler.
 
-export [all_tools, atom_for, knows]
+export [
+    all_tools, atom_for, knows,
+    allowed_in, names_for, subagent_blocked_tools, council_panel_tools
+]
 
 fun all_tools() {
     [
@@ -98,7 +100,7 @@ fun all_tools() {
 
 # Map a string name to its dispatcher atom. Returns the original
 # string if unknown — that's how MCP tools (mcp__*) flow through
-# without explicit registration; tools.sw exec() detects the prefix.
+# without explicit registration; tools.sw exec_raw() detects the prefix.
 fun atom_for(name) {
     s = to_string(name)
     atom_lookup(all_tools(), s)
@@ -130,4 +132,59 @@ fun knows_lookup(entries, name) {
         if (to_string(map_get(e, 'name')) == name) { 'true' }
         else { knows_lookup(tl(entries), name) }
     }
+}
+
+# Context policy lives beside tool identity so new entry points do not
+# invent their own allow/block lists. The main agent can use every tool.
+fun allowed_in(context, name) {
+    if (context == "mcp_server") {
+        in_list(mcp_server_tools(), to_string(name))
+    } else { if (context == "council_panel") {
+        in_list(council_panel_tools(), to_string(name))
+    } else { if (context == "council_judge") {
+        'false'
+    } else { if (context == "subagent") {
+        if (in_list(subagent_blocked_tools(), to_string(name)) == 'true') {
+            'false'
+        } else { 'true' }
+    } else { if (context == "main") { 'true' }
+    else { 'false' }}}}}
+}
+
+fun names_for(context) {
+    if (context == "mcp_server") { mcp_server_tools() }
+    else { if (context == "council_panel") { council_panel_tools() }
+    else { if (context == "council_judge") { [] }
+    else { if (context == "main" || context == "subagent") {
+        all_names(all_tools(), [])
+    } else { [] }}}}
+}
+
+fun all_names(entries, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        all_names(tl(entries), list_append(acc, to_string(map_get(hd(entries), 'name'))))
+    }
+}
+
+fun mcp_server_tools() {
+    ["bash", "read", "write", "edit", "glob", "grep", "web_fetch"]
+}
+
+fun subagent_blocked_tools() {
+    ["task", "remember", "forget", "learn_skill", "forget_skill",
+     "bg_server", "browser_launch", "git_commit", "todo_write"]
+}
+
+# Council panelists inspect the repository independently. Keep the first
+# prototype read-only and non-recursive: no shell, writes, background work,
+# memory mutation, browser control, or nested task delegation.
+fun council_panel_tools() {
+    ["read", "glob", "grep", "git_status", "git_diff", "code_search"]
+}
+
+fun in_list(lst, item) {
+    if (length(lst) == 0) { 'false' }
+    else { if (hd(lst) == item) { 'true' }
+    else { in_list(tl(lst), item) }}
 }

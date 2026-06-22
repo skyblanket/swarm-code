@@ -18,7 +18,7 @@ VERSION_STR := $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
 
 TESTBIN := bin/swarm-code-test
 
-.PHONY: all clean run test smoke integration
+.PHONY: all clean run test smoke integration module-check test-all check run-local FORCE
 
 all: $(BIN)
 
@@ -53,7 +53,7 @@ run: $(BIN)
 # Smoke test — boots the binary in headless mode, runs one bash tool call,
 # verifies the response. Used by tests/smoke.sh.
 smoke: $(BIN)
-	@BIN=./$(BIN) ./tests/smoke.sh
+	@SWARM_CODE_NO_RESUME=1 BIN=./$(BIN) ./tests/smoke.sh
 
 # Integration (E2E) suite — runs the real binary headless against a
 # scripted mock LLM endpoint (tests/integration/). Isolated $HOME per
@@ -61,10 +61,16 @@ smoke: $(BIN)
 integration: $(BIN)
 	@BIN=./$(BIN) ./tests/integration/run.sh
 
-# Run the per-module tests in tests/ (8 modules; the main 84-check
-# regression suite runs via `make test`).
-test-all:
+# Compile and run the focused per-module checks in tests/. The main
+# regression suite runs via `make test`.
+module-check:
 	@./tests/run_all.sh
+
+# Backwards-compatible alias used by older contributor docs/scripts.
+test-all: module-check
+
+# Production gate: one command for local verification, CI, and releases.
+check: test smoke integration module-check
 
 # Handy one-liner for ad hoc testing against a local endpoint.
 run-local: $(BIN)

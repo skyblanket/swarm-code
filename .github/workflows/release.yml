@@ -72,27 +72,16 @@ jobs:
           export SWARMRT="$GITHUB_WORKSPACE/swarmrt"
           make
 
-      - name: Smoke-test the binary
+      - name: Verify release candidate
         working-directory: swarm-code
+        env:
+          SWARMRT: ${{ github.workspace }}/swarmrt
         run: |
           # Sanity: artifact looks like a real executable.
           file bin/swarm-code
           test -s bin/swarm-code
           ls -lh bin/swarm-code
-          # Real end-to-end: boot + run a single bash tool call (no
-          # network). SWARM_CODE_NO_RESUME=1 guards against a stale
-          # .active marker bleeding between matrix jobs.
-          SWARM_CODE_NO_RESUME=1 make smoke
-
-      - name: Run module tests
-        working-directory: swarm-code
-        env:
-          SWARMRT: ${{ github.workspace }}/swarmrt
-        run: |
-          # 8 module tests built by the parallel test-gen wave. Each
-          # is `module Main` that sys_exit(0) on pass. Catches the
-          # kind of regressions a `file -s` check can't.
-          make test-all
+          make check
 
       - name: Package
         working-directory: swarm-code

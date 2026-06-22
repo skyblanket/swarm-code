@@ -5,23 +5,72 @@ export [run_tests, parse_output, test_gate, format_result]
 # Run tests and return structured results
 # shell() returns {exit_code, stdout} as a tuple
 fun run_tests(repo_path, command) {
-  cmd = if (command == "") { "npm test" } else { command }
-  full = "cd " ++ repo_path ++ " && " ++ cmd ++ " 2>&1"
-  result = shell(full)
-  exit_code = elem(result, 0)
-  stdout = elem(result, 1)
-  parsed = parse_output(stdout)
+  cmd = if (command == "") { detect_test_command(repo_path) } else { command }
+  if (cmd == "") {
+    # No explicit command and nothing recognizable in the repo. A clear hint
+    # beats the old behaviour — blindly running `npm test` on a non-npm project
+    # and reporting a baffling "framework: unknown" with exit 254.
+    %{
+      framework: "unknown",
+      passed: 0, failed: 0, skipped: 0, total: 0,
+      duration_ms: 0, failures: [],
+      raw: "run_tests: could not auto-detect a test framework in " ++ repo_path ++
+           " (looked for package.json / Cargo.toml / go.mod / pyproject.toml / setup.py / pytest.ini / test_*.py). " ++
+           "Pass an explicit 'command', e.g. \"pytest -q\".",
+      exit_code: 0
+    }
+  } else {
+    full = "cd " ++ repo_path ++ " && " ++ cmd ++ " 2>&1"
+    result = shell(full)
+    exit_code = elem(result, 0)
+    stdout = elem(result, 1)
+    parsed = parse_output(stdout)
 
-  %{
-    framework: parsed.framework,
-    passed: parsed.passed,
-    failed: parsed.failed,
-    skipped: parsed.skipped,
-    total: parsed.total,
-    duration_ms: parsed.duration_ms,
-    failures: parsed.failures,
-    raw: stdout,
-    exit_code: exit_code
+    %{
+      framework: parsed.framework,
+      passed: parsed.passed,
+      failed: parsed.failed,
+      skipped: parsed.skipped,
+      total: parsed.total,
+      duration_ms: parsed.duration_ms,
+      failures: parsed.failures,
+      raw: stdout,
+      exit_code: exit_code
+    }
+  }
+}
+
+# Pick a test command from the repo's files when the caller didn't supply one.
+# Previously run_tests hard-defaulted to `npm test`, so every non-npm project
+# (e.g. a bare pytest project with just test_*.py) failed with exit 254 and
+# "framework: unknown". Now we sniff the stack first.
+fun detect_test_command(repo_path) {
+  base = repo_path ++ "/"
+  if (file_exists(base ++ "package.json") == 'true') { "npm test" }
+  else { if (file_exists(base ++ "Cargo.toml") == 'true') { "cargo test" }
+  else { if (file_exists(base ++ "go.mod") == 'true') { "go test ./..." }
+  else { if (looks_python(base, repo_path) == 'true') { "python3 -m pytest -q" }
+  else { "" }}}}
+}
+
+# Python detection: a config file, OR bare test_*.py / *_test.py in the root
+# (the common ad-hoc case that pytest auto-discovers).
+fun looks_python(base, repo_path) {
+  if (file_exists(base ++ "pyproject.toml") == 'true') { 'true' }
+  else { if (file_exists(base ++ "setup.py") == 'true') { 'true' }
+  else { if (file_exists(base ++ "pytest.ini") == 'true') { 'true' }
+  else { if (file_exists(base ++ "tox.ini") == 'true') { 'true' }
+  else { if (file_exists(base ++ "conftest.py") == 'true') { 'true' }
+  else { has_pytest_file(file_list(repo_path)) }}}}}
+}
+
+fun has_pytest_file(entries) {
+  if (length(entries) == 0) { 'false' }
+  else {
+    e = to_string(hd(entries))
+    if (string_starts_with(e, "test_") == 'true' && string_ends_with(e, ".py") == 'true') { 'true' }
+    else { if (string_ends_with(e, "_test.py") == 'true') { 'true' }
+    else { has_pytest_file(tl(entries)) }}
   }
 }
 

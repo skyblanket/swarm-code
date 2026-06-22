@@ -29,40 +29,26 @@ import Browser
 import Mcp
 import Util
 import TestRunner
-import TestRunner
 import PathGuard
-import Hooks
 
-export [exec, max_output_bytes]
+export [exec_raw, max_output_bytes]
 
 # Keep tool output well under the 32K context so even a long history +
 # a big bash stdout doesn't push the KV cache over. 6 KB ≈ ~1500 tokens.
 fun max_output_bytes() { 6000 }
 
-# Dispatch a tool call by name. The big if/else used to live here;
-# now it's a registry lookup. MCP tools still front-load because
-# their name is dynamic (mcp__server__tool) and they route through
-# Mcp.call_tool rather than a static handler.
-fun exec(name, args, opts) {
-    # Run pre_tool hook — may veto or modify args.
-    hook_pre = Hooks.run_pre_tool(name, args, opts)
-    if (map_get(hook_pre, 'veto') == 'true') {
-        "blocked by pre_tool hook"
+# Raw handler dispatch. Permission, context, guardrail, and hook policy
+# lives in ToolExecutor; callers outside tests should use that boundary.
+fun exec_raw(name, args, opts) {
+    if (string_starts_with(to_string(name), "mcp__") == 'true') {
+        truncate_output(Mcp.call_tool(to_string(name), args, opts), max_output_bytes())
     } else {
-        effective_args = map_get(hook_pre, 'args')
-        raw_result = if (string_starts_with(to_string(name), "mcp__") == 'true') {
-            truncate_output(Mcp.call_tool(to_string(name), effective_args, opts), max_output_bytes())
+        handler = find_handler(all_tools(), name)
+        if (handler == nil) {
+            "error: unknown tool '" ++ to_string(name) ++ "'"
         } else {
-            handler = find_handler(all_tools(), name)
-            if (handler == nil) {
-                "error: unknown tool '" ++ to_string(name) ++ "'"
-            } else {
-                handler(effective_args, opts)
-            }
+            handler(args, opts)
         }
-        # Run post_tool hook (fire-and-forget).
-        Hooks.run_post_tool(name, raw_result, 0, opts)
-        raw_result
     }
 }
 
@@ -95,7 +81,7 @@ fun all_tools() {
         %{atom: 'glob',               handler: fun(args, opts) { do_glob(args) }},
         %{atom: 'grep',               handler: fun(args, opts) { do_grep(args) }},
         %{atom: 'todo_write',         handler: fun(args, opts) { do_todo_write(args, opts) }},
-        %{atom: 'web_fetch',          handler: fun(args, opts) { do_web_fetch(args) }},
+        %{atom: 'web_fetch',          handler: fun(args, opts) { do_web_fetch(args, opts) }},
         %{atom: 'web_search',         handler: fun(args, opts) { do_web_search(args) }},
         %{atom: 'remember',           handler: fun(args, opts) { do_remember(args, opts) }},
         %{atom: 'recall',             handler: fun(args, opts) { do_recall(args, opts) }},
@@ -131,28 +117,25 @@ fun all_tools() {
         %{atom: 'browser_get_text',   handler: fun(args, opts) { do_browser_get_text(args, opts) }},
         %{atom: 'browser_get_html',   handler: fun(args, opts) { do_browser_get_html(args, opts) }},
         %{atom: 'browser_evaluate',   handler: fun(args, opts) { do_browser_evaluate(args, opts) }},
-        %{atom: 'browser_close',      handler: fun(args, opts) { do_browser_close(args, opts) }}
+        %{atom: 'browser_close',      handler: fun(args, opts) { do_browser_close(args, opts) }},
+        %{atom: 'browser_console',    handler: fun(args, opts) { do_browser_console(args, opts) }}
     ]
 }
 
 # ------------------------------------------------------------
 # Timeout infrastructure
 # ------------------------------------------------------------
-# Every tool that shells out gets wrapped by `with_timeout()` so a
-# hanging command (tail -f, infinite loop, stuck DNS, unresponsive
-# git remote) never pins the whole agent.
-#
-# Mechanism: we prefix the command with `perl -e 'alarm shift; exec
-# @ARGV'`. Perl sets an alarm(N) timer in its own process, then
-# `exec()`s the real command in place. The kernel preserves the
-# pending SIGALRM across exec, so after N seconds SIGALRM fires on
-# whatever the command replaced perl with and terminates it. Zero
-# external deps — perl is on every macOS box.
-#
-# Timeout defaults mirror Claude Code:
+# Every tool that shells out runs through `shell_managed(cmd, ms)` (a swarmrt
+# builtin): it runs the command in its OWN process group, enforces the timeout
+# in C, and on timeout/ESC kills the WHOLE process group (TERM→KILL) — so a hung
+# command (tail -f, stuck DNS, unresponsive git remote, or a leaked grandchild)
+# can never pin the agent. The old perl-`alarm` `with_timeout` wrapper was
+# removed: it only SIGALRM'd the direct child (leaking grandchildren) and left
+# swarmrt's shell() polling for an exit file that never arrived → a multi-minute
+# wedge. These constants supply the per-tool budgets in SECONDS; callers pass
+# `* 1000` to shell_managed. Timeouts mirror Claude Code:
 #   bash:       120s default, 600s max, overridable via timeout_ms arg
-#   git/search: 30s (no override — if you need more, use bash directly)
-#   web_fetch:  45s (HTTP is flakier, give it more)
+#   git/search: 30s · web_fetch: 45s · read-probes: 5s
 # ------------------------------------------------------------
 fun bash_default_timeout_s() { 120 }
 fun bash_max_timeout_s() { 600 }
@@ -160,23 +143,56 @@ fun search_timeout_s() { 30 }
 fun git_timeout_s() { 30 }
 fun fetch_timeout_s() { 45 }
 
-# Wrap a shell command with a perl alarm guard. The resulting string
-# can be passed to `shell()` as if it were the original command.
-# SIGALRM terminates the target with exit code 142 (128 + 14), which
-# callers can detect to surface a friendly timeout message.
-fun with_timeout(cmd, seconds) {
-    "perl -e 'alarm shift; exec @ARGV' " ++ to_string(seconds) ++
-    " sh -c " ++ Util.shell_q(to_string(cmd))
+# Extract a host label from a URL for the web_fetch pre-flight line.
+# "https://github.com/a/b?x=1" → "github.com". Falls back to "web_fetch"
+# when the URL is empty or yields no host. Pure string ops, no parsing libs.
+fun fetch_host_label(url) {
+    s = to_string(url)
+    after_scheme = if (string_contains(s, "://") == 'true') {
+        elem_or(string_split(s, "://"), 1, s)
+    } else { s }
+    host_and_more = elem_or(string_split(after_scheme, "/"), 0, after_scheme)
+    # Drop any userinfo (user:pass@host) and trailing port.
+    host = if (string_contains(host_and_more, "@") == 'true') {
+        elem_or(string_split(host_and_more, "@"), 1, host_and_more)
+    } else { host_and_more }
+    bare = elem_or(string_split(host, ":"), 0, host)
+    if (string_length(bare) == 0) { "web_fetch" } else { bare }
 }
 
-# Given the exit code and output from a shell() call wrapped by
-# with_timeout, return a formatted tool result. If the exit code is
-# 142 (SIGALRM), prepend a visible "timed out" banner so the model
-# knows to retry with a longer budget instead of guessing.
-fun format_timed_result(code, out, seconds) {
-    if (code == 142) {
-        "[timed out after " ++ to_string(seconds) ++ "s — process killed by SIGALRM]\n" ++
-        "(partial output below; retry with a larger timeout_ms or a tighter query)\n\n" ++
+# Safe 0-indexed list access with a fallback when out of range.
+fun elem_or(xs, i, fallback) {
+    if (length(xs) == 0) { fallback }
+    else { if (i <= 0) { hd(xs) }
+    else { elem_or(tl(xs), i - 1, fallback) } }
+}
+fun read_probe_timeout_s() { 5 }
+
+# Prefix that makes git non-interactive: never prompt for credentials,
+# make any askpass call fail-fast (empty), and force ssh batch mode so a
+# host-key/passphrase prompt errors out instead of blocking on a dead tty.
+# Uses `export ...;` (NOT a leading `VAR=val cmd` assignment list) so the
+# vars persist across the WHOLE `sh -c` — every git in an `&&` chain
+# (add && commit && rev-parse), not just the first command.
+fun git_noninteractive_env() {
+    "export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true GIT_SSH_COMMAND='ssh -oBatchMode=yes'; "
+}
+
+# Format a result from shell_managed (a {code, output, interrupted} 3-tuple).
+# When interrupted == 'true' the whole process GROUP was SIGKILLed — either
+# by the wall-clock timeout (exit 124) or a user ESC/Ctrl-C (exit 130) — so
+# any partial output is all we have. We distinguish the two so the model
+# knows whether to retry with a bigger budget or to stop entirely.
+fun format_managed_result(code, out, seconds, interrupted) {
+    if (interrupted == 'true') {
+        banner = if (code == 130) {
+            "[stopped by user (ESC/Ctrl-C) — process group killed]\n"
+        } else {
+            "[timed out after " ++ to_string(seconds) ++ "s — process group killed]\n"
+        }
+        banner ++
+        "(partial output below; the whole process tree was terminated. Retry with\n" ++
+        " a larger timeout_ms, a tighter command, or run long jobs in the background.)\n\n" ++
         out
     } else {
         "[exit " ++ to_string(code) ++ "]\n" ++ out
@@ -264,14 +280,21 @@ fun do_bash(args) {
         else {
             t_s = resolve_bash_timeout_s(timeout_raw)
             user_cmd = cmd_s
+            # Keep the non-interactive env + stdin</dev/null + 2>&1 hardening,
+            # but hand the timeout AND the kill to shell_managed instead of the
+            # perl alarm: the alarm only SIGALRMs the single exec'd process, so
+            # node/python/server grandchildren leaked and kept running. shell_managed
+            # runs the command in its own process group, enforces the timeout in C,
+            # killpg's the WHOLE tree on timeout, and lets a user ESC stop a hung
+            # command mid-run (the alarm could never be cut short).
             noninteractive = noninteractive_wrap(user_cmd)
-            wrapped = with_timeout(noninteractive, t_s)
-            result = shell(wrapped)
-            code = elem(result, 0)
-            out = elem(result, 1)
+            r = shell_managed(noninteractive, t_s * 1000)
+            code = elem(r, 0)
+            out = elem(r, 1)
+            interrupted = elem(r, 2)
             line_capped = truncate_output_lines(out, bash_max_lines())
             byte_capped = truncate_output(line_capped, max_output_bytes())
-            format_timed_result(code, byte_capped, t_s)
+            format_managed_result(code, byte_capped, t_s, interrupted)
         }
     }
 }
@@ -316,37 +339,57 @@ fun do_read(args) {
 
 fun read_file_capped(path, offset, limit) {
     pq = Util.shell_q(to_string(path))
-    # Check if file is binary before reading — binary content poisons the
-    # model's context and causes empty responses.
-    file_type = elem(shell("file --brief --mime-type " ++ pq), 1)
-    is_text = string_starts_with(string_trim(file_type), "text") == 'true'
-    is_json = string_contains(file_type, "json") == 'true'
-    is_xml = string_contains(file_type, "xml") == 'true'
-    if (is_text == 'true' || is_json == 'true' || is_xml == 'true') {
-        # Size guard: file_read() pulls the WHOLE file into memory, so a
-        # multi-GB file would OOM the VM before truncate_output ever runs.
-        # Stat first; for anything large, read only a capped head via
-        # `head -c` instead of slurping the whole thing.
-        size_str = string_trim(elem(shell("wc -c < " ++ pq ++ " 2>/dev/null"), 1))
-        size = parse_int_safe(size_str, 0)
-        read_ceiling = max_output_bytes() * 8
-        content = if (size > read_ceiling) {
-            head = elem(shell("head -c " ++ to_string(read_ceiling) ++ " " ++ pq), 1)
-            head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
-            to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
-        } else {
-            file_read(path)
-        }
-        if (content == nil) {
-            "error: could not read " ++ path
-        } else {
-            sliced = slice_lines(content, offset, limit)
-            truncate_output(sliced, max_output_bytes())
-        }
+    # Regular-file guard FIRST. `test -f` is false for FIFOs, char/block
+    # devices, sockets, and directories. Reading any of those (e.g. a named
+    # pipe with no writer, or /dev/stdin) blocks FOREVER — `file`, `wc -c`,
+    # and `head -c` would all hang, freezing the tool worker. Refuse before
+    # touching the path. Every probe below is also timeout-guarded as a
+    # backstop (a path on a dead NFS mount can hang even `test`).
+    rf_r = shell_managed(
+        "test -f " ++ pq ++ " && echo reg || echo nonreg 2>&1", read_probe_timeout_s() * 1000)
+    rf = string_trim(elem(rf_r, 1))
+    if (elem(rf_r, 2) == 'true') {
+        # Probe was killed by timeout/ESC (e.g. a dead NFS mount) — say so
+        # rather than misreporting the path as a non-regular file.
+        "error: read of " ++ to_string(path) ++ " was interrupted (timeout or ESC) " ++
+        "before the file could be classified — the path may be on an unresponsive filesystem."
+    } else { if (rf != "reg") {
+        "error: not a regular file — " ++ to_string(path) ++
+        "\n(FIFOs, devices, sockets, and directories are refused to avoid a hang. " ++
+        "Use bash with an explicit, bounded reader if you really need to.)"
     } else {
-        "error: binary file (" ++ string_trim(file_type) ++ ") — " ++ to_string(path) ++
-        "\nUse bash with hexdump, xxd, strings, or file to inspect binary files."
-    }
+        # Check if file is binary before reading — binary content poisons the
+        # model's context and causes empty responses.
+        file_type = elem(shell_managed("file --brief --mime-type " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
+        is_text = string_starts_with(string_trim(file_type), "text") == 'true'
+        is_json = string_contains(file_type, "json") == 'true'
+        is_xml = string_contains(file_type, "xml") == 'true'
+        if (is_text == 'true' || is_json == 'true' || is_xml == 'true') {
+            # Size guard: file_read() pulls the WHOLE file into memory, so a
+            # multi-GB file would OOM the VM before truncate_output ever runs.
+            # Stat first; for anything large, read only a capped head via
+            # `head -c` instead of slurping the whole thing.
+            size_str = string_trim(elem(shell_managed("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
+            size = parse_int_safe(size_str, 0)
+            read_ceiling = max_output_bytes() * 8
+            content = if (size > read_ceiling) {
+                head = elem(shell_managed("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
+                head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
+                to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
+            } else {
+                file_read(path)
+            }
+            if (content == nil) {
+                "error: could not read " ++ path
+            } else {
+                sliced = slice_lines(content, offset, limit)
+                truncate_output(sliced, max_output_bytes())
+            }
+        } else {
+            "error: binary file (" ++ string_trim(file_type) ++ ") — " ++ to_string(path) ++
+            "\nUse bash with hexdump, xxd, strings, or file to inspect binary files."
+        }
+    } }
 }
 
 # Slice [offset, offset+limit) lines from content (1-based offset).
@@ -394,6 +437,27 @@ fun count_substrings(s, sub) {
 # ------------------------------------------------------------
 # write
 # ------------------------------------------------------------
+# Create all parent directories of a file path (like `mkdir -p $(dirname path)`).
+# file_mkdir is single-level POSIX mkdir, so we walk the path and create each
+# ancestor in turn (EEXIST is harmless). Without this the FIRST write into any
+# new project dir fails — the model then has to mkdir+retry, burning a full turn.
+fun ensure_parent_dirs(path) {
+    mkdir_walk(to_string(path), 0, "")
+}
+
+fun mkdir_walk(p, i, acc) {
+    if (i >= string_length(p)) { 'ok' }
+    else {
+        ch = string_sub(p, i, 1)
+        if (ch == "/") {
+            if (string_length(acc) > 0) { file_mkdir(acc) }
+            mkdir_walk(p, i + 1, acc ++ "/")
+        } else {
+            mkdir_walk(p, i + 1, acc ++ ch)
+        }
+    }
+}
+
 fun do_write(args) {
     path = resolve_path_arg(args)
     content = map_get(args, 'content')
@@ -406,6 +470,7 @@ fun do_write(args) {
             guard = PathGuard.validate_write(to_string(path))
             if (guard != "ok") { guard }
             else {
+                ensure_parent_dirs(to_string(path))
                 rc = file_write(path, content)
                 if (rc == 'ok') {
                     "ok: wrote " ++ to_string(string_length(content)) ++ " bytes to " ++ path
@@ -539,10 +604,11 @@ fun do_glob(args) {
         cmd = "if command -v rg >/dev/null 2>&1; then " ++
               "rg --files --hidden --no-messages -g " ++ pat_q ++ base_part ++ "; " ++
               "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null | sed 's|^\\./||'; fi | head -n 100"
-        result = shell(with_timeout(cmd, search_timeout_s()))
+        result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
-        if (code == 142) {
+        interrupted = elem(result, 2)
+        if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
             if (string_length(string_trim(out)) == 0) { "(no matches)" } else { out }
@@ -606,10 +672,11 @@ fun do_grep(args) {
               " -e " ++ pat_q ++ base_part ++ "; " ++
               "else grep" ++ grep_mode ++ " --color=never -e " ++ pat_q ++ grep_base ++ " 2>/dev/null | sed 's|^\\./||'; fi" ++
               " | head -n " ++ to_string(head_n)
-        result = shell(with_timeout(cmd, search_timeout_s()))
+        result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
-        if (code == 142) {
+        interrupted = elem(result, 2)
+        if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
             trimmed = truncate_output(out, max_output_bytes())
@@ -944,11 +1011,16 @@ fun do_web_search(args) {
         cmd = "SWC_WSQ=" ++ Util.shell_q(to_string(q)) ++
               " SWC_WSN=" ++ Util.shell_q(to_string(max_n)) ++
               " python3 -c " ++ Util.shell_q(py_script)
-        result = shell(with_timeout(cmd, fetch_timeout_s()))
+        # stderr → /dev/null (NOT 2>&1): the python script writes non-fatal
+        # diagnostics like "ddg failed: 403" to stderr while still printing
+        # valid JSON (the Wikipedia fallback) to stdout. Folding stderr would
+        # prepend that text and break json_decode of an otherwise-good result.
+        result = shell_managed(cmd ++ " 2>/dev/null", fetch_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
-        if (code == 142) {
-            "error: web_search timed out after " ++ to_string(fetch_timeout_s()) ++ "s"
+        interrupted = elem(result, 2)
+        if (interrupted == 'true') {
+            "error: web_search timed out after " ++ to_string(fetch_timeout_s()) ++ "s (process group killed)"
         } else { if (code != 0) {
             "error: web_search failed (exit " ++ to_string(code) ++ "):\n" ++ out
         } else {
@@ -1078,11 +1150,12 @@ fun do_run_tests(args) {
 fun do_git_status(args) {
     cwd_arg = map_get(args, 'cwd')
     cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
-    cmd = "git " ++ cwd_part ++ "status --porcelain --branch 2>&1 | head -n 100"
-    r = shell(with_timeout(cmd, git_timeout_s()))
+    cmd = git_noninteractive_env() ++ "git " ++ cwd_part ++ "status --porcelain --branch 2>&1 | head -n 100"
+    r = shell_managed(cmd, git_timeout_s() * 1000)
     code = elem(r, 0)
     out = elem(r, 1)
-    if (code == 142) {
+    interrupted = elem(r, 2)
+    if (interrupted == 'true') {
         "[timed out after " ++ to_string(git_timeout_s()) ++ "s]\n" ++ out
     } else {
         if (string_length(out) == 0) { "(clean)" } else { out }
@@ -1097,11 +1170,12 @@ fun do_git_diff(args) {
     staged = map_get(args, 'staged')
     cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     flag = if (staged == 'true') { "--staged " } else { "" }
-    cmd = "git " ++ cwd_part ++ "diff " ++ flag ++ "--no-color 2>&1"
-    r = shell(with_timeout(cmd, git_timeout_s()))
+    cmd = git_noninteractive_env() ++ "git " ++ cwd_part ++ "diff " ++ flag ++ "--no-color 2>&1"
+    r = shell_managed(cmd, git_timeout_s() * 1000)
     code = elem(r, 0)
     out = elem(r, 1)
-    if (code == 142) {
+    interrupted = elem(r, 2)
+    if (interrupted == 'true') {
         "[timed out after " ++ to_string(git_timeout_s()) ++ "s]\n" ++ out
     } else {
         truncated = truncate_output(out, max_output_bytes())
@@ -1123,17 +1197,23 @@ fun do_git_commit(args) {
     else {
         stage_list = if (files == nil) { "." } else { join_files(files, "") }
         cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
+        # Group the add && commit && rev-parse chain in { …; } 2>&1 so stderr
+        # from ALL three git invocations is captured (a leading per-segment
+        # 2>&1 would only fold one). The group exits with the chain's last
+        # status, preserving the code==0 success check.
         cmd =
-            "git " ++ cwd_part ++ "add " ++ stage_list ++
+            git_noninteractive_env() ++
+            "{ git " ++ cwd_part ++ "add " ++ stage_list ++
             " && git " ++ cwd_part ++ "commit -m " ++ Util.shell_q(to_string(msg)) ++
-            " 2>&1 && git " ++ cwd_part ++ "rev-parse --short HEAD"
-        r = shell(with_timeout(cmd, git_timeout_s()))
+            " && git " ++ cwd_part ++ "rev-parse --short HEAD ; } 2>&1"
+        r = shell_managed(cmd, git_timeout_s() * 1000)
         code = elem(r, 0)
         out = elem(r, 1)
-        if (code == 0) {
-            "ok: committed\n" ++ out
-        } else { if (code == 142) {
+        interrupted = elem(r, 2)
+        if (interrupted == 'true') {
             "error: git commit timed out after " ++ to_string(git_timeout_s()) ++ "s\n" ++ out
+        } else { if (code == 0) {
+            "ok: committed\n" ++ out
         } else {
             "error: git commit failed\n" ++ out
         }}
@@ -1196,10 +1276,11 @@ fun do_code_search(args) {
             Util.shell_q(rgx) ++ " " ++ base_q ++
             " || grep -rn --color=never -E " ++ Util.shell_q(rgx) ++ " " ++ base_q ++
             ") 2>&1 | head -n 80"
-        r = shell(with_timeout(cmd, search_timeout_s()))
+        r = shell_managed(cmd, search_timeout_s() * 1000)
         code = elem(r, 0)
         out = elem(r, 1)
-        if (code == 142) {
+        interrupted = elem(r, 2)
+        if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
             truncated = truncate_output(out, max_output_bytes())
@@ -1233,18 +1314,23 @@ fun do_log_wait(args, opts) {
         if (string_length(log_path) == 0) {
             "error: log_wait needs either 'task_id' or 'path'"
         } else {
-            # Shell loop with grep -q, wrapped in our perl alarm guard
-            # instead of GNU `timeout` (which isn't on base macOS).
-            # Quote BOTH the pattern and the log path — both reach us
-            # from the model.
+            # Shell poll loop with grep -q, run via shell_managed so the timeout
+            # is enforced in C and the whole process group (the sleep loop) is
+            # killed on timeout/ESC — no GNU `timeout` dependency, no orphan.
+            # Quote BOTH the pattern and the log path — both reach us from the model.
             inner = "until grep -q " ++ Util.shell_q(to_string(pat)) ++
                     " " ++ Util.shell_q(log_path) ++ " 2>/dev/null; do sleep 0.5; done"
-            r = shell(with_timeout(inner, timeout_n))
+            # shell_managed (not the perl alarm) so a user ESC can stop the
+            # wait, and so the `sleep` poll-loop's whole process group dies on
+            # timeout. Timeout/interrupt surface via the interrupted flag now,
+            # not exit 142.
+            r = shell_managed(inner, timeout_n * 1000)
             code = elem(r, 0)
-            if (code == 0) {
+            interrupted = elem(r, 2)
+            if (interrupted == 'true') {
+                "timeout: pattern not found within " ++ to_string(timeout_n) ++ "s (or stopped)"
+            } else { if (code == 0) {
                 "ok: pattern found in " ++ log_path
-            } else { if (code == 142) {
-                "timeout: pattern not found within " ++ to_string(timeout_n) ++ "s"
             } else {
                 "error: log_wait failed (exit " ++ to_string(code) ++ ")"
             }}
@@ -1266,8 +1352,8 @@ fun do_file_watch(args) {
         timeout_n = if (timeout == nil) { 60 } else { to_int(timeout) }
 
         # Capture initial mtime, then poll every 0.5s until it changes.
-        # Timeout via perl alarm (with_timeout) so we don't depend on GNU
-        # coreutils `timeout` which isn't on base macOS.
+        # Run via shell_managed so the timeout is enforced in C and the poll
+        # loop's process group is killed on timeout/ESC (no GNU `timeout` dep).
         inner =
             "p=" ++ shell_inner_quote(path) ++ "; " ++
             "initial=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
@@ -1276,13 +1362,14 @@ fun do_file_watch(args) {
             "  [ \"$current\" != \"$initial\" ] && echo \"changed: $initial -> $current\" && exit 0; " ++
             "  sleep 0.5; " ++
             "done"
-        r = shell(with_timeout(inner, timeout_n))
+        r = shell_managed(inner, timeout_n * 1000)
         code = elem(r, 0)
         out = string_trim(elem(r, 1))
-        if (code == 0) { "ok: " ++ out }
-        else { if (code == 142) {
+        interrupted = elem(r, 2)
+        if (interrupted == 'true') {
             "timeout: no change to " ++ path ++ " in " ++ to_string(timeout_n) ++ "s"
-        } else {
+        } else { if (code == 0) { "ok: " ++ out }
+        else {
             "error: file_watch failed (exit " ++ to_string(code) ++ "): " ++ out
         }}
     }
@@ -1326,10 +1413,11 @@ fun do_sw_check(args) {
                   " >/dev/null 2>" ++ Util.shell_q(errf) ++ "; S=$?; " ++
                   "grep -v 'auto-imported\\|cannot open' " ++ Util.shell_q(errf) ++
                   "; rm -f " ++ Util.shell_q(errf) ++ "; exit $S"
-            r = shell(with_timeout(cmd, 60))
+            r = shell_managed(cmd, 60 * 1000)
             code = elem(r, 0)
             out = string_trim(elem(r, 1))
-            if (code == 142) {
+            interrupted = elem(r, 2)
+            if (interrupted == 'true') {
                 "[timed out after 60s while compiling " ++ path ++ "]"
             } else { if (code == 0) {
                 "OK: " ++ path ++ " compiles clean (parse + typecheck + codegen passed)."
@@ -1350,7 +1438,7 @@ fun resolve_swc() {
     override = getenv("SWARM_CODE_SWC")
     if (override != nil) { to_string(override) }
     else {
-        r = shell("command -v swc 2>/dev/null")
+        r = shell_managed("command -v swc 2>/dev/null", read_probe_timeout_s() * 1000)
         found = string_trim(elem(r, 1))
         if (string_length(found) > 0) { found }
         else { "../swarmrt/bin/swc" }
@@ -1500,12 +1588,24 @@ fun todo_read(opts) {
 # v1 strips HTML tags via a sed-backed shell command and caps output.
 # When prompt is provided we append an instruction block to the body —
 # the model can then summarize on its next turn.
-fun do_web_fetch(args) {
+fun do_web_fetch(args, opts) {
     url = map_get(args, 'url')
     if (url == nil) { "error: missing 'url'" }
     else {
+        # Pre-flight feedback: http_get is a single blocking builtin (0-45s,
+        # ESC-interruptible upstream) with no poll loop to hang a heartbeat on.
+        # Print one dim grey line before it and clear right after, gated off
+        # in headless/subagent runs.
+        show_wait = if (map_get(opts, 'headless') == 'true') { 'false' }
+                    else { if (map_get(opts, 'is_subagent') == 'true') { 'false' }
+                    # mcp_server mode reserves stdout for JSON-RPC — never print there.
+                    else { if (map_get(opts, 'execution_context') == "mcp_server") { 'false' } else { 'true' } } }
+        if (show_wait == 'true') {
+            print_inline("\r\e[K  \e[38;5;240m⋯ fetching " ++ fetch_host_label(url) ++ "…\e[0m")
+        }
         # http_get(url, headers) → response body string, or nil on failure
         body = http_get(url, [])
+        if (show_wait == 'true') { UI.tool_progress_clear() }
         if (body == nil) {
             "error: fetch failed for " ++ url
         } else {
@@ -1520,7 +1620,7 @@ fun do_web_fetch(args) {
                         " -e 's/&nbsp;/ /g' -e 's/&amp;/\\&/g'" ++
                         " -e 's/&lt;/</g' -e 's/&gt;/>/g'" ++
                         " -e 's/&quot;/\"/g' | tr -s ' \\n' | head -c 30000"
-            result = shell(strip_cmd)
+            result = shell_managed(strip_cmd ++ " 2>&1", fetch_timeout_s() * 1000)
             text = elem(result, 1)
             file_delete(tmp_path)
             "fetched " ++ url ++ " (" ++ to_string(string_length(text)) ++
@@ -1541,8 +1641,24 @@ fun ensure_browser(opts) {
     if (table == nil) { nil }
     else {
         sess = ets_get(table, 'session')
-        if (sess != nil) { sess }
-        else { nil }
+        if (sess == nil) { nil }
+        else {
+            # If the prior session's WS was flagged dead (transport failure or
+            # an unresponsive CDP call in cdp_call_with_timeout), transparently
+            # relaunch rather than operating on a stale handle. Chrome usually
+            # stays warm on :9222, so this is a fast re-attach, not a cold start.
+            if (ets_get(sess, 'dead') == 'true') {
+                Browser.close(sess)
+                fresh = Browser.init('true')
+                if (fresh == nil) {
+                    ets_delete(table, 'session')
+                    nil
+                } else {
+                    ets_put(table, 'session', fresh)
+                    fresh
+                }
+            } else { sess }
+        }
     }
 }
 
@@ -1555,7 +1671,9 @@ fun do_browser_launch(args, opts) {
             "ok: browser already launched (reusing session)"
         } else {
             headless_v = map_get(args, 'headless')
-            headless = if (headless_v == 'false' || headless_v == "false") { 'false' } else { 'true' }
+            # Default to a VISIBLE browser (real WebGL, you can watch it) — only
+            # go headless if the caller explicitly asks for it.
+            headless = if (headless_v == 'true' || headless_v == "true") { 'true' } else { 'false' }
             sess = Browser.init(headless)
             if (sess == nil) {
                 "error: chrome_launch failed — is Chrome / Chromium installed? checked /Applications and /usr/bin"
@@ -1572,7 +1690,7 @@ fun do_browser_navigate(args, opts) {
     url = map_get(args, 'url')
     if (sess == nil) { "error: no browser session — call browser_launch first" }
     else { if (url == nil) { "error: navigate requires 'url'" }
-    else { Browser.navigate(sess, url) }}
+    else { Browser.navigate(sess, url, opts) }}
 }
 
 fun do_browser_click(args, opts) {
@@ -1580,7 +1698,7 @@ fun do_browser_click(args, opts) {
     sel = map_get(args, 'selector')
     if (sess == nil) { "error: no browser session — call browser_launch first" }
     else { if (sel == nil) { "error: click requires 'selector'" }
-    else { Browser.click(sess, sel) }}
+    else { Browser.click(sess, sel, opts) }}
 }
 
 fun do_browser_type(args, opts) {
@@ -1590,7 +1708,7 @@ fun do_browser_type(args, opts) {
     if (sess == nil) { "error: no browser session — call browser_launch first" }
     else { if (sel == nil) { "error: type requires 'selector'" }
     else { if (text == nil) { "error: type requires 'text'" }
-    else { Browser.type_text(sess, sel, text) }}}
+    else { Browser.type_text(sess, sel, text, opts) }}}
 }
 
 fun do_browser_screenshot(args, opts) {
@@ -1598,20 +1716,20 @@ fun do_browser_screenshot(args, opts) {
     path_v = map_get(args, 'path')
     path = if (path_v == nil) { "/tmp/swc-page.png" } else { to_string(path_v) }
     if (sess == nil) { "error: no browser session — call browser_launch first" }
-    else { Browser.screenshot(sess, path) }
+    else { Browser.screenshot(sess, path, opts) }
 }
 
 fun do_browser_get_text(args, opts) {
     sess = ensure_browser(opts)
     sel = map_get(args, 'selector')
     if (sess == nil) { "error: no browser session — call browser_launch first" }
-    else { Browser.get_text(sess, sel) }
+    else { Browser.get_text(sess, sel, opts) }
 }
 
 fun do_browser_get_html(args, opts) {
     sess = ensure_browser(opts)
     if (sess == nil) { "error: no browser session — call browser_launch first" }
-    else { Browser.get_html(sess) }
+    else { Browser.get_html(sess, opts) }
 }
 
 fun do_browser_evaluate(args, opts) {
@@ -1619,7 +1737,7 @@ fun do_browser_evaluate(args, opts) {
     expr = map_get(args, 'expression')
     if (sess == nil) { "error: no browser session — call browser_launch first" }
     else { if (expr == nil) { "error: evaluate requires 'expression'" }
-    else { Browser.evaluate(sess, expr) }}
+    else { Browser.evaluate(sess, expr, opts) }}
 }
 
 fun do_browser_close(args, opts) {
@@ -1632,6 +1750,20 @@ fun do_browser_close(args, opts) {
             Browser.close(sess)
             ets_delete(table, 'session')
             "ok: browser session closed (chrome still running for fast re-launch)"
+        }
+    }
+}
+
+fun do_browser_console(args, opts) {
+    sess = ensure_browser(opts)
+    if (sess == nil) { "error: no browser session — call browser_launch first" }
+    else {
+        logs = Browser.console_logs(sess)
+        if (logs == nil || logs == "[]" || logs == "") {
+            "ok: no console output/errors captured yet — navigate (or reload) the page; " ++
+            "the capture records console + JS errors from page load onward"
+        } else {
+            "console output + JS errors (most recent last):\n" ++ logs
         }
     }
 }

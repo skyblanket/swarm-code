@@ -30,6 +30,8 @@ import Agent
 import Scheduler
 import Plan
 import MemVec
+import ToolExecutor
+import ToolRegistry
 
 fun main() {
     print("")
@@ -70,6 +72,10 @@ fun main() {
         t_guardrail_research_allowed(),
         t_guardrail_failure_halt(),
         t_subagent_blocked_tool(),
+        t_tool_executor_noninteractive_ask_denied(),
+        t_tool_executor_hardline_stays_denied(),
+        t_tool_executor_missing_context_denied(),
+        t_tool_registry_context_policy(),
         t_context_status_injected(),
         t_scheduler_units_ms(),
         t_scheduler_daily_parses(),
@@ -258,7 +264,7 @@ fun native_history() {
 }
 
 fun native_opts() {
-    %{model: "kimi-k2.6", temperature: 1.0, max_tokens: 1024, tool_format: 'native'}
+    %{model: "kimi-k2.7-code", temperature: 1.0, max_tokens: 1024, tool_format: 'native'}
 }
 
 fun t_native_tool_calls() {
@@ -388,12 +394,12 @@ fun t_slugify() {
 # glob with a path-component pattern — `find -name` (basename only)
 # silently matched nothing here before the rg/find rewrite.
 fun t_glob() {
-    out = Tools.exec('glob', %{pattern: "*.sw", path: "src"}, %{})
+    out = Tools.exec_raw('glob', %{pattern: "*.sw", path: "src"}, %{})
     check("glob finds .sw files", string_contains(out, ".sw"))
 }
 
 fun t_grep() {
-    out = Tools.exec('grep', %{pattern: "module Tools", path: "src"}, %{})
+    out = Tools.exec_raw('grep', %{pattern: "module Tools", path: "src"}, %{})
     check("grep finds file content", string_contains(out, "tools.sw"))
 }
 
@@ -416,7 +422,7 @@ fun t_mcp_unconfigured() {
 # call must persist the body to the .md file.
 fun t_remember_body() {
     marker = "REMEMBER-BODY-GUARD-77"
-    Tools.exec('remember', %{name: "zz remember probe",
+    Tools.exec_raw('remember', %{name: "zz remember probe",
                              description: "regression guard",
                              type: "reference",
                              body: marker}, %{})
@@ -493,7 +499,7 @@ fun t_path_traversal_blocked() {
     evil_path = home ++ "/.ssh/swarm_code_test_should_not_exist"
     # Make sure prior runs didn't leave a stray copy.
     file_delete(evil_path)
-    blocked = Tools.exec('write',
+    blocked = Tools.exec_raw('write',
         %{path: evil_path, content: "evil"}, %{})
     blocked_str = to_string(blocked)
     refused = string_contains(blocked_str, "error")
@@ -501,7 +507,7 @@ fun t_path_traversal_blocked() {
 
     safe_path = "/tmp/sw_pathtest_guard.txt"
     file_delete(safe_path)
-    allowed = Tools.exec('write',
+    allowed = Tools.exec_raw('write',
         %{path: safe_path, content: "safe"}, %{})
     wrote = if (file_exists(safe_path) == 'true') { 'true' } else { 'false' }
     file_delete(safe_path)
@@ -514,7 +520,7 @@ fun t_path_traversal_blocked() {
 # SWARM_CODE_ALLOW_SUDO=1. The error string must mention "sudo" so
 # the model knows what was rejected.
 fun t_sudo_blocked() {
-    out = Tools.exec('bash', %{command: "sudo ls /"}, %{})
+    out = Tools.exec_raw('bash', %{command: "sudo ls /"}, %{})
     s = to_string(out)
     ok = bool_and(
         if (string_contains(s, "error") == 'true') { 'true' } else { 'false' },
@@ -685,6 +691,75 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# Non-interactive entry points cannot answer an "ask" permission
+# decision. They must fail closed instead of silently running it.
+fun t_tool_executor_noninteractive_ask_denied() {
+    out = ToolExecutor.permission_gate(
+        'bash',
+        %{command: "rm -rf ~/tmp"},
+        %{settings: map_new(), execution_context: "mcp_server"})
+    ok = if (string_contains(to_string(out), "requires interactive permission") == 'true') {
+        'true'
+    } else { 'false' }
+    check("tool executor denies ask without interactive approval", ok)
+}
+
+fun t_tool_executor_hardline_stays_denied() {
+    out = ToolExecutor.permission_gate(
+        'bash',
+        %{command: "mkfs.ext4 /dev/null"},
+        %{settings: map_new()})
+    ok = if (string_contains(to_string(out), "permission denied") == 'true') {
+        'true'
+    } else { 'false' }
+    check("tool executor preserves the hardline deny floor", ok)
+}
+
+fun t_tool_executor_missing_context_denied() {
+    out = ToolExecutor.prepare('read', %{path: "README.md"}, %{settings: map_new()})
+    ok = if (string_contains(to_string(map_get(out, 'error')), "explicit execution_context") == 'true') {
+        'true'
+    } else { 'false' }
+    check("tool executor denies calls without an execution context", ok)
+}
+
+fun t_tool_registry_context_policy() {
+    mcp_policy = bool_and(
+        ToolRegistry.allowed_in("mcp_server", "bash"),
+        if (ToolRegistry.allowed_in("mcp_server", "git_commit") == 'false') {
+            'true'
+        } else { 'false' })
+    subagent_policy = if (ToolRegistry.allowed_in("subagent", "remember") == 'false' &&
+                         ToolRegistry.allowed_in("subagent", "read") == 'true') {
+        'true'
+    } else { 'false' }
+    council_policy = if (ToolRegistry.allowed_in("council_panel", "read") == 'true' &&
+                         ToolRegistry.allowed_in("council_panel", "task") == 'false' &&
+                         ToolRegistry.allowed_in("council_panel", "bash") == 'false' &&
+                         ToolRegistry.allowed_in("council_judge", "read") == 'false' &&
+                         ToolRegistry.allowed_in("council_panle", "read") == 'false') {
+        'true'
+    } else { 'false' }
+    policy_names_known = bool_and(
+        all_registered(ToolRegistry.names_for("mcp_server")),
+        bool_and(
+            all_registered(ToolRegistry.subagent_blocked_tools()),
+            all_registered(ToolRegistry.council_panel_tools())))
+    ok = bool_and(
+        bool_and3(mcp_policy, subagent_policy, council_policy),
+        policy_names_known)
+    check("tool registry centralizes execution-context policy", ok)
+}
+
+fun all_registered(names) {
+    if (length(names) == 0) { 'true' }
+    else {
+        if (ToolRegistry.knows(hd(names)) == 'true') {
+            all_registered(tl(names))
+        } else { 'false' }
+    }
 }
 
 # The passive context-status injection replaces the old explicit
