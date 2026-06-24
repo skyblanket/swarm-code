@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Live wait-feedback on every blocking operation: a pre-flight model/throughput
+  hint plus a live `tok/s` counter during LLM calls, and a "still running (Ns)"
+  heartbeat for long bash/tool, browser (CDP), MCP-server boot, and
+  `/memory reindex` waits — all suppressed in headless, subagent, and
+  MCP-server contexts so they never pollute a result or the JSON-RPC stream.
+- `SECURITY.md` documenting the fail-closed model and responsible disclosure.
+
 ### Changed
 
 - Added `ToolExecutor.sw` as the shared execution-policy boundary for Agent,
@@ -30,11 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw handlers execute.
 - Tool execution now fails closed when its execution context is missing or
   unknown.
+- MCP server now conforms to JSON-RPC 2.0: notifications get no `id:null` reply
+  and run no side-effects; malformed/batch/missing-method requests return
+  `-32600`; `isError` is determined structurally rather than by string matching.
+- Headless (`-p`/`--json`), subagent, and MCP-server output no longer leak
+  feedback or diagnostic text onto the result or the JSON-RPC stream — kept on
+  stderr or suppressed.
 
 ### Documentation
 
 - Replaced the stale comparison review with a current maintainability roadmap.
 - Updated README architecture, source size, and MCP server capability.
+- Rewrote the README (badges, quickstart, configuration, security) and moved
+  internal working notes (`AUDIT`, `REVIEW`, `UPGRADE_PLAN`) under `docs/`.
 
 ## [0.4.0] - 2026-06-10
 
@@ -68,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer wedge a job in `skipped_busy`; `skipped_busy` no longer bumps
   `last_run`; retention off-by-one (keeps the documented 10 newest).
 
-### Fixed — UI/markdown + full multi-agent audit (39 verified findings, see AUDIT.md)
+### Fixed — UI/markdown + full multi-agent audit (39 verified findings, see docs/AUDIT.md)
 
 **UI / markdown rendering**
 - **`render_table` now clamps to the terminal width** (P1) — wide tables overflowed and the terminal hard-wrapped mid-cell, destroying alignment. Column widths are scaled to fit and over-wide cells are truncated on the *raw* text (before ANSI is added, so no escape is ever split) with an ellipsis.

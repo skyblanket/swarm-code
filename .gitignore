@@ -10,6 +10,8 @@
 !/CHANGELOG.md
 !/CONTRIBUTING.md
 !/SECURITY.md
+!/CODE_OF_CONDUCT.md
+!/examples/
 !/scripts/
 !/src/
 !/docs/
@@ -22,6 +24,9 @@ scripts/*
 !scripts/install.sh
 !scripts/install.ps1
 !scripts/council.sh
+
+# Local-only internal planning note — kept out of the public repo.
+docs/UPGRADE_PLAN.md
 
 # Inside src/, ignore generated C output from `swc build` and the
 # version module make generates from the VERSION file.

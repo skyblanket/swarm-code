@@ -68,7 +68,7 @@ launch_panel() {
     role="$2"
     profile="$3"
     log="$TMP/panel-$idx.log"
-    panel_prompt="READ-ONLY COUNCIL PANEL. The repository root is your current working directory: use relative paths only. Do not edit files, run shell commands, spawn subagents, or delegate. Use at most six tool calls, then answer. Start with the most relevant of README.md, REVIEW.md, scripts/council.sh, src/ToolRegistry.sw, src/ToolExecutor.sw, and src/main.sw. $(role_prompt "$role")
+    panel_prompt="READ-ONLY COUNCIL PANEL. The repository root is your current working directory: use relative paths only. Do not edit files, run shell commands, spawn subagents, or delegate. Use at most six tool calls, then answer. Start with the most relevant of README.md, docs/REVIEW.md, scripts/council.sh, src/ToolRegistry.sw, src/ToolExecutor.sw, and src/main.sw. $(role_prompt "$role")
 
 Question:
 $PROMPT

@@ -1,0 +1,14 @@
+{
+  "name": "review",
+  "description": "Fan out three reviewers over the working diff, each from a different angle, in parallel.",
+  "phases": [
+    {
+      "name": "Review",
+      "tasks": [
+        { "label": "bugs",     "prompt": "Run `git diff` and review ONLY for correctness bugs (logic, off-by-one, nil, wrong conditions). List each as file:line — issue, or say 'none'." },
+        { "label": "security", "prompt": "Run `git diff` and review ONLY for security issues (injection, leaked secrets, unsafe shell, path traversal). List each as file:line — issue, or say 'none'." },
+        { "label": "simplify", "prompt": "Run `git diff` and review ONLY for simplifications and reuse opportunities (duplicated logic, an existing helper that fits). List each as file:line — issue, or say 'none'." }
+      ]
+    }
+  ]
+}
