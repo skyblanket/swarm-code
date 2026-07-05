@@ -7,8 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-03
+
+First production release. The 1.0 cut hardens the TUI (markdown list
+rendering, edit diffs, NO_COLOR), adds the dragonfly identity, and closes the
+audit items from `docs/HARNESS_REVIEW_2026-07.md`. Verified by a full
+compile + 96/98 test suite on linux-arm64 (2 failures are sandbox-$HOME
+artifacts, pre-existing at the same count on the previous commit).
+
 ### Added
 
+- Markdown: ordered lists (`1.` / `1)`) render one item per line with hanging
+  indents — previously they fell into the paragraph branch and were space-merged
+  into a single line. Nested bullets keep their depth (• ◦ ▪ ▫ markers), task
+  lists (`- [ ]` / `- [x]`) render as checkboxes, `+ `-bullets are recognized,
+  and table header rows are bold.
+- Ink-brush dragonfly startup banner (skipped under 64 cols) with a hanko-style
+  `sw` seal, after the Otonomy insect artwork.
+- Colored ± diff preview under successful `edit`/`multi_edit` results — the
+  user sees what changed, not just "ok: edited path". Display-only (never
+  journaled, costs zero context) and suppressed in headless mode.
+- `NO_COLOR` support (no-color.org): any non-empty value disables all color
+  emission from the UI palette; bold/dim formatting survives.
+- Soft max-steps ceiling: at 90% of the per-turn tool-step cap the model gets a
+  one-shot ephemeral nudge to wrap up, instead of discovering the hard cap
+  after being cut off.
+- `glob` now says when results were capped at 100 (fetches 101, shows 100 +
+  notice) instead of silently truncating; schema descriptions for `glob`/`grep`
+  document their caps.
+- Markdown regression tests: ordered-list line-splitting, nested-bullet
+  markers, task-list checkboxes, `has_markdown` ordered-list detection.
 - Live wait-feedback on every blocking operation: a pre-flight model/throughput
   hint plus a live `tok/s` counter during LLM calls, and a "still running (Ns)"
   heartbeat for long bash/tool, browser (CDP), MCP-server boot, and
@@ -18,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Telemetry `tool_call` arg preview widened 400 → 2000 chars — 400 clipped most
+  write/multi_edit args and blinded the audit trail. `event()` still redacts
+  the full encoded line, so masking is unchanged.
+- `has_markdown` also fires on numbered lists, leading-`|` tables, and
+  `[label](url)` links, so those replies get the post-stream render pass.
 - Added `ToolExecutor.sw` as the shared execution-policy boundary for Agent,
   subagent, and MCP server calls. Context allow-lists, argument-rewriting
   hooks, guardrails, permissions, and post hooks now follow one path.

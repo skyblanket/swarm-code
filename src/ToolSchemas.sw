@@ -108,7 +108,10 @@ fun edit_s() {
     tool("edit",
         "Replace an exact string in a file with another. The `old_string` " ++
         "must appear exactly once (or pass replace_all=true). Preserve " ++
-        "surrounding whitespace and indentation precisely.",
+        "surrounding whitespace and indentation precisely. Use the smallest " ++
+        "unique old_string — usually 2-4 adjacent lines; avoid pasting large blocks. " ++
+        "`read` prefixes each line with a line-number and a tab (`N\\t<content>`) — " ++
+        "strip that leading line-number+tab before using the text as old_string.",
         obj(%{
             path: s("Absolute path to the file"),
             old_string: s("Exact text to find"),
@@ -120,7 +123,9 @@ fun edit_s() {
 fun multi_edit_s() {
     tool("multi_edit",
         "Apply multiple edits to a single file atomically. Each edit has the " ++
-        "same shape as `edit`. Applied in order; all-or-nothing.",
+        "same shape as `edit`. Applied in order; all-or-nothing. " ++
+        "`read` prefixes each line with a line-number and a tab (`N\\t<content>`) — " ++
+        "strip that leading line-number+tab before using the text as old_string.",
         obj(%{
             path: s("Absolute path to the file"),
             edits: arr(obj(%{
@@ -134,7 +139,9 @@ fun multi_edit_s() {
 fun glob_s() {
     tool("glob",
         "Find files matching a glob pattern (e.g. `src/**/*.sw`). Returns " ++
-        "paths sorted by modification time. Use for file discovery.",
+        "paths sorted by modification time, capped at 100 (a cap notice is " ++
+        "appended when more matched — narrow the pattern to see the rest). " ++
+        "Use for file discovery.",
         obj(%{
             pattern: s("Glob pattern"),
             path: s("Optional: directory to search in (defaults to cwd)")
@@ -150,7 +157,7 @@ fun grep_s() {
             path: s("Optional: file or directory to search"),
             glob: s("Optional: file glob filter (e.g. *.sw)"),
             output_mode: s("'files_with_matches' | 'content' | 'count'"),
-            head_limit: i("Optional: cap results")
+            head_limit: i("Optional: cap results (default 100 lines; output truncated past ~16KB)")
         }, ["pattern"]))
 }
 

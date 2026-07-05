@@ -42,13 +42,11 @@ import Plan
 import Flows
 import ToolExecutor
 
-export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS]
+export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
+        drop_to_last_clean_user, trailing_turn_incomplete, trim_incomplete]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
-
-# Auto-compaction threshold (message count).
-fun compact_threshold() { 120 }
 
 # ------------------------------------------------------------
 # Context budget — token-based, sourced from server usage
@@ -60,6 +58,14 @@ fun compact_buffer_env()  { parse_env_int("SWARM_CODE_COMPACT_BUFFER",   52000) 
 fun context_budget_tokens() {
     max_tokens_env() - output_reserve_env() - compact_buffer_env()
 }
+
+# When a compaction fires (over context_budget_tokens), trim/summarize down to
+# THIS lower level — not just barely under the trigger — so the next several tool
+# steps can add output without immediately re-crossing the budget. This is the
+# hysteresis margin (~70% of budget) that stops the per-step trim churn that
+# reads as "compacting on every turn". Mirrors how claude-code's post-compaction
+# summary lands far below the threshold so it won't re-fire for many turns.
+fun compact_target_tokens() { context_budget_tokens() * 70 / 100 }
 
 fun context_budget_chars_fallback() {
     context_budget_tokens() * 4
@@ -223,6 +229,18 @@ fun replay_one(parsed) {
 # the prior turn crashed before the tool results were journaled, so
 # the next request would carry orphan tool_calls and the API would
 # reject it (or worse, re-dispatch on the model's next echo).
+#
+# F2: also handles two more crash artefacts:
+#   - a trailing assistant whose tool_calls[].arguments fail json_decode
+#     (a turn that died mid-stream with a truncated/malformed tool call —
+#     re-sending it would 400 / re-poison). The has_tcs branch already
+#     drops ANY trailing assistant with tool_calls, so malformed args are
+#     covered too; trailing_tools_incomplete handles the case where a
+#     PARTIAL set of tool results was journaled after it.
+#   - a trailing unanswered tool_use: the last record(s) are role:'tool'
+#     answering only SOME of the preceding assistant's tool_calls (or that
+#     assistant's calls are malformed). Drop the whole incomplete turn so
+#     resume restarts from the last clean point.
 fun trim_incomplete(msgs) {
     if (length(msgs) == 0) { msgs }
     else {
@@ -232,13 +250,147 @@ fun trim_incomplete(msgs) {
             tcs = map_get(last, 'tool_calls')
             if (tcs == nil || length(tcs) == 0) { msgs }
             else { drop_last(msgs, 1) }
-        } else { msgs }
+        }
+        else { if (role == 'tool') {
+            # Trailing tool result(s). Find the assistant that opened this
+            # tool-call turn; if its calls aren't all answered, or its args
+            # are malformed, drop the assistant + all its trailing tools.
+            if (trailing_turn_incomplete(msgs) == 'true') {
+                drop_trailing_tool_turn(msgs)
+            } else { msgs }
+        } else { msgs }}
+    }
+}
+
+# True when the trailing run of role:'tool' messages does NOT cleanly answer
+# the assistant tool_calls that opened the turn (partial set, or the calls'
+# arguments don't parse — both mean the turn never completed cleanly).
+fun trailing_turn_incomplete(msgs) {
+    n = length(msgs)
+    tools_run = count_trailing_tools(msgs, n - 1, 0)
+    asst_idx = n - 1 - tools_run
+    if (asst_idx < 0) { 'true' }
+    else {
+        asst = nth_at(msgs, asst_idx)
+        if (map_get(asst, 'role') != 'assistant') { 'true' }
+        else {
+            tcs = map_get(asst, 'tool_calls')
+            if (tcs == nil || length(tcs) == 0) { 'false' }
+            else {
+                if (tcs_args_malformed(tcs) == 'true') { 'true' }
+                else { if (tools_run < length(tcs)) { 'true' } else { 'false' } }
+            }
+        }
+    }
+}
+
+fun count_trailing_tools(msgs, i, acc) {
+    if (i < 0) { acc }
+    else {
+        m = nth_at(msgs, i)
+        if (map_get(m, 'role') == 'tool') { count_trailing_tools(msgs, i - 1, acc + 1) }
+        else { acc }
+    }
+}
+
+# Drop the trailing run of tool messages AND the assistant that opened them.
+fun drop_trailing_tool_turn(msgs) {
+    n = length(msgs)
+    tools_run = count_trailing_tools(msgs, n - 1, 0)
+    drop_last(msgs, tools_run + 1)
+}
+
+# True when any tool_call carries a non-empty arguments blob that fails to
+# json_decode (truncated mid-string) — the turn is poisoned and unsendable.
+fun tcs_args_malformed(tcs) {
+    if (length(tcs) == 0) { 'false' }
+    else {
+        tc = hd(tcs)
+        raw = to_string(map_get(tc, 'arguments'))
+        trimmed = string_trim(raw)
+        bad = if (trimmed == "" || trimmed == "{}" || trimmed == "null") { 'false' }
+              else { if (json_decode(raw) == nil) { 'true' } else { 'false' } }
+        if (bad == 'true') { 'true' } else { tcs_args_malformed(tl(tcs)) }
+    }
+}
+
+fun nth_at(lst, i) {
+    if (i == 0) { hd(lst) }
+    else { nth_at(tl(lst), i - 1) }
+}
+
+# ------------------------------------------------------------
+# F2 — poison / clean-exit markers beside .active
+# ------------------------------------------------------------
+# A turn that ends on an UNRECOVERED llm error writes .poison (holding the
+# journal path) so the next launch knows the recorded session died mid-turn
+# and trims the failing turn back to the last clean user message instead of
+# replaying the poisoned tool_call. A clean /quit writes .clean_exit. Both
+# are cleared when a fresh session starts.
+fun journal_poison_ptr()      { session_dir() ++ "/.poison" }
+fun journal_clean_exit_ptr()  { session_dir() ++ "/.clean_exit" }
+
+fun mark_poison(opts) {
+    jp = map_get(opts, 'journal_path')
+    if (jp == nil) { 'ok' }
+    else {
+        file_write(journal_poison_ptr(), to_string(jp))
+        'ok'
+    }
+}
+
+fun clear_poison() {
+    p = journal_poison_ptr()
+    if (file_exists(p) == 'true') { file_delete(p) }
+    'ok'
+}
+
+fun clear_clean_exit() {
+    p = journal_clean_exit_ptr()
+    if (file_exists(p) == 'true') { file_delete(p) }
+    'ok'
+}
+
+# Is the named journal path flagged poisoned (died on an llm error)?
+fun journal_is_poisoned(journal_path) {
+    p = journal_poison_ptr()
+    if (file_exists(p) == 'false') { 'false' }
+    else {
+        recorded = file_read(p)
+        if (recorded == nil) { 'false' }
+        else {
+            if (string_trim(recorded) == string_trim(to_string(journal_path))) { 'true' }
+            else { 'false' }
+        }
+    }
+}
+
+# Drop trailing assistant/tool records back to (and including) the last
+# role:'user' message — the last clean point. Used on resume of a poisoned
+# session so the failing turn never re-fires. Keeps system + everything up
+# to and including the last user message.
+fun drop_to_last_clean_user(msgs) {
+    idx = last_user_index(msgs, length(msgs) - 1)
+    if (idx < 0) { msgs }
+    else { take_first(msgs, idx + 1, []) }
+}
+
+fun last_user_index(msgs, i) {
+    if (i < 0) { 0 - 1 }
+    else {
+        m = nth_at(msgs, i)
+        if (map_get(m, 'role') == 'user') { i }
+        else { last_user_index(msgs, i - 1) }
     }
 }
 
 fun journal_clean(opts) {
     ap = journal_active_ptr()
     if (file_exists(ap) == 'true') { file_delete(ap) }
+    # F2: a clean /quit clears any poison flag and records a clean-exit
+    # marker so the next launch knows the prior session ended deliberately.
+    clear_poison()
+    file_write(journal_clean_exit_ptr(), to_string(timestamp()))
     'ok'
 }
 
@@ -256,29 +408,46 @@ fun run(opts, system_prompt_text) {
     file_mkdir(jdir)
     ap = journal_active_ptr()
     prev_ptr = if (file_exists(ap) == 'true') { file_read(ap) } else { nil }
+    prev_path = if (prev_ptr == nil) { "" } else { string_trim(prev_ptr) }
+    # F2: was the recorded session flagged poisoned (died on an llm error)?
+    prev_poisoned = if (string_length(prev_path) > 0) { journal_is_poisoned(prev_path) }
+                    else { 'false' }
     resumed_raw = if (prev_ptr == nil) { [] }
                   else {
-                      prev_path = string_trim(prev_ptr)
                       if (string_length(prev_path) > 0 && file_exists(prev_path) == 'true') {
                           replay_journal(prev_path)
                       } else { [] }
                   }
-    resumed = trim_incomplete(resumed_raw)
+    # F2: on a poisoned session, trim the failing turn back to the last clean
+    # user message (drop the poisoned tool_call) BEFORE the usual incomplete
+    # trim, so resume never re-fires the call that killed the prior session.
+    resumed_clean = if (prev_poisoned == 'true') { drop_to_last_clean_user(resumed_raw) }
+                    else { resumed_raw }
+    resumed = trim_incomplete(resumed_clean)
 
     journal_path = if (length(resumed) > 0) {
-        string_trim(prev_ptr)
+        prev_path
     } else {
         jp_new = jdir ++ "/journal-" ++ to_string(timestamp()) ++ ".jsonl"
         file_write(jp_new, "")
         jp_new
     }
     file_write(ap, journal_path)
+    # Fresh working session — clear the prior poison/clean-exit markers; a new
+    # failure or a new clean /quit will re-stamp them.
+    clear_poison()
+    clear_clean_exit()
     opts_journal = map_put(opts, 'journal_path', journal_path)
 
     history = if (length(resumed) > 0) {
         print("")
-        print(UI.grey_text() ++ "  ⏺ resumed crashed session — " ++
-              to_string(length(resumed)) ++ " messages recovered" ++ UI.reset())
+        if (prev_poisoned == 'true') {
+            print(UI.grey_text() ++ "  ⏺ previous session ended on an error — trimmed the " ++
+                  "failing turn; resumed " ++ to_string(length(resumed)) ++ " messages" ++ UI.reset())
+        } else {
+            print(UI.grey_text() ++ "  ⏺ resumed crashed session — " ++
+                  to_string(length(resumed)) ++ " messages recovered" ++ UI.reset())
+        }
         prepend([LLM.new_message_system(system_prompt_text)], resumed)
     } else {
         [LLM.new_message_system(system_prompt_text)]
@@ -445,11 +614,15 @@ fun route_input(line, history, opts) {
             if (gated == 'cancelled') {
                 history
             } else {
-                pre_turn_hist = if (length(gated) > compact_threshold()) {
-                    print("\e[2m[auto-compacting " ++ to_string(length(gated)) ++ " messages]\e[0m")
-                    compact_history(gated, opts)
-                } else { gated }
-                run_turn(pre_turn_hist, opts, 0)
+                # Compaction is TOKEN-threshold-based and handled inside run_turn
+                # (the F3a budget gate at step 0 = this turn's pre-flight check),
+                # matching claude-code: history grows verbatim until it nears the
+                # context budget, then ONE compaction fires. We deliberately do
+                # NOT compact on a message COUNT here — at a 193k-token budget,
+                # 120 messages is only ~30k tokens, so a count trigger summarized
+                # at ~16% of the real limit and fired every ~60 tool calls
+                # ("compacting on every turn"). Token-gated = compact rarely, late.
+                run_turn(gated, opts, 0)
             }
         }}}}
     }
@@ -1494,8 +1667,7 @@ fun opts_with_history(opts, history) {
     a = map_put(opts, 'history_len', length(history))
     b = map_put(a, 'history_chars', history_chars(history))
     c = map_put(b, 'context_budget', context_budget_tokens())
-    d = map_put(c, 'compact_thr', compact_threshold())
-    d
+    c
 }
 
 fun history_chars(history) { history_chars_loop(history, 0) }
@@ -1523,6 +1695,60 @@ fun tcs_chars(tcs, acc) {
     }
 }
 
+# ------------------------------------------------------------
+# F3b — mechanical (non-LLM) trim tier
+# ------------------------------------------------------------
+# Pure-string context shrink, mirroring claude-code's applyToolResultBudget
+# → snip before any LLM auto-compaction. Walk OLDEST-first; for each role:'tool'
+# or role:'user' message whose content exceeds ~8KB, replace the body with a
+# "[N chars elided]" stub. Stop as soon as approx_tokens(history) < budget.
+# Never touches system, assistant prose, tool_calls, or the LAST message (the
+# live user turn). Needs no network — works even when the LLM is unreachable.
+fun MECH_TRIM_THRESHOLD_CHARS() { 8000 }
+
+fun mechanical_trim(history, budget_t) {
+    n = length(history)
+    if (n == 0) { history }
+    else { mech_trim_loop(history, 0, n, budget_t, []) }
+}
+
+fun mech_trim_loop(msgs, i, total, budget_t, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        # Recompute the running estimate from (acc-so-far ++ remaining). Cheap
+        # enough at our message counts and keeps the stop condition honest.
+        already_ok = if (approx_tokens(acc ++ msgs) <= budget_t) { 'true' } else { 'false' }
+        if (already_ok == 'true') {
+            # Under budget — emit the rest unchanged.
+            acc ++ msgs
+        } else {
+            role = map_get(m, 'role')
+            is_last = if (i == total - 1) { 'true' } else { 'false' }
+            stubbable = if (is_last == 'true') { 'false' }
+                        else { if (role == 'tool' || role == 'user') { 'true' } else { 'false' }}
+            new_m = if (stubbable == 'true') { stub_if_large(m) } else { m }
+            mech_trim_loop(tl(msgs), i + 1, total, budget_t, list_append(acc, new_m))
+        }
+    }
+}
+
+# Replace an oversized string body with a stub; small or non-string (multimodal
+# list) content is left untouched so image blocks never get mangled.
+fun stub_if_large(m) {
+    c = map_get(m, 'content')
+    if (c == nil) { m }
+    else { if (is_list(c) == 'true') { m }
+    else {
+        s = to_string(c)
+        if (string_length(s) <= MECH_TRIM_THRESHOLD_CHARS()) { m }
+        else {
+            stub = "[" ++ to_string(string_length(s)) ++ " chars elided to fit context]"
+            map_put(m, 'content', stub)
+        }
+    }}
+}
+
 fun run_turn(history, opts, step) {
     if (step >= max_steps()) {
         print("\e[33m[warn] max tool steps reached\e[0m")
@@ -1540,25 +1766,45 @@ fun run_turn(history, opts, step) {
             ets_put(guard_table, 'halt_reason', nil)
             history
         } else {
+        # F3a: gate over_budget on the LARGER of the previous turn's server
+        # count and a live char-based estimate of the CURRENT history. A single
+        # fat turn (giant read, big write arg echoed back) leaves a small stale
+        # last_pt; relying on it alone ships a bloated history that stalls in
+        # prefill. max(last_pt, estimate) catches the in-turn blow-up.
         last_pt = LLM.last_prompt_tokens(opts)
         budget_t = context_budget_tokens()
-        over_budget = if (last_pt != nil) {
-            if (last_pt > budget_t) { 'true' } else { 'false' }
-        } else {
-            if (history_chars(history) > context_budget_chars_fallback()) { 'true' } else { 'false' }
-        }
+        est = approx_tokens(history)
+        effective = if (last_pt != nil) { if (last_pt > est) { last_pt } else { est } }
+                    else { est }
+        over_budget = if (effective > budget_t) { 'true' } else { 'false' }
         working_hist = if (over_budget == 'true') {
-            shown = if (last_pt != nil) {
-                "(context at " ++ to_string(last_pt) ++ " / " ++
-                to_string(budget_t) ++ " tokens, compacting)"
-            } else {
-                "(context estimate over budget, compacting)"
-            }
-            print("  \e[38;5;240m" ++ shown ++ "\e[0m")
-            compact_history(history, opts)
+            print("  \e[38;5;240m(context at ~" ++ to_string(effective) ++ " / " ++
+                  to_string(budget_t) ++ " tokens, compacting)\e[0m")
+            # F3b: pure-string mechanical trim tier FIRST — oldest-first, stub
+            # oversized tool/user content. No LLM call (compaction itself needs
+            # a working call, which fails in the same prefill regime). Only fall
+            # back to LLM compaction if mechanical trim can't reach budget.
+            # Trim to compact_target_tokens() (~70% of budget), NOT just under the
+            # trigger — that hysteresis margin lets the next several tool steps run
+            # without re-crossing the budget, so we don't trim on every step.
+            trimmed = mechanical_trim(history, compact_target_tokens())
+            if (approx_tokens(trimmed) > budget_t) {
+                print("  \e[38;5;240m(mechanical trim insufficient — summarizing)\e[0m")
+                compact_history(trimmed, opts)
+            } else { trimmed }
         } else { history }
 
-        result = LLM.chat(working_hist, opts)
+        # Soft ceiling — one-shot nudge at 90% of max_steps so the model
+        # wraps up gracefully instead of being cut off mid-flight at the
+        # hard cap (which it otherwise only discovers after the fact).
+        hist_send = if (step == (max_steps() * 9) / 10) {
+            list_append(working_hist, LLM.new_message_user(
+                "[system notice] You have used " ++ to_string(step) ++ " of " ++
+                to_string(max_steps()) ++ " tool steps for this turn. Finish up now: " ++
+                "complete the immediate action, then summarize progress and stop."))
+        } else { working_hist }
+
+        result = LLM.chat(hist_send, opts)
         debug_env = getenv("SWARM_CODE_DEBUG")
         if (debug_env == "1" && result != nil) {
             print("\e[2m[debug result map keys: " ++
@@ -1569,7 +1815,23 @@ fun run_turn(history, opts, step) {
             # is signalled by exit 1 / the --json status. (Transport detail is
             # on stderr via the runtime.) Interactive keeps the inline error.
             if (map_get(opts, 'headless') != 'true') { print("\e[31m[error] llm call failed\e[0m") }
-            working_hist
+            # F2/F1: distinguish a POISONED context from a TRANSIENT failure.
+            #  - FATAL (a 4xx request rejection or an unparseable body — re-sending
+            #    the identical bytes can't fix it): drop back to the last clean user
+            #    message so the offending tool_call is never journaled/re-fired, and
+            #    flag the journal poisoned so even an immediate resume trims it.
+            #  - TRANSIENT (network blip / 5xx after the retry budget): the context
+            #    is fine, the wire failed. KEEP all completed work; only trim a
+            #    dangling unsendable tail. Do NOT poison — a later resume is valid.
+            fatal = LLM.last_fail(opts)
+            recovered = if (fatal == 'fatal') {
+                mark_poison(opts)
+                drop_to_last_clean_user(working_hist)
+            } else {
+                trim_incomplete(working_hist)
+            }
+            journal_sync(opts, recovered)
+            recovered
         } else {
             content = to_string(map_get(result, 'content'))
             tool_calls_v = map_get(result, 'tool_calls')
@@ -1579,6 +1841,26 @@ fun run_turn(history, opts, step) {
             asst_msg = LLM.new_message_assistant(content, tool_calls, reasoning)
             with_assistant = list_append(working_hist, asst_msg)
             journal_sync(opts, with_assistant)
+            # F2: a turn completed cleanly — clear any poison flag a PRIOR turn in
+            # this same session set. Otherwise a mid-session recovery followed by
+            # good work then a hard kill (no clean /quit) would make the next
+            # launch trim the journal back to that old recovery point, discarding
+            # the good work. clear_poison() is a cheap stat+unlink, idempotent.
+            clear_poison()
+
+            # F4: length-truncation recovery (finish_reason=length / truncation
+            # marker) — ONLY when the turn carried no tool_calls. A truncated turn
+            # that still emitted tool_calls is actionable: fall through and execute
+            # them normally (appending a user nudge after an assistant-with-open-
+            # tool_calls would be an invalid native sequence and would skip the
+            # work). Stage 0: retry ONCE with a raised per-turn max_tokens. Stage 1:
+            # inject a "continue in smaller append-mode edits" user-message while
+            # KEEPING the partial assistant output. Stage 2+: give up gracefully.
+            # Guarded by the 'trunc_retry' counter so we never loop unbounded.
+            truncated = map_get(result, 'truncated')
+            if (truncated == 'true' && length(tool_calls) == 0) {
+                handle_truncation(with_assistant, tool_calls, opts, step)
+            } else {
 
             if (length(tool_calls) == 0) {
                 visible = string_trim(content)
@@ -1631,9 +1913,69 @@ fun run_turn(history, opts, step) {
                 post_exec = execute_all(tool_calls, with_assistant, meter_opts)
                 run_turn(post_exec, meter_opts, step + 1)
             }
+            }
         }
         }
     }
+}
+
+# ------------------------------------------------------------
+# F4 — length-truncation recovery (escalate max_tokens → smaller-edits nudge)
+# ------------------------------------------------------------
+# `with_assistant` already contains the (partial) assistant output — we never
+# discard it. Mirrors claude-code's max-output recovery: bump max_tokens and
+# retry once, then inject a recovery user-message telling the model to continue
+# in smaller append-mode edits, up to a small recovery cap.
+fun trunc_retry_max() { 2 }
+
+# Raised per-turn output budget — double the configured max_tokens, capped at
+# a sane ceiling so we don't ask a server for an absurd window.
+fun raised_max_tokens(opts) {
+    cur = map_get(opts, 'max_tokens')
+    base = if (cur == nil) { 16384 } else { cur }
+    doubled = base * 2
+    ceil = 131072
+    if (doubled > ceil) { ceil } else { doubled }
+}
+
+fun handle_truncation(with_assistant, tool_calls, opts, step) {
+    stage = map_get(opts, 'trunc_retry')
+    stage_n = if (stage == nil) { 0 } else { stage }
+    if (stage_n == 0) {
+        # Stage 0: retry once with a raised per-turn max_tokens. Keep the partial
+        # assistant output in history so the model can continue from it.
+        raised = raised_max_tokens(opts)
+        print("  \e[38;5;240m(output hit the length limit — retrying once with " ++
+              "max_tokens=" ++ to_string(raised) ++ ")\e[0m")
+        retry_opts0 = map_put(opts, 'max_tokens', raised)
+        retry_opts = map_put(retry_opts0, 'trunc_retry', 1)
+        cont = "Your previous response was cut off at the output token limit. " ++
+               "Continue exactly where you left off."
+        with_nudge = list_append(with_assistant, LLM.new_message_user(cont))
+        journal_sync(opts, with_nudge)
+        run_turn(with_nudge, retry_opts, step + 1)
+    }
+    else { if (stage_n < trunc_retry_max()) {
+        # Stage 1: still truncated after the raise. Inject the smaller-edits
+        # recovery message; KEEP the partial assistant output.
+        print("  \e[38;5;240m(still hitting the output limit — switching to " ++
+              "smaller append-mode edits)\e[0m")
+        recovery = "Output token limit hit again. Stop trying to emit large " ++
+                   "blocks in one turn. Continue in smaller, append-mode edits: " ++
+                   "write a short stub first, then use `edit` with old_string=\"\" " ++
+                   "to append the remaining content in pieces."
+        with_recovery = list_append(with_assistant, LLM.new_message_user(recovery))
+        retry_opts = map_put(opts, 'trunc_retry', stage_n + 1)
+        journal_sync(opts, with_recovery)
+        run_turn(with_recovery, retry_opts, step + 1)
+    }
+    else {
+        # Stage 2+: give up gracefully — keep the partial output, stop the loop.
+        print("  \e[38;5;240m(output still truncated after recovery attempts — " ++
+              "keeping the partial result; ask me to continue.)\e[0m")
+        print("")
+        with_assistant
+    }}
 }
 
 # Per-tool user-facing args formatter — matches CC's renderToolUseMessage.
@@ -2086,32 +2428,77 @@ fun execute_all(tool_calls, history, opts) {
         name_atom = string_to_atom(name_str)
         args_raw = to_string(map_get(tc, 'arguments'))
         args_map = json_decode(args_raw)
-        args_map_safe = if (args_map == nil) { map_new() } else { args_map }
-
-        UI.tool_header(name_atom, format_tool_args(name_atom, args_map_safe, args_raw))
-        Log.tool_call(name_atom, args_raw)
-
-        prepared = ToolExecutor.prepare(name_atom, args_map_safe, opts)
-        result = if (map_get(prepared, 'ok') != 'true') {
-            to_string(map_get(prepared, 'error'))
+        # F5: a NON-EMPTY args blob that fails to parse is a truncated/malformed
+        # tool call. Don't silently dispatch with empty args (which yields a
+        # confusing "missing X" for an arg the model DID supply) — tell it to reissue.
+        args_trim = string_trim(args_raw)
+        malformed = if (args_map == nil && args_trim != "" && args_trim != "{}" && args_trim != "null") { 'true' } else { 'false' }
+        result = if (malformed == 'true') {
+            UI.tool_header(name_atom, "(malformed / truncated arguments)")
+            Log.tool_call(name_atom, args_raw)
+            "error: the arguments for '" ++ name_str ++ "' were not valid JSON (likely truncated mid-string). Reissue this single tool call with complete, valid JSON arguments. If the content is large, write it in smaller pieces (stub then append-edit)."
         } else {
-            effective_args = map_get(prepared, 'args')
-            decision = resolve_permission(name_atom, effective_args, opts)
-            if (decision == 'deny') {
-                denial = "error: permission denied for tool '" ++ name_str ++ "'"
-                print("\e[31m" ++ denial ++ "\e[0m")
-                denial
+            args_map_safe = if (args_map == nil) { map_new() } else { args_map }
+            UI.tool_header(name_atom, format_tool_args(name_atom, args_map_safe, args_raw))
+            Log.tool_call(name_atom, args_raw)
+            prepared = ToolExecutor.prepare(name_atom, args_map_safe, opts)
+            if (map_get(prepared, 'ok') != 'true') {
+                to_string(map_get(prepared, 'error'))
             } else {
-                dispatch_tool_prepared(name_atom, effective_args, opts)
+                effective_args = map_get(prepared, 'args')
+                decision = resolve_permission(name_atom, effective_args, opts)
+                if (decision == 'deny') {
+                    denial = "error: permission denied for tool '" ++ name_str ++ "'"
+                    print("\e[31m" ++ denial ++ "\e[0m")
+                    denial
+                } else {
+                    dispatch_tool_prepared(name_atom, effective_args, opts)
+                }
             }
         }
 
         UI.tool_result(result)
+        # Colored ± preview for successful content edits — display-only,
+        # never added to history, so it costs the model zero tokens.
+        show_edit_diff(name_atom, args_map, result, opts)
         had_err = if (string_starts_with(result, "error:") == 'true') { 'true' } else { 'false' }
         Log.tool_result(name_atom, string_length(result), had_err)
         hist_done = list_append(history, LLM.new_message_tool(id, result))
         journal_sync(opts, hist_done)
         execute_all(tl(tool_calls), hist_done, opts)
+    }
+}
+
+# ------------------------------------------------------------
+# Edit diff preview — for successful edit/multi_edit calls, show the
+# old/new content as colored ± lines. Suppressed in headless mode so
+# piped -p output stays clean.
+# ------------------------------------------------------------
+fun show_edit_diff(name, args, result, opts) {
+    if (map_get(opts, 'headless') == 'true') { 'ok' }
+    else { if (string_starts_with(to_string(result), "ok:") != 'true') { 'ok' }
+    else { if (args == nil) { 'ok' }
+    else {
+        if (name == 'edit') {
+            UI.edit_diff_render(map_get(args, 'old_string'), map_get(args, 'new_string'))
+        } else { if (name == 'multi_edit') {
+            edits = map_get(args, 'edits')
+            if (edits == nil) { 'ok' } else { diff_edits_loop(edits, 0) }
+        } else { 'ok' }}
+    }}}
+}
+
+fun diff_edits_loop(edits, shown) {
+    if (length(edits) == 0) { 'ok' }
+    else {
+        if (shown >= 3) {
+            print("     " ++ UI.grey_text() ++ "… " ++ to_string(length(edits)) ++
+                  " more edits not shown" ++ UI.reset())
+        } else {
+            e = hd(edits)
+            UI.edit_diff_render(map_get(e, 'old_string'), map_get(e, 'new_string'))
+            diff_edits_loop(tl(edits), shown + 1)
+        }
     }
 }
 

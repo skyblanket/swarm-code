@@ -38,7 +38,7 @@ import Hooks
 export [
     chat, chat_silent, chat_for_subagent,
     build_request_body, chat_completions_url,
-    last_prompt_tokens, last_reasoning,
+    last_prompt_tokens, last_reasoning, last_fail,
     record_usage, record_reasoning, extract_usage, extract_reasoning,
     extract_content, extract_finish_reason,
     new_message_system, new_message_user,
@@ -512,10 +512,6 @@ fun inject_context_status(messages, opts) {
 }
 
 fun build_status_string(messages, opts) {
-    msg_count = length(messages)
-    msg_threshold = 120
-
-    last_pt = last_prompt_tokens(opts)
     max_tok = parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144)
     out_res = parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384)
     buf = parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000)
@@ -525,24 +521,22 @@ fun build_status_string(messages, opts) {
     raw_budget = max_tok - out_res - buf
     tok_budget = if (raw_budget < 1) { 1 } else { raw_budget }
 
+    # Use the server's real prompt-token count once we have it; fall back to a
+    # char/4 estimate before the first response.
+    last_pt = last_prompt_tokens(opts)
     tok_used = if (last_pt != nil) { last_pt }
                else { rough_token_estimate(messages, 0) }
 
-    # % used (not remaining) — universal mental model: 0% empty,
-    # 100% full. The TIGHTER trigger (whichever is closer to firing
-    # compaction) gets shown, so a 95%-on-messages run still reads
-    # as "95% used" even if tokens are only 30% in.
-    msg_used_pct = (msg_count * 100) / msg_threshold
+    # % used (0% empty, 100% full) — TOKEN-ONLY, matching claude-code. Context
+    # fullness is about tokens, not message count, and we compact on this same
+    # token budget (see Agent.context_budget_tokens), so the meter tracks the
+    # actual compaction trigger. A long run of small messages no longer reads as
+    # "100% full" when the real token usage is a fraction of the budget.
     tok_used_pct = (tok_used * 100) / tok_budget
-
-    msg_clamped = if (msg_used_pct > 100) { 100 } else { msg_used_pct }
     tok_pos = if (tok_used_pct < 0) { 0 } else { tok_used_pct }
-    tok_clamped = if (tok_pos > 100) { 100 } else { tok_pos }
-
-    pct = if (msg_clamped > tok_clamped) { msg_clamped } else { tok_clamped }
+    pct = if (tok_pos > 100) { 100 } else { tok_pos }
 
     "ctx " ++ to_string(pct) ++ "% used · " ++
-    to_string(msg_count) ++ "/" ++ to_string(msg_threshold) ++ " msg · " ++
     fmt_k(tok_used) ++ "/" ++ fmt_k(tok_budget) ++ " tok"
 }
 
@@ -936,7 +930,28 @@ fun chat_native_retry(messages, opts, attempt) {
         # marker), so we never reach this nil branch on interrupt — only a
         # genuine failure (nil) does. (The old `last_fail == "interrupted"`
         # guard here was dead code: record_fail is never called with that value.)
-        if (attempt >= max_chat_retries()) {
+        #
+        # F1: a FATAL request error (4xx / parse-error body / structured error
+        # object) must NOT be retried — re-sending the byte-identical poisoned
+        # body just re-fails 4× then dies. chat_native already surfaced it; stop
+        # here and let the agent layer recover (drop the failing turn). The
+        # fallback endpoint is still worth one shot (different server may accept).
+        if (last_fail(opts) == 'fatal') {
+            fb = map_get(opts, 'fallback_endpoint')
+            if (fb != nil) {
+                print("  [llm] request rejected — trying fallback endpoint once...")
+                fb_key   = map_get(opts, 'fallback_key')
+                fb_model = map_get(opts, 'fallback_model')
+                fb_tf    = map_get(opts, 'fallback_tool_format')
+                fb_opts  = map_put(opts, 'endpoint', to_string(fb))
+                fb_opts2 = if (fb_model != nil) { map_put(fb_opts,  'model',       to_string(fb_model)) } else { fb_opts  }
+                fb_opts3 = if (fb_key   != nil) { map_put(fb_opts2, 'api_key',     to_string(fb_key))   } else { fb_opts2 }
+                fb_opts4 = if (fb_tf    != nil) { map_put(fb_opts3, 'tool_format', fb_tf)               } else { fb_opts3 }
+                fb_format = map_get(fb_opts4, 'tool_format')
+                if (fb_format == 'inband') { chat_inband(messages, fb_opts4) }
+                else { chat_native(messages, fb_opts4) }
+            } else { nil }
+        } else { if (attempt >= max_chat_retries()) {
             fb = map_get(opts, 'fallback_endpoint')
             if (fb != nil) {
                 print("  [llm] retrying on fallback endpoint...")
@@ -958,26 +973,53 @@ fun chat_native_retry(messages, opts, attempt) {
                 nil
             }
         } else {
-            d = retry_delay_ms(attempt)
-            diag(opts, "  \e[38;5;208m↻ llm call failed — retrying in " ++
+            # Honor a server-supplied Retry-After (429/503) when it's longer
+            # than our backoff; otherwise use the exponential schedule.
+            ra = last_retry_after(opts)
+            base_d = retry_delay_ms(attempt)
+            d = if (ra > base_d) { ra } else { base_d }
+            diag(opts, "  \e[38;5;208m↻ llm call failed (transient) — retrying in " ++
                   to_string(d / 1000) ++ "s (attempt " ++
                   to_string(attempt + 2) ++ "/" ++
                   to_string(max_chat_retries() + 1) ++ ")\e[0m")
             sleep(d)
             chat_native_retry(messages, opts, attempt + 1)
-        }
+        }}
     }
 }
 
 fun chat_inband_retry(messages, opts, attempt) {
     result = chat_inband(messages, opts)
-    needs_retry = if (result == nil) { 'true' }
+    # F1: a FATAL request error (4xx / parse-error body) must not be retried.
+    # chat_inband already surfaced it; never re-send the identical poisoned body.
+    fatal = if (result == nil && last_fail(opts) == 'fatal') { 'true' } else { 'false' }
+    needs_retry = if (fatal == 'true') { 'false' }
+                  else { if (result == nil) { 'true' }
                   else {
                       content = to_string(map_get(result, 'content'))
                       is_transport_truncated(content)
-                  }
-    if (needs_retry == 'true' && attempt < max_chat_retries()) {
-        d = retry_delay_ms(attempt)
+                  }}
+    if (fatal == 'true') {
+        # Fatal — try the fallback endpoint once (a different server may
+        # accept), else surface nil to the agent layer for turn-drop recovery.
+        fb = map_get(opts, 'fallback_endpoint')
+        if (fb != nil) {
+            print("  [llm] request rejected — trying fallback endpoint once...")
+            fb_key   = map_get(opts, 'fallback_key')
+            fb_model = map_get(opts, 'fallback_model')
+            fb_tf    = map_get(opts, 'fallback_tool_format')
+            fb_opts  = map_put(opts, 'endpoint', to_string(fb))
+            fb_opts2 = if (fb_model != nil) { map_put(fb_opts,  'model',       to_string(fb_model)) } else { fb_opts  }
+            fb_opts3 = if (fb_key   != nil) { map_put(fb_opts2, 'api_key',     to_string(fb_key))   } else { fb_opts2 }
+            fb_opts4 = if (fb_tf    != nil) { map_put(fb_opts3, 'tool_format', fb_tf)               } else { fb_opts3 }
+            fb_format = map_get(fb_opts4, 'tool_format')
+            if (fb_format == 'native') { chat_native(messages, fb_opts4) }
+            else { chat_inband(messages, fb_opts4) }
+        } else { nil }
+    } else { if (needs_retry == 'true' && attempt < max_chat_retries()) {
+        ra = last_retry_after(opts)
+        base_d = retry_delay_ms(attempt)
+        d = if (ra > base_d) { ra } else { base_d }
         print("")
         diag(opts, "  \e[38;5;208m↻ transport failure — retrying in " ++
               to_string(d / 1000) ++ "s (attempt " ++
@@ -1002,7 +1044,7 @@ fun chat_inband_retry(messages, opts, attempt) {
                 else { chat_inband(messages, fb_opts4) }
             } else { result }
         } else { result }
-    }
+    }}
 }
 
 fun is_transport_truncated(content) {
@@ -1010,24 +1052,166 @@ fun is_transport_truncated(content) {
     else { 'false' }
 }
 
-# unwrap_stream — http_post_stream returns {'ok, json_str} or {'error, reason}.
+# unwrap_stream — http_post_stream returns {'ok', json_str} or {'error, reason}.
 # Old swarmrt returned a bare string; new builds return a 2-tuple.
 # This helper normalises both forms to a bare JSON string (or nil on error).
+# Kept for chat_for_subagent (which doesn't classify); the main paths use
+# classify_stream/3 below so they can distinguish fatal vs transient failures.
 fun unwrap_stream(raw) {
     if (raw == nil) { nil }
     else {
         tag = elem(raw, 0)
         if (tag == 'ok') { elem(raw, 1) }
         else {
-            # tag is the error atom (not 'ok). elem(raw,1) = reason string.
-            # If elem returns nil the runtime doesn't support tagged tuples
-            # and raw is a bare JSON string — pass it through unchanged.
-            inner = elem(raw, 1)
-            if (inner != nil) {
-                Log.llm_error("stream error", to_string(inner))
+            # Error tuple. Current contract: {'error, status_int, body}. elem(raw,1)
+            # is the STATUS code, elem(raw,2) the body — log the BODY (the useful
+            # part), prefixed with the status, not the bare status int.
+            status = elem(raw, 1)
+            body = elem(raw, 2)
+            if (status == nil) { raw }
+            else {
+                detail = if (body != nil) { "HTTP " ++ to_string(status) ++ ": " ++ to_string(body) }
+                         else { "HTTP " ++ to_string(status) }
+                Log.llm_error("stream error", detail)
                 nil
-            } else { raw }
+            }
         }
+    }
+}
+
+# ============================================================
+# F1 — classify the HTTP stream result (CROSS-SLICE CONTRACT)
+# ============================================================
+# The streaming builtin (threaded through slice C) returns one of:
+#   {'ok',    body_string}              — success
+#   {'error, status_int, body_string}  — failure; status_int is the HTTP
+#                                        code, or 0 for connection-refused /
+#                                        timeout / no-response.
+# classify_stream/1 normalises BOTH that shape AND the legacy shapes
+# ({'ok,body} / {'error,reason} / bare-string / nil) into a 3-way tag:
+#   {'ok',        body}        — proceed
+#   {'fatal',     status, msg} — DO NOT retry (4xx, esp 400, or a body that
+#                               is not parseable JSON). Re-sending the same
+#                               body would just re-fail; surface it.
+#   {'transient', status, msg} — backoff-retry (status 0 / 408 / 429 / 5xx,
+#                               or an unclassifiable/legacy failure).
+# A bare nil (oldest runtime, no tagged tuples) is treated as transient but
+# bounded by max_chat_retries() — the safe fallback the contract requires.
+fun classify_stream(raw) {
+    if (raw == nil) { {'transient', 0, "no response"} }
+    else {
+        tag = elem(raw, 0)
+        if (tag == 'ok') {
+            body = elem(raw, 1)
+            # A present-but-unparseable body is a FATAL request error (a 400
+            # error page, an HTML 502 from a proxy mislabeled 'ok, …): retrying
+            # the identical body can't fix it. Empty/nil body → transient.
+            if (body == nil) { {'transient', 0, "empty ok body"} }
+            else { if (json_decode(to_string(body)) == nil) {
+                {'fatal', 200, "response body was not valid JSON"}
+            } else { {'ok', to_string(body)} }}
+        } else {
+            # Error tuple. New shape: {'error, status, body}. Legacy: {'error, reason}.
+            second = elem(raw, 1)
+            third  = elem(raw, 2)
+            if (second == nil) {
+                # Not a tagged tuple at all — bare JSON string from an old
+                # runtime. Re-classify it as if it had been {'ok', raw}.
+                if (json_decode(to_string(raw)) == nil) {
+                    {'fatal', 200, "response body was not valid JSON"}
+                } else { {'ok', to_string(raw)} }
+            } else { if (third == nil) {
+                # Legacy {'error, reason} — no status available. Treat as
+                # transient (bounded by the retry cap) per the safe fallback.
+                {'transient', 0, to_string(second)}
+            } else {
+                status = to_int_safe(second)
+                msg = to_string(third)
+                if (is_transient_status(status) == 'true') {
+                    {'transient', status, msg}
+                } else {
+                    {'fatal', status, msg}
+                }
+            }}
+        }
+    }
+}
+
+# Coerce a possibly-string/possibly-int status to an int. 0 on garbage.
+fun to_int_safe(v) {
+    if (v == nil) { 0 }
+    else {
+        s = to_string(v)
+        n = parse_positive_int_local(s, 0, 0, 'false')
+        if (n < 0) { 0 } else { n }
+    }
+}
+
+# Transient = retry-worthy: connection-level (0), request-timeout (408),
+# rate-limit (429), or any 5xx. Everything else (4xx, esp 400) is fatal.
+fun is_transient_status(status) {
+    if (status == 0) { 'true' }
+    else { if (status == 408) { 'true' }
+    else { if (status == 429) { 'true' }
+    else { if (status >= 500 && status <= 599) { 'true' }
+    else { 'false' }}}}
+}
+
+# Parse a Retry-After hint (seconds) embedded in the error body by the C
+# stream as `retry-after: N` (case-insensitive-ish, we lower first). Returns
+# milliseconds, or 0 when absent. Honored by chat_native_retry for 429/503.
+fun parse_retry_after_ms(msg) {
+    low = string_lower(to_string(msg))
+    marker = "retry-after:"
+    if (string_contains(low, marker) == 'false') { 0 }
+    else {
+        tail = string_after_first(low, marker)
+        secs = parse_leading_int(string_trim(tail), 0, 0, 'false')
+        if (secs <= 0) { 0 } else { secs * 1000 }
+    }
+}
+
+# Prefix-aware leading-int parser: stops at the first non-digit. Used for
+# Retry-After where the value may be followed by other text.
+fun parse_leading_int(s, i, acc, saw) {
+    if (i >= string_length(s)) { if (saw == 'true') { acc } else { 0 } }
+    else {
+        ch = string_sub(s, i, 1)
+        d = if (ch == "0") { 0 } else { if (ch == "1") { 1 }
+            else { if (ch == "2") { 2 } else { if (ch == "3") { 3 }
+            else { if (ch == "4") { 4 } else { if (ch == "5") { 5 }
+            else { if (ch == "6") { 6 } else { if (ch == "7") { 7 }
+            else { if (ch == "8") { 8 } else { if (ch == "9") { 9 }
+            else { 0 - 1 }}}}}}}}}}
+        if (d < 0) { if (saw == 'true') { acc } else { 0 } }
+        else { parse_leading_int(s, i + 1, acc * 10 + d, 'true') }
+    }
+}
+
+# Substring after the first occurrence of marker ("" if not present).
+fun string_after_first(s, marker) {
+    if (string_contains(s, marker) == 'false') { "" }
+    else {
+        sentinel = "\x01\x02SWAFTER\x02\x01"
+        replaced = string_replace(s, marker, sentinel)
+        parts = string_split(replaced, sentinel)
+        if (length(parts) < 2) { "" } else { hd(tl(parts)) }
+    }
+}
+
+# Stash/read a pending Retry-After delay (ms) on the stats table so the
+# retry loop can honor it without re-plumbing return shapes.
+fun record_retry_after(opts, ms) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'ok' } else { ets_put(table, 'retry_after_ms', ms) }
+}
+
+fun last_retry_after(opts) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 0 }
+    else {
+        v = ets_get(table, 'retry_after_ms')
+        if (v == nil) { 0 } else { v }
     }
 }
 
@@ -1115,21 +1299,52 @@ fun chat_native(messages, opts) {
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     record_fail(opts, "fail")
-    resp = unwrap_stream(http_post_stream(url, hdrs, body))
+    record_retry_after(opts, 0)
+    cls = classify_stream(http_post_stream(url, hdrs, body))
     latency = timestamp() - start_ms
 
+    cls_tag = elem(cls, 0)
+    resp = if (cls_tag == 'ok') { elem(cls, 1) } else { nil }
+
     if (resp == nil) {
-        Log.llm_error("http_post_stream returned nil (native)", "")
-        nil
+        # F1: classify the failure so chat_native_retry can decide whether to
+        # re-send. 'fatal (4xx / parse-error body) → STOP (re-sending the same
+        # body just re-fails). 'transient (0 / 408 / 429 / 5xx) → backoff-retry,
+        # honoring any Retry-After the server sent.
+        if (cls_tag == 'fatal') {
+            f_status = elem(cls, 1)
+            f_msg = elem(cls, 2)
+            record_fail(opts, 'fatal')
+            diag(opts, "  \e[38;5;208m✗ request rejected (HTTP " ++
+                  to_string(f_status) ++ ") — not retrying: " ++ to_string(f_msg) ++ "\e[0m")
+            Log.llm_error("fatal request error " ++ to_string(f_status), to_string(f_msg))
+            nil
+        } else {
+            t_status = elem(cls, 1)
+            t_msg = elem(cls, 2)
+            record_fail(opts, 'transient')
+            record_retry_after(opts, parse_retry_after_ms(t_msg))
+            Log.llm_error("http_post_stream transient (native, HTTP " ++
+                  to_string(t_status) ++ ")", to_string(t_msg))
+            nil
+        }
     } else {
         decoded = json_decode(resp)
         if (decoded == nil) {
+            # classify_stream already guarantees resp parses, but keep the
+            # belt-and-braces nil-guard; a parse failure here is fatal.
+            record_fail(opts, 'fatal')
             Log.llm_error("json_decode failed (native)", resp)
             nil
         } else {
             err = map_get(decoded, 'error')
             if (err != nil) {
                 em = map_get(err, 'message')
+                # A structured error object is a request-level rejection
+                # (bad params, context overflow, auth) — re-sending the
+                # identical body just re-fails. Mark fatal so the retry
+                # loop stops instead of hammering the same poisoned body.
+                record_fail(opts, 'fatal')
                 diag(opts, "  \e[38;5;208m[llm error] " ++ to_string(em) ++ "\e[0m")
                 Log.llm_error("server error", to_string(em))
                 nil
@@ -1171,6 +1386,16 @@ fun chat_native(messages, opts) {
                     } else { prose_raw }
                     tool_calls = api_tool_calls_to_internal(raw_tool_calls, [])
 
+                    # F4: signal length-truncation to the agent layer. With slice
+                    # C threading the body out, finish_reason may now be present;
+                    # also catch the C-appended marker. run_turn uses this to
+                    # escalate max_tokens / inject a smaller-edits recovery nudge.
+                    fin = extract_finish_reason(resp)
+                    truncated = if (fin == "length") { 'true' }
+                                else { if (string_contains(to_string(prose_raw),
+                                          "[Response truncated at max_tokens") == 'true') { 'true' }
+                                else { 'false' }}
+
                     had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
                     # Feed the learned-speed signal for the next wait_hint.
@@ -1191,7 +1416,8 @@ fun chat_native(messages, opts) {
                     %{
                         content: prose,
                         tool_calls: tool_calls,
-                        reasoning: reason_text
+                        reasoning: reason_text,
+                        truncated: truncated
                     }
                 }
             }
@@ -1248,11 +1474,27 @@ fun chat_inband(messages, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = unwrap_stream(http_post_stream(url, hdrs, body))
+    record_fail(opts, "fail")
+    record_retry_after(opts, 0)
+    cls = classify_stream(http_post_stream(url, hdrs, body))
     latency = timestamp() - start_ms
 
+    cls_tag = elem(cls, 0)
+    resp = if (cls_tag == 'ok') { elem(cls, 1) } else { nil }
+
     if (resp == nil) {
-        Log.llm_error("http_post returned nil (inband)", "")
+        # F1: same classification as chat_native — fatal request errors stop the
+        # retry loop (chat_inband_retry checks last_fail), transient ones retry.
+        if (cls_tag == 'fatal') {
+            record_fail(opts, 'fatal')
+            diag(opts, "  \e[38;5;208m✗ request rejected (HTTP " ++
+                  to_string(elem(cls, 1)) ++ ") — not retrying: " ++ to_string(elem(cls, 2)) ++ "\e[0m")
+            Log.llm_error("fatal request error (inband, HTTP " ++ to_string(elem(cls, 1)) ++ ")", to_string(elem(cls, 2)))
+        } else {
+            record_fail(opts, 'transient')
+            record_retry_after(opts, parse_retry_after_ms(elem(cls, 2)))
+            Log.llm_error("http_post transient (inband, HTTP " ++ to_string(elem(cls, 1)) ++ ")", to_string(elem(cls, 2)))
+        }
         nil
     } else {
         raw_content = extract_content(resp)
@@ -1311,10 +1553,18 @@ fun chat_inband(messages, opts) {
                 Markdown.repaint_streamed_prose(to_string(prose))
             }
 
+            # F4: same length-truncation signal as chat_native.
+            fin = extract_finish_reason(resp)
+            truncated = if (fin == "length") { 'true' }
+                        else { if (string_contains(to_string(prose_raw),
+                                  "[Response truncated at max_tokens") == 'true') { 'true' }
+                        else { 'false' }}
+
             %{
                 content: prose,
                 tool_calls: tool_calls,
-                reasoning: reason_text
+                reasoning: reason_text,
+                truncated: truncated
             }
         }
     }
