@@ -15,7 +15,9 @@ module Markdown
 #
 # Block-level handling:
 #   `### X` `## X` `# X`    → bold (with depth-graded styling)
-#   `- X`     `* X`         → bullet • prefix
+#   `- X` `* X` `+ X`       → bullet • prefix (nested: ◦ ▪ ▫ by indent)
+#   `1. X` / `1) X`         → ordered item, hanging indent
+#   `- [ ] X` / `- [x] X`   → task checkbox ◻ / green ✔
 #   `> X`                   → dim │ blockquote bar
 #   ```                      → code fence (until closing ```)
 #   `---` (alone on a line)  → horizontal rule
@@ -98,7 +100,9 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
                 t = strip_prefix(line, header_prefix(d))
                 walk_blocks(rest, [], 'false', list_append(blocks, {'header', {d, t}}))
             } else { if (is_bullet(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'bullet', bullet_text(line)}))
+                walk_blocks(rest, [], 'false', list_append(blocks, {'bullet', {bullet_level(line), bullet_text(line)}}))
+            } else { if (is_ordered(line) == 'true') {
+                walk_blocks(rest, [], 'false', list_append(blocks, {'ordered', {bullet_level(line), ordered_marker(line), ordered_text(line)}}))
             } else { if (is_quote(line) == 'true') {
                 walk_blocks(rest, [], 'false', list_append(blocks, {'quote', quote_text(line)}))
             } else { if (is_table_row(line) == 'true') {
@@ -126,7 +130,7 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
                 } else {
                     walk_blocks(rest, [], 'false', list_append(blocks, {'para', string_trim(line)}))
                 }
-            }}}}}}}
+            }}}}}}}}
         }
     }
 }
@@ -154,13 +158,70 @@ fun is_bullet(line) {
     if (string_length(t) < 2) { 'false' }
     else {
         h2 = string_sub(t, 0, 2)
-        if (h2 == "- " || h2 == "* ") { 'true' } else { 'false' }
+        if (h2 == "- " || h2 == "* " || h2 == "+ ") { 'true' } else { 'false' }
     }
 }
 
 fun bullet_text(line) {
     t = string_trim(line)
     string_sub(t, 2, string_length(t) - 2)
+}
+
+# Nesting level for list items: floor(leading spaces / 2), capped at 3.
+# "- x" → 0, "  - x" → 1, "    - x" → 2. Previously the trim discarded
+# the indent and every nested list flattened to one level.
+fun bullet_level(line) {
+    sp = leading_spaces(line, 0)
+    lvl = sp / 2
+    if (lvl > 3) { 3 } else { lvl }
+}
+
+fun leading_spaces(s, i) {
+    if (i >= string_length(s)) { i }
+    else {
+        if (string_sub(s, i, 1) == " ") { leading_spaces(s, i + 1) }
+        else { i }
+    }
+}
+
+# Ordered list item: 1-3 digits, then "." or ")", then a space.
+# These previously fell through to the paragraph branch and consecutive
+# numbered lines were space-merged into ONE line — the most visible
+# markdown bug, since models emit numbered lists constantly.
+fun is_ordered(line) {
+    t = string_trim(line)
+    n = digits_len(t, 0)
+    if (n < 1 || n > 3) { 'false' }
+    else {
+        if (string_length(t) < n + 2) { 'false' }
+        else {
+            p = string_sub(t, n, 1)
+            if ((p == "." || p == ")") && string_sub(t, n + 1, 1) == " ") { 'true' }
+            else { 'false' }
+        }
+    }
+}
+
+fun digits_len(s, i) {
+    if (i >= string_length(s)) { i }
+    else {
+        ch = string_sub(s, i, 1)
+        if (ch >= "0" && ch <= "9") { digits_len(s, i + 1) }
+        else { i }
+    }
+}
+
+# "12. text" → "12."   "3) text" → "3)"
+fun ordered_marker(line) {
+    t = string_trim(line)
+    n = digits_len(t, 0)
+    string_sub(t, 0, n + 1)
+}
+
+fun ordered_text(line) {
+    t = string_trim(line)
+    n = digits_len(t, 0)
+    string_sub(t, n + 2, string_length(t) - (n + 2))
 }
 
 fun is_table_row(line) {
@@ -281,8 +342,11 @@ fun pair_sep(prev_kind, cur_kind) {
     #   anything→blank, blank→anything    — blank already empties
     if (cur_kind == 'blank' || prev_kind == 'blank') { "\n" }
     else { if (prev_kind == 'bullet' && cur_kind == 'bullet') { "\n" }
+    else { if (prev_kind == 'ordered' && cur_kind == 'ordered') { "\n" }
+    else { if (prev_kind == 'bullet' && cur_kind == 'ordered') { "\n" }
+    else { if (prev_kind == 'ordered' && cur_kind == 'bullet') { "\n" }
     else { if (prev_kind == 'quote' && cur_kind == 'quote') { "\n" }
-    else { "\n\n" }}}
+    else { "\n\n" }}}}}}
 }
 
 # ------------------------------------------------------------
@@ -297,7 +361,8 @@ fun render_block(kind, payload, width) {
     else { if (kind == 'hr')       { render_hr(width) }
     else { if (kind == 'blank')    { "" }
     else { if (kind == 'table')    { render_table(payload, width) }
-    else { render_para(payload, width) }}}}}}}
+    else { if (kind == 'ordered')  { render_ordered(payload, width) }
+    else { render_para(payload, width) }}}}}}}}
 }
 
 # Headers: bold. h1 also underlined. Prepend nothing — no `### ` text.
@@ -313,10 +378,59 @@ fun render_header(payload, width) {
 }
 
 fun render_bullet(payload, width) {
-    bullet = "  • "    # 4-char prefix (incl. 2-space indent)
-    cont   = "    "    # 4-char hanging indent for wrapped lines
-    rendered = render_inline(payload)
+    level = elem(payload, 0)
+    text = elem(payload, 1)
+    ind = pad_chars(2 + level * 2, "")
+    # Task-list items ("[ ] x" / "[x] x") swap the dot for a checkbox.
+    marker = task_marker(text, bullet_marker(level))
+    body = task_body(text)
+    bullet = ind ++ marker ++ " "
+    # Hanging indent sized to the VISUAL prefix (indent + 1-col marker +
+    # space) — display_width on the marker would double-count multibyte
+    # glyphs if string_sub is byte-based.
+    cont = pad_chars(2 + level * 2 + 2, "")
+    rendered = render_inline(body)
     wrap_with_prefixes(rendered, bullet, cont, width)
+}
+
+# Marker glyph steps with nesting depth: • ◦ ▪ ▫
+fun bullet_marker(level) {
+    if (level == 0) { "•" }
+    else { if (level == 1) { "◦" }
+    else { if (level == 2) { "▪" }
+    else { "▫" }}}
+}
+
+fun task_marker(text, fallback) {
+    if (string_length(text) < 4) { fallback }
+    else {
+        h4 = string_sub(text, 0, 4)
+        if (h4 == "[ ] ") { "◻" }
+        else { if (h4 == "[x] " || h4 == "[X] ") { UI.green() ++ "✔" ++ UI.reset() }
+        else { fallback }}
+    }
+}
+
+fun task_body(text) {
+    if (string_length(text) < 4) { text }
+    else {
+        h4 = string_sub(text, 0, 4)
+        if (h4 == "[ ] " || h4 == "[x] " || h4 == "[X] ") {
+            string_sub(text, 4, string_length(text) - 4)
+        } else { text }
+    }
+}
+
+# Ordered item: "  1. text" with a hanging indent under the text column.
+fun render_ordered(payload, width) {
+    level = elem(payload, 0)
+    marker = elem(payload, 1)
+    text = elem(payload, 2)
+    ind = pad_chars(2 + level * 2, "")
+    prefix = ind ++ marker ++ " "
+    cont = pad_chars(2 + level * 2 + string_length(marker) + 1, "")
+    rendered = render_inline(text)
+    wrap_with_prefixes(rendered, prefix, cont, width)
 }
 
 fun render_quote(payload, width) {
@@ -369,7 +483,7 @@ fun render_table(rows, width) {
         # then the body rows.
         head = hd(parsed)
         body = tl(parsed)
-        head_line = render_row(head, widths)
+        head_line = render_header_row(head, widths)
         div_line = render_divider(widths)
         body_lines = render_body_rows(body, widths, "")
         if (string_length(body_lines) == 0) {
@@ -462,6 +576,24 @@ fun merge_widths(a, b, acc) {
 # Render one row as "  cell1 │ cell2 │ cell3" with each cell padded.
 fun render_row(cells, widths) {
     "  " ++ row_cells_loop(cells, widths, "")
+}
+
+# Header row — same layout, each padded cell wrapped in bold. A reset
+# inside a cell (inline code/bold) only un-bolds the rest of THAT cell.
+fun render_header_row(cells, widths) {
+    "  " ++ header_cells_loop(cells, widths, "")
+}
+
+fun header_cells_loop(cells, widths, acc) {
+    if (length(cells) == 0) { acc }
+    else {
+        cell = hd(cells)
+        col_width = if (length(widths) == 0) { display_width(render_inline(cell)) } else { hd(widths) }
+        padded = render_cell(cell, col_width)
+        sep = if (string_length(acc) == 0) { "" } else { " " ++ UI.grey_border() ++ "│" ++ UI.reset() ++ " " }
+        next_widths = if (length(widths) == 0) { [] } else { tl(widths) }
+        header_cells_loop(tl(cells), next_widths, acc ++ sep ++ "\e[1m" ++ padded ++ "\e[0m")
+    }
 }
 
 fun row_cells_loop(cells, widths, acc) {
@@ -902,7 +1034,25 @@ fun has_markdown(s) {
     else { if (string_starts_with(s, "* ") == 'true') { 'true' }
     else { if (string_contains(s, "\n> ") == 'true') { 'true' }
     else { if (string_contains(s, "\n|") == 'true') { 'true' }
-    else { 'false' }}}}}}}}}
+    else { if (string_starts_with(s, "|") == 'true') { 'true' }
+    else { if (string_contains(s, "](") == 'true') { 'true' }
+    else { if (has_ordered_item(s) == 'true') { 'true' }
+    else { 'false' }}}}}}}}}}}}
+}
+
+# True when any line is an ordered-list item ("1. x" / "2) y"). These
+# were invisible to the old heuristic, so numbered-list replies never
+# got the render pass at all.
+fun has_ordered_item(s) {
+    any_ordered(string_split(s, "\n"))
+}
+
+fun any_ordered(lines) {
+    if (length(lines) == 0) { 'false' }
+    else {
+        if (is_ordered(hd(lines)) == 'true') { 'true' }
+        else { any_ordered(tl(lines)) }
+    }
 }
 
 # Inline code or a fence needs at least TWO backticks (a balanced pair) —

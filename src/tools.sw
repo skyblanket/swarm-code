@@ -33,15 +33,25 @@ import PathGuard
 
 export [exec_raw, max_output_bytes]
 
-# Keep tool output well under the 32K context so even a long history +
-# a big bash stdout doesn't push the KV cache over. 6 KB ≈ ~1500 tokens.
+# Per-tool output caps. A single 6 KB global cap starved test/build/grep
+# output (the failing assertion or the matching line got chopped, hiding the
+# exact thing the model needed → a re-run with a narrower command → a burned
+# turn). Each tool now gets a cap tuned to its role, mirroring claude-code's
+# per-tool limits. truncate_output keeps HEAD+TAIL so the failing tail of a
+# log survives the cut. max_output_bytes() stays as the conservative default
+# (and the read_ceiling base) for any caller without a dedicated cap.
 fun max_output_bytes() { 6000 }
+fun bash_output_cap() { 24000 }
+fun run_tests_raw_cap() { 16000 }
+fun grep_output_cap() { 16000 }
+fun read_output_cap() { 65000 }
+fun mcp_output_cap() { 24000 }
 
 # Raw handler dispatch. Permission, context, guardrail, and hook policy
 # lives in ToolExecutor; callers outside tests should use that boundary.
 fun exec_raw(name, args, opts) {
     if (string_starts_with(to_string(name), "mcp__") == 'true') {
-        truncate_output(Mcp.call_tool(to_string(name), args, opts), max_output_bytes())
+        truncate_output(Mcp.call_tool(to_string(name), args, opts), mcp_output_cap())
     } else {
         handler = find_handler(all_tools(), name)
         if (handler == nil) {
@@ -293,7 +303,7 @@ fun do_bash(args) {
             out = elem(r, 1)
             interrupted = elem(r, 2)
             line_capped = truncate_output_lines(out, bash_max_lines())
-            byte_capped = truncate_output(line_capped, max_output_bytes())
+            byte_capped = truncate_output(line_capped, bash_output_cap())
             format_managed_result(code, byte_capped, t_s, interrupted)
         }
     }
@@ -371,7 +381,7 @@ fun read_file_capped(path, offset, limit) {
             # `head -c` instead of slurping the whole thing.
             size_str = string_trim(elem(shell_managed("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
             size = parse_int_safe(size_str, 0)
-            read_ceiling = max_output_bytes() * 8
+            read_ceiling = read_output_cap()
             content = if (size > read_ceiling) {
                 head = elem(shell_managed("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
                 head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
@@ -383,7 +393,7 @@ fun read_file_capped(path, offset, limit) {
                 "error: could not read " ++ path
             } else {
                 sliced = slice_lines(content, offset, limit)
-                truncate_output(sliced, max_output_bytes())
+                truncate_output(sliced, read_output_cap())
             }
         } else {
             "error: binary file (" ++ string_trim(file_type) ++ ") — " ++ to_string(path) ++
@@ -392,22 +402,36 @@ fun read_file_capped(path, offset, limit) {
     } }
 }
 
-# Slice [offset, offset+limit) lines from content (1-based offset).
-# When offset=1 and limit covers the whole file, returns content as-is
-# so callers reading small files see no behavior change.
+# Slice [offset, offset+limit) lines from content (1-based offset) and
+# prefix each line with its 1-based file line number + a tab — `N\t<content>`,
+# the cat -n shape claude-code's Read emits. The schema PROMISED line numbers
+# (the edit/multi_edit prose tells the model to strip the leading number+tab
+# before using a line as old_string); previously the body returned raw content
+# with no anchors, so the model dropped to `od -c` to count offsets. The line
+# number is the ABSOLUTE file line (start + position-in-window + 1), so anchors
+# stay correct even when reading a windowed slice with offset > 1.
 fun slice_lines(content, offset, limit) {
-    if (offset <= 1 && limit >= 1000000) {
-        content
+    lines = string_split(content, "\n")
+    total = length(lines)
+    start = if (offset < 1) { 0 } else { offset - 1 }
+    if (start >= total) {
+        ""
     } else {
-        lines = string_split(content, "\n")
-        total = length(lines)
-        start = if (offset < 1) { 0 } else { offset - 1 }
-        if (start >= total) {
-            ""
-        } else {
-            window = take_first_lines(drop_first_n(lines, start), limit, [])
-            join_lines(window, "")
-        }
+        window = take_first_lines(drop_first_n(lines, start), limit, [])
+        number_lines(window, start + 1, "")
+    }
+}
+
+# Join lines, each prefixed with `<lineno>\t`. lineno is the 1-based file line
+# number of the FIRST window line; it increments per line. Matches cat -n /
+# claude-code Read so the model has stable anchors for edit old_strings.
+fun number_lines(lst, lineno, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        sep = if (string_length(acc) == 0) { "" } else { "\n" }
+        line = to_string(lineno) ++ "\t" ++ h
+        number_lines(tl(lst), lineno + 1, acc ++ sep ++ line)
     }
 }
 
@@ -489,23 +513,50 @@ fun do_edit(args) {
     path = resolve_path_arg(args)
     old_s = map_get(args, 'old_string')
     new_s = map_get(args, 'new_string')
+    replace_all = is_truthy(map_get(args, 'replace_all'))
     if (path == nil) { "error: missing path" }
     else {
         if (old_s == nil) { "error: missing old_string" }
         else {
             if (new_s == nil) { "error: missing new_string" }
-            else { do_edit_impl(path, old_s, new_s) }
+            else { do_edit_impl(path, old_s, new_s, replace_all) }
         }
     }
 }
 
-fun do_edit_impl(path, old_s, new_s) {
-    guard = PathGuard.validate_write(to_string(path))
-    if (guard != "ok") { guard }
-    else { do_edit_impl_inner(path, old_s, new_s) }
+# Coerce a JSON-decoded flag to a sw boolean atom. json_decode yields the
+# atoms 'true'/'false' for JSON booleans, but a model may also send the
+# strings "true"/"1" — accept all of them so a correctly-intended
+# replace_all isn't silently dropped.
+fun is_truthy(v) {
+    if (v == 'true' || v == "true" || v == "1" || v == 1) { 'true' } else { 'false' }
 }
 
-fun do_edit_impl_inner(path, old_s, new_s) {
+# Replace EVERY occurrence of `old` in `s` with `new`, built from
+# string_split + join so it is correct regardless of string_replace's
+# all-vs-first semantics. Empty `old` is a no-op (caller guards against it).
+fun replace_all_occ(s, old, new) {
+    if (string_length(old) == 0) { s }
+    else { join_with(string_split(s, old), new, "") }
+}
+
+fun join_with(parts, sep, acc) {
+    if (length(parts) == 0) { acc }
+    else {
+        h = hd(parts)
+        rest = tl(parts)
+        piece = if (length(rest) == 0) { h } else { h ++ sep }
+        join_with(rest, sep, acc ++ piece)
+    }
+}
+
+fun do_edit_impl(path, old_s, new_s, replace_all) {
+    guard = PathGuard.validate_write(to_string(path))
+    if (guard != "ok") { guard }
+    else { do_edit_impl_inner(path, old_s, new_s, replace_all) }
+}
+
+fun do_edit_impl_inner(path, old_s, new_s, replace_all) {
     original = file_read(path)
     if (original == nil) {
         # Missing file. Empty old_string = create it with new_string.
@@ -541,14 +592,30 @@ fun do_edit_impl_inner(path, old_s, new_s) {
                 # new_string contains old_string as a substring.
                 occ = count_substrings(original, old_s)
                 if (occ == 0) {
-                    "error: old_string not found in " ++ path ++ ". Read the file first, then retry with an exact substring."
-                } else { if (occ > 1) {
-                    "error: old_string appears " ++ to_string(occ) ++ " times in " ++ path ++ " — add more context to make it unique"
+                    # Exact miss. Before failing, retry against normalized
+                    # copies (curly→straight quotes, trailing-whitespace
+                    # stripped) — most near-misses are a quote or a stray
+                    # trailing space, not a real mismatch. Same transform is
+                    # applied to new_string so the splice stays consistent.
+                    norm = normalized_edit(original, old_s, new_s, replace_all)
+                    if (norm == nil) {
+                        "error: old_string not found in " ++ path ++ ":\n--- old_string ---\n" ++ old_s ++ "\n--- end ---\nCheck for trailing spaces, tabs-vs-spaces, or curly quotes, then copy the exact bytes from a fresh read."
+                    } else {
+                        rc_n = file_write(path, norm)
+                        if (rc_n == 'ok') { "ok: edited " ++ path ++ " (matched after folding curly quotes)" }
+                        else { "error: could not write " ++ path }
+                    }
+                } else { if (occ > 1 && replace_all == 'false') {
+                    "error: old_string appears " ++ to_string(occ) ++ " times in " ++ path ++ " — add more context to make it unique, or pass replace_all=true to replace every occurrence"
                 } else {
-                    edited = string_replace(original, old_s, new_s)
+                    # occ == 1, OR occ > 1 with replace_all: replace_all_occ
+                    # rewrites every match (it is a no-op past the first when
+                    # occ == 1), so one path covers both cases.
+                    edited = replace_all_occ(original, old_s, new_s)
                     rc_r = file_write(path, edited)
                     if (rc_r == 'ok') {
-                        "ok: edited " ++ path
+                        if (occ > 1) { "ok: edited " ++ path ++ " (" ++ to_string(occ) ++ " occurrences replaced)" }
+                        else { "ok: edited " ++ path }
                     } else {
                         "error: could not write " ++ path
                     }
@@ -556,6 +623,85 @@ fun do_edit_impl_inner(path, old_s, new_s) {
             }
         }
     }
+}
+
+# ------------------------------------------------------------
+# Edit normalization fallback (F7)
+# ------------------------------------------------------------
+# When an exact old_string match fails, retry with curly→straight quote
+# folding — the single highest-hit-rate near-miss. CRITICAL: this is
+# LOCATE-ONLY. We fold a COPY of the buffer purely to find the unique region
+# that matches the folded old_string, then map that match's byte offsets back
+# to the ORIGINAL buffer and splice ONLY that region with new_string. We never
+# write back a globally-folded buffer (an earlier version did, which silently
+# rewrote every other curly quote in the file). new_string is written exactly
+# as the model supplied it.
+#
+# Only a UNIQUE folded match is accepted (occ != 1 → nil). Trailing-whitespace
+# auto-normalization was deliberately dropped: stripping it correctly requires
+# a region-local splice it can't do safely (a whole-file strip corrupts
+# Markdown hard line-breaks and diff fixtures), and the exact-miss error
+# already tells the model to check for stray trailing spaces.
+fun normalized_edit(original, old_s, new_s, replace_all) {
+    nold = fold_quotes(old_s)
+    if (string_length(nold) == 0) { nil }
+    else {
+        nbuf = fold_quotes(original)
+        occ = count_substrings(nbuf, nold)
+        # Unique-only. Fuzzy + replace_all (multi-region splice) is intentionally
+        # unsupported — too risky to splice several fuzzily-matched regions.
+        if (occ != 1) { nil }
+        else {
+            pos_n = string_index_of(nbuf, nold)
+            if (pos_n < 0) { nil }
+            else {
+                end_n = pos_n + string_length(nold)
+                orig_start = map_norm_to_orig(original, pos_n)
+                orig_end   = map_norm_to_orig(original, end_n)
+                olen = string_length(original)
+                string_sub(original, 0, orig_start) ++ new_s ++
+                    string_sub(original, orig_end, olen - orig_end)
+            }
+        }
+    }
+}
+
+# Map a BYTE offset in fold_quotes(original) back to the BYTE offset in the
+# ORIGINAL buffer. fold_quotes only ever rewrites a curly-quote char (>1 byte)
+# to a 1-byte ASCII quote; every other char is byte-identical. We walk original
+# char by char, accumulating the normalized byte length, and return the original
+# byte offset the instant the normalized length reaches `target`. old_s is whole
+# characters, so a match boundary always lands exactly on a char boundary.
+fun map_norm_to_orig(original, target) {
+    map_norm_to_orig_loop(string_chars(original), 0, 0, target)
+}
+
+fun map_norm_to_orig_loop(chars, orig_off, norm_off, target) {
+    if (norm_off >= target) { orig_off }
+    else { if (length(chars) == 0) { orig_off }
+    else {
+        c = hd(chars)
+        ob = string_length(c)
+        fb = string_length(fold_quote_char(c))
+        map_norm_to_orig_loop(tl(chars), orig_off + ob, norm_off + fb, target)
+    }}
+}
+
+# Fold the common curly quotes to their straight ASCII equivalents.
+# string_chars is UTF-8 aware so each curly quote is one list element.
+fun fold_quotes(s) {
+    join_chars(map(fun(c) { fold_quote_char(c) }, string_chars(s)), "")
+}
+
+fun fold_quote_char(c) {
+    if (c == "‘" || c == "’" || c == "ʼ" || c == "′") { "'" }
+    else { if (c == "“" || c == "”" || c == "″") { "\"" }
+    else { c }}
+}
+
+fun join_chars(lst, acc) {
+    if (length(lst) == 0) { acc }
+    else { join_chars(tl(lst), acc ++ hd(lst)) }
 }
 
 # ------------------------------------------------------------
@@ -603,7 +749,7 @@ fun do_glob(args) {
         # so downstream tools (Read) get the same path either way.
         cmd = "if command -v rg >/dev/null 2>&1; then " ++
               "rg --files --hidden --no-messages -g " ++ pat_q ++ base_part ++ "; " ++
-              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null | sed 's|^\\./||'; fi | head -n 100"
+              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null | sed 's|^\\./||'; fi | head -n 101"
         result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
@@ -611,8 +757,30 @@ fun do_glob(args) {
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            if (string_length(string_trim(out)) == 0) { "(no matches)" } else { out }
+            if (string_length(string_trim(out)) == 0) { "(no matches)" }
+            else { glob_cap_notice(out) }
         }
+    }
+}
+
+# The pipe fetches 101 lines: a 101st line means "more than 100 matched".
+# Show 100 and SAY the list is capped — the old silent cap made big
+# trees look smaller than they are.
+fun glob_cap_notice(out) {
+    lines = string_split(string_trim(out), "\n")
+    if (length(lines) <= 100) { out }
+    else {
+        join_first_n(lines, 100, "") ++
+        "\n[results capped at 100 — narrow the pattern or path]"
+    }
+}
+
+fun join_first_n(lines, n, acc) {
+    if (n <= 0 || length(lines) == 0) { acc }
+    else {
+        h = hd(lines)
+        next = if (string_length(acc) == 0) { h } else { acc ++ "\n" ++ h }
+        join_first_n(tl(lines), n - 1, next)
     }
 }
 
@@ -679,7 +847,7 @@ fun do_grep(args) {
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            trimmed = truncate_output(out, max_output_bytes())
+            trimmed = truncate_output(out, grep_output_cap())
             if (string_length(string_trim(trimmed)) == 0) { "(no matches)" } else { trimmed }
         }
     }
@@ -1132,12 +1300,13 @@ fun do_run_tests(args) {
                   "Total: " ++ to_string(total) ++ "\n" ++
                   "Exit code: " ++ to_string(exit_code)
         if (failed > 0) {
-            tail = if (string_length(raw) > 2000) {
-                string_sub(raw, string_length(raw) - 2000, 2000)
+            cap = run_tests_raw_cap()
+            tail = if (string_length(raw) > cap) {
+                string_sub(raw, string_length(raw) - cap, cap)
             } else {
                 raw
             }
-            summary ++ "\n\n--- raw output (last 2000 chars) ---\n" ++ tail
+            summary ++ "\n\n--- raw output (last " ++ to_string(cap) ++ " chars — failing tail kept) ---\n" ++ tail
         } else {
             summary
         }
@@ -1283,7 +1452,7 @@ fun do_code_search(args) {
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            truncated = truncate_output(out, max_output_bytes())
+            truncated = truncate_output(out, grep_output_cap())
             if (string_length(truncated) == 0) { "(no matches)" } else { truncated }
         }
     }
@@ -1489,14 +1658,14 @@ fun do_multi_edit(args) {
                 if (original == nil) {
                     "error: could not read " ++ path
                 } else {
-                    apply_edits(path, original, edits, 0)
+                    apply_edits(path, original, edits, 0, length(edits))
                 }
             }
         }
     }
 }
 
-fun apply_edits(path, buffer, edits, count) {
+fun apply_edits(path, buffer, edits, count, total) {
     if (length(edits) == 0) {
         rc = file_write(path, buffer)
         if (rc == 'ok') {
@@ -1508,21 +1677,32 @@ fun apply_edits(path, buffer, edits, count) {
         edit_map = hd(edits)
         old_s = map_get(edit_map, 'old_string')
         new_s = map_get(edit_map, 'new_string')
-        if (old_s == nil) { "error: edit " ++ to_string(count) ++ " missing old_string" }
+        replace_all = is_truthy(map_get(edit_map, 'replace_all'))
+        # 1-based for messages so "edit 1 of N" matches how a human counts.
+        idx = to_string(count + 1) ++ " of " ++ to_string(total)
+        if (old_s == nil) { "error: edit " ++ idx ++ " missing old_string" }
         else {
-            if (new_s == nil) { "error: edit " ++ to_string(count) ++ " missing new_string" }
+            if (new_s == nil) { "error: edit " ++ idx ++ " missing new_string" }
             else {
                 # Count in the CURRENT buffer (pre-replace) — using
                 # the post-replace check produced false positives when
                 # new_string contained old_string as a substring.
                 occ = count_substrings(buffer, old_s)
                 if (occ == 0) {
-                    "error: edit " ++ to_string(count) ++ " old_string not found in " ++ path
-                } else { if (occ > 1) {
-                    "error: edit " ++ to_string(count) ++ " old_string appears " ++ to_string(occ) ++ " times — make it more specific"
+                    # Exact miss — retry against normalized copies (quotes /
+                    # trailing whitespace) before aborting the batch.
+                    norm = normalized_edit(buffer, old_s, new_s, replace_all)
+                    if (norm == nil) {
+                        "error: edit " ++ idx ++ " — old_string not found in " ++ path ++ ":\n--- old_string ---\n" ++ old_s ++ "\n--- end ---\nCheck trailing spaces, tabs-vs-spaces, or curly quotes. Edits apply in order; an earlier edit may have changed this text."
+                    } else {
+                        apply_edits(path, norm, tl(edits), count + 1, total)
+                    }
+                } else { if (occ > 1 && replace_all == 'false') {
+                    "error: edit " ++ idx ++ " — old_string appears " ++ to_string(occ) ++ " times; add surrounding context to make it unique, or set replace_all=true on this edit"
                 } else {
-                    replaced = string_replace(buffer, old_s, new_s)
-                    apply_edits(path, replaced, tl(edits), count + 1)
+                    # occ == 1, OR occ > 1 with replace_all on this edit.
+                    replaced = replace_all_occ(buffer, old_s, new_s)
+                    apply_edits(path, replaced, tl(edits), count + 1, total)
                 }}
             }
         }

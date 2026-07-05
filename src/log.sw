@@ -116,10 +116,14 @@ fun llm_error(reason, body_preview) {
 }
 
 fun tool_call(name, args_raw) {
+    # 2000 (was 400): 400 clipped most write/multi_edit args, leaving the
+    # audit trail blind to what was actually attempted. Safe to widen:
+    # event() runs redact() over the final encoded line, so the extra
+    # chars get the same secret masking as before.
     event(%{
         type: "tool_call",
         name: to_string(name),
-        args: truncate(args_raw, 400)
+        args: truncate(args_raw, 2000)
     })
 }
 

@@ -27,7 +27,7 @@ module UI
 
 export [
     banner, divider, brand_color, brand_dark, reset,
-    tool_header, tool_result,
+    tool_header, tool_result, edit_diff_render,
     rationale_box, answer_box,
     input_prompt, input_box_top, input_box_bottom, input_box_bottom_full,
     input_divider, footer_hint,
@@ -47,20 +47,31 @@ export [
 # semantic colors (truecolor). The red is the brand identity;
 # everything around it is tuned to OpenCode's calm dark theme.
 # ------------------------------------------------------------
-fun brand_color() { "\e[38;2;175;0;0m" }     # #af0000 — deep red (brand/primary)
-fun brand_dark()  { "\e[38;2;135;0;0m" }     # #870000 — darker red
-fun brand_dim()   { "\e[38;2;95;0;0m"  }     # #5f0000 — very dark red
+# NO_COLOR (https://no-color.org): any non-empty value disables ALL
+# color emission. Bold/dim/strike survive — they're formatting, not
+# color. reset() stays live so formatting still closes correctly.
+fun colors_off() {
+    v = getenv("NO_COLOR")
+    if (v == nil) { 'false' }
+    else { if (string_length(to_string(v)) > 0) { 'true' } else { 'false' } }
+}
+
+fun paint(code) { if (colors_off() == 'true') { "" } else { code } }
+
+fun brand_color() { paint("\e[38;2;175;0;0m") }     # #af0000 — deep red (brand/primary)
+fun brand_dark()  { paint("\e[38;2;135;0;0m") }     # #870000 — darker red
+fun brand_dim()   { paint("\e[38;2;95;0;0m")  }     # #5f0000 — very dark red
 
 # OpenCode dark-theme neutrals (step scale).
-fun grey_border() { "\e[38;2;72;72;72m"    } # #484848 — borders
-fun grey_text()   { "\e[38;2;128;128;128m" } # #808080 — muted / secondary text
-fun ui_text()     { "\e[38;2;238;238;238m" } # #eeeeee — primary text
+fun grey_border() { paint("\e[38;2;72;72;72m")    } # #484848 — borders
+fun grey_text()   { paint("\e[38;2;128;128;128m") } # #808080 — muted / secondary text
+fun ui_text()     { paint("\e[38;2;238;238;238m") } # #eeeeee — primary text
 
 # OpenCode semantic colors.
-fun teal_info()   { "\e[38;2;86;182;194m"  } # #56b6c2 — info / cyan
-fun warn_color()  { "\e[38;2;245;167;66m"  } # #f5a742 — warning / orange
-fun err_color()   { "\e[38;2;224;108;117m" } # #e06c75 — error / red
-fun accent_color(){ "\e[38;2;157;124;216m" } # #9d7cd8 — accent / purple
+fun teal_info()   { paint("\e[38;2;86;182;194m")  } # #56b6c2 — info / cyan
+fun warn_color()  { paint("\e[38;2;245;167;66m")  } # #f5a742 — warning / orange
+fun err_color()   { paint("\e[38;2;224;108;117m") } # #e06c75 — error / red
+fun accent_color(){ paint("\e[38;2;157;124;216m") } # #9d7cd8 — accent / purple
 fun reset()       { "\e[0m" }
 
 # ------------------------------------------------------------
@@ -111,8 +122,8 @@ fun char_to_digit(ch) {
 # ------------------------------------------------------------
 fun banner(model_name, endpoint, cwd) {
     w = term_width()
-    print("")
-    print(" " ++ brand_color() ++ "\e[1m⏺ swarm-code" ++ reset() ++ " " ++ grey_text() ++ "· the fine sw coding agent" ++ reset())
+    if (w >= 64) { banner_art() } else { print("") }
+    print(" " ++ brand_color() ++ "\e[1m⏺ swarm-code" ++ reset() ++ " " ++ grey_text() ++ "· the fine sw coding agent" ++ reset() ++ "  " ++ seal())
     print("")
     print(" " ++ grey_text() ++ "model   " ++ reset() ++ " " ++ teal_info() ++ model_name ++ reset())
     print(" " ++ grey_text() ++ "endpoint" ++ reset() ++ " " ++ teal_info() ++ endpoint ++ reset())
@@ -120,6 +131,36 @@ fun banner(model_name, endpoint, cwd) {
     print("")
     print(" " ++ grey_text() ++ "/help for commands · /quit to exit" ++ reset())
     print(full_divider(w))
+}
+
+# Ink-brush dragonfly, side profile — wings swept up-right with red
+# pterostigma dots, long antenna trailing left, segmented tail with an
+# upturned tip. Skipped entirely under 64 cols.
+fun banner_art() {
+    g = grey_text()
+    b = ui_text()
+    r = brand_color()
+    x = reset()
+    print("")
+    print(g ++ "                                     _.-~~-)" ++ x)
+    print(g ++ "                              _.-~~ " ++ r ++ "●" ++ g ++ " _.-~/" ++ x)
+    print(g ++ "                         _.-~  ,  _.-~ " ++ r ++ "●" ++ g ++ ",/" ++ x)
+    print(g ++ "                     .-~  ,  _.-~ , _.-~" ++ x)
+    print(g ++ "                    ( ,  _.-~ , _.-~" ++ x)
+    print(g ++ "               __   (_.-~ ,_.-~" ++ x)
+    print(g ++ "    `~-.._    " ++ x ++ b ++ "((" ++ r ++ "@" ++ b ++ "__().-~~" ++ x)
+    print(b ++ "          `~~--=(   )==,__" ++ x)
+    print(g ++ "                / /~\\ \\_   `==,__" ++ x)
+    print(g ++ "               ( (   \\ `\\_,     `==,_" ++ x)
+    print(g ++ "                \\_)    `~-._        `=~-'" ++ x)
+    print(g ++ "                            `~--`" ++ x)
+    print("")
+}
+
+# Hanko-style red seal — a nod to the stamp on the reference art.
+fun seal() {
+    if (colors_off() == 'true') { "" }
+    else { "\e[48;2;135;0;0m\e[38;2;238;238;238m\e[1m sw \e[0m" }
 }
 
 fun full_divider(width) {
@@ -211,6 +252,41 @@ fun take_n_lines(lines, n, acc) {
     else {
         if (length(lines) == 0) { acc }
         else { take_n_lines(tl(lines), n - 1, list_append(acc, hd(lines))) }
+    }
+}
+
+# ------------------------------------------------------------
+# Edit diff preview — colored ± lines under the tool result, so the
+# user sees WHAT changed instead of just "ok: edited path".
+#   - old   ← red,  capped
+#   + new   ← green, capped
+# ------------------------------------------------------------
+fun edit_diff_render(old_s, new_s) {
+    o = if (old_s == nil) { "" } else { to_string(old_s) }
+    n = if (new_s == nil) { "" } else { to_string(new_s) }
+    if (string_length(o) > 0) {
+        diff_side(string_split(o, "\n"), "-", err_color(), 4)
+    }
+    if (string_length(n) > 0) {
+        diff_side(string_split(n, "\n"), "+", green(), 4)
+    }
+}
+
+fun diff_side(lines, sign, color, cap) {
+    total = length(lines)
+    shown = take_n_lines(lines, cap, [])
+    diff_lines_loop(shown, sign, color)
+    if (total > cap) {
+        print("       " ++ grey_text() ++ "… " ++ to_string(total - cap) ++
+              " more " ++ sign ++ " lines" ++ reset())
+    }
+}
+
+fun diff_lines_loop(lines, sign, color) {
+    if (length(lines) == 0) { 'ok' }
+    else {
+        print("     " ++ color ++ sign ++ " " ++ hd(lines) ++ reset())
+        diff_lines_loop(tl(lines), sign, color)
     }
 }
 
@@ -389,7 +465,7 @@ fun leave_alt_screen() {
 # In-progress items get bold.
 # Pending items are normal.
 
-fun green()      { "\e[38;2;127;216;143m" }   # #7fd88f — success (OpenCode)
+fun green()      { paint("\e[38;2;127;216;143m") }   # #7fd88f — success (OpenCode)
 fun strikethrough() { "\e[9m" }
 fun dim()        { "\e[2m" }
 fun bold()       { "\e[1m" }
@@ -515,7 +591,7 @@ fun agent_color(name) {
     h = djb2_hash(name, 5381)
     # sw has no `%` modulo operator; do it the long way.
     palette_idx = h - (h / 8) * 8
-    pick_palette(palette_idx)
+    paint(pick_palette(palette_idx))
 }
 
 fun djb2_hash(s, h) {

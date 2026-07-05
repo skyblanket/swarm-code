@@ -54,6 +54,10 @@ fun main() {
         t_markdown_basic(),
         t_markdown_empty(),
         t_markdown_oneline(),
+        t_markdown_ordered(),
+        t_markdown_nested_bullets(),
+        t_markdown_task_list(),
+        t_markdown_detects_ordered(),
         t_dangerous_bash(),
         t_slugify(),
         t_glob(),
@@ -127,7 +131,14 @@ fun main() {
         t_hardline_rm_rf_root(),
         t_hardline_ls_la_allowed(),
         t_hardline_fork_bomb(),
-        t_to_string_nil()
+        t_to_string_nil(),
+        # --- harness-hardening regressions (F7/F8/F2) ---
+        t_edit_quote_fold_preserves_others(),
+        t_edit_replace_all(),
+        t_edit_ambiguous_errors(),
+        t_drop_to_last_clean_user(),
+        t_trailing_turn_incomplete_detection(),
+        t_context_meter_token_based()
     ]
 
     passed = sum_list(results, 0)
@@ -371,6 +382,42 @@ fun t_markdown_oneline() {
           if (string_length(r) > 0) { 'true' } else { 'false' })
 }
 
+# Ordered lists must render one item per line. They previously fell into
+# the paragraph branch and consecutive numbered lines were space-merged
+# into a single wrapped line ("1. alpha 2. beta 3. gamma").
+fun t_markdown_ordered() {
+    r = Markdown.render("1. alpha\n2. beta\n3. gamma", 80)
+    ok = bool_and3(
+        string_contains(r, "1. alpha"),
+        string_contains(r, "3. gamma"),
+        if (string_contains(r, "alpha 2.") == 'true') { 'false' } else { 'true' })
+    check("markdown ordered list: one item per line", ok)
+}
+
+# Indented sub-bullets keep their nesting (distinct marker glyph) instead
+# of flattening to the top level.
+fun t_markdown_nested_bullets() {
+    r = Markdown.render("- top\n  - nested\n", 80)
+    ok = if (string_contains(r, "•") == 'true' && string_contains(r, "◦") == 'true') { 'true' } else { 'false' }
+    check("markdown nested bullets get distinct markers", ok)
+}
+
+fun t_markdown_task_list() {
+    r = Markdown.render("- [ ] open\n- [x] done\n", 80)
+    ok = bool_and3(
+        string_contains(r, "◻"),
+        string_contains(r, "✔"),
+        if (string_contains(r, "[ ]") == 'true') { 'false' } else { 'true' })
+    check("markdown task-list checkboxes", ok)
+}
+
+# has_markdown must fire on numbered-list replies, or they never get the
+# post-stream render pass at all.
+fun t_markdown_detects_ordered() {
+    check("has_markdown detects ordered lists",
+          Markdown.has_markdown("Steps:\n1. build\n2. test"))
+}
+
 # ------------------------------------------------------------
 # Config / Memory / Tools
 # ------------------------------------------------------------
@@ -401,6 +448,75 @@ fun t_glob() {
 fun t_grep() {
     out = Tools.exec_raw('grep', %{pattern: "module Tools", path: "src"}, %{})
     check("grep finds file content", string_contains(out, "tools.sw"))
+}
+
+# F7: the quote-fold edit fallback must be LOCATE-ONLY — it splices the matched
+# region of the ORIGINAL buffer and leaves curly quotes ELSEWHERE untouched.
+# (The bug it guards: an earlier version wrote a globally quote-folded buffer,
+# silently straightening every other curly quote in the file.)
+fun t_edit_quote_fold_preserves_others() {
+    p = "/tmp/swc_f7_fold.txt"
+    file_write(p, "say “hello” here\nkeep “world” intact\n")
+    # old_string uses STRAIGHT quotes → exact match misses → quote-fold fallback.
+    r = Tools.exec_raw('edit', %{path: p, old_string: "say \"hello\" here", new_string: "say bye here"}, %{})
+    aft = file_read(p)
+    file_delete(p)
+    ok = if (aft == nil) { 'false' }
+         else { if (string_contains(aft, "say bye here") &&
+                    string_contains(aft, "“world”") == 'true') { 'true' } else { 'false' } }
+    check("edit quote-fold splices only the match (other curly quotes survive)", ok)
+}
+
+# F8: replace_all replaces every occurrence; without it an ambiguous match errors.
+fun t_edit_replace_all() {
+    p = "/tmp/swc_f8_all.txt"
+    file_write(p, "x = 1\ny = x\nz = x\n")
+    r = Tools.exec_raw('edit', %{path: p, old_string: "x", new_string: "q", replace_all: 'true'}, %{})
+    aft = file_read(p)
+    file_delete(p)
+    ok = if (aft == nil) { 'false' }
+         else { if (string_contains(aft, "q = 1") && string_contains(aft, "y = q") &&
+                    string_contains(aft, "z = q")) { 'true' } else { 'false' } }
+    check("edit replace_all replaces every occurrence", ok)
+}
+
+fun t_edit_ambiguous_errors() {
+    p = "/tmp/swc_f8_ambig.txt"
+    file_write(p, "a\na\n")
+    r = Tools.exec_raw('edit', %{path: p, old_string: "a", new_string: "b"}, %{})
+    file_delete(p)
+    check("edit errors on ambiguous old_string (occ>1, no replace_all)",
+          string_contains(r, "appears 2 times"))
+}
+
+# F2: drop_to_last_clean_user keeps system+last-user, drops the failing tail.
+fun t_drop_to_last_clean_user() {
+    msgs = [%{role: 'system', content: "s"}, %{role: 'user', content: "u1"},
+            %{role: 'assistant', content: "a", tool_calls: [%{id: "1", arguments: "{}"}]},
+            %{role: 'tool', content: "t"}]
+    out = Agent.drop_to_last_clean_user(msgs)
+    check("drop_to_last_clean_user keeps system+user, drops failing tail",
+          if (length(out) == 2) { 'true' } else { 'false' })
+}
+
+# F2: trailing_turn_incomplete keeps a COMPLETE tool turn (every tool_call
+# answered) and flags a PARTIAL one (a tool_call left unanswered) — the robust
+# detection that doesn't depend on json_decode. (NB: the args-malformed sub-check
+# is only a weak backup: sw's json_decode is lenient and recovers truncated JSON
+# into a partial map rather than nil, so a mid-string-truncated tool_call is
+# caught by F4's finish_reason/marker path and this partial-tool-set check, not
+# by json_decode==nil.)
+fun t_trailing_turn_incomplete_detection() {
+    complete = [%{role: 'user', content: "u"},
+                %{role: 'assistant', content: "", tool_calls: [%{id: "1", arguments: "{}"}]},
+                %{role: 'tool', content: "r"}]
+    partial = [%{role: 'user', content: "u"},
+               %{role: 'assistant', content: "", tool_calls: [%{id: "1", arguments: "{}"}, %{id: "2", arguments: "{}"}]},
+               %{role: 'tool', content: "r"}]
+    c_ok = if (Agent.trailing_turn_incomplete(complete) == 'false') { 'true' } else { 'false' }
+    p_ok = if (Agent.trailing_turn_incomplete(partial) == 'true') { 'true' } else { 'false' }
+    all_ok = if (c_ok == 'true' && p_ok == 'true') { 'true' } else { 'false' }
+    check("trailing_turn_incomplete: complete kept, partial tool-set flagged", all_ok)
 }
 
 # MCP with no mcpServers configured: init returns an empty table,
@@ -775,8 +891,23 @@ fun t_context_status_injected() {
     ok = bool_and3(
         string_contains(body, "ctx "),
         string_contains(body, "% used"),
-        string_contains(body, "msg"))
-    check("[ctx N% used · ...] block injected into last user msg", ok)
+        string_contains(body, "tok"))
+    check("[ctx N% used · ...] token-based block injected into last user msg", ok)
+}
+
+# Regression: the context meter must be TOKEN-based, not message-count-based.
+# 200 tiny messages blow past the OLD 120-message threshold (which made the meter
+# report ~100% used) but are only a few hundred tokens — it must read LOW now.
+fun t_context_meter_token_based() {
+    msgs = make_tiny_msgs(200, [])
+    s = LLM.build_status_string(msgs, %{})
+    not_full = if (string_contains(s, "100% used") == 'true') { 'false' } else { 'true' }
+    check("context meter is token-based (200 tiny msgs NOT reported ~100% used)", not_full)
+}
+
+fun make_tiny_msgs(n, acc) {
+    if (n <= 0) { acc }
+    else { make_tiny_msgs(n - 1, list_append(acc, %{role: 'user', content: "hi"})) }
 }
 
 # ------------------------------------------------------------

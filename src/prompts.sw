@@ -35,12 +35,48 @@ fun system_prompt(cwd, tool_format) {
     } else {
         "\n\n=== TOOL-CALLING PROTOCOL ===\n" ++ protocol()
     }
+    # In native mode the request already carries every tool's name, description
+    # and parameters in its `tools` array — repeating the prose here is pure
+    # duplicated prefill (saved ~3k tokens/turn). Only inband needs the prose.
+    tools_section = if (tool_format == "native") {
+        "\n\n=== TOOLS ===\nYour tools — names, descriptions, and parameters — are defined in this request's `tools` array. Read them there; they are not repeated here."
+    } else {
+        "\n\n=== AVAILABLE TOOLS ===\n" ++ tool_descriptions()
+    }
+    # The sw idiom guide is ~3k tokens and only useful when the project is a
+    # sw/swarmrt codebase. Gate it on a cheap cwd probe so non-sw projects
+    # don't pay the prefill every turn (every extra token brings the
+    # prefill/compaction deadlock closer).
+    sw_section = if (is_sw_project(cwd) == 'true') {
+        "\n\n=== WRITING SW CODE ===\n" ++ sw_guide()
+    } else { "" }
     preamble() ++
     "\n\n=== ENVIRONMENT ===\n" ++ environment_section(cwd) ++
     protocol_section ++
-    "\n\n=== AVAILABLE TOOLS ===\n" ++ tool_descriptions() ++
-    "\n\n=== WRITING SW CODE ===\n" ++ sw_guide() ++
+    tools_section ++
+    sw_section ++
     "\n\n=== RULES ===\n" ++ rules()
+}
+
+# Does cwd look like a sw / swarmrt project? True when cwd OR cwd/src holds
+# any `.sw` file. Cheap (two dir listings), returns 'true'/'false'.
+fun is_sw_project(cwd) {
+    if (dir_has_sw(cwd) == 'true') { 'true' }
+    else { dir_has_sw(to_string(cwd) ++ "/src") }
+}
+
+fun dir_has_sw(dir) {
+    entries = file_list(dir)
+    if (entries == nil) { 'false' }
+    else { any_sw(entries) }
+}
+
+fun any_sw(entries) {
+    if (length(entries) == 0) { 'false' }
+    else {
+        if (string_ends_with(to_string(hd(entries)), ".sw") == 'true') { 'true' }
+        else { any_sw(tl(entries)) }
+    }
 }
 
 # ------------------------------------------------------------
@@ -726,6 +762,7 @@ fun rules() {
     "- If a task needs information, actually call the tool — NEVER make up file " ++
     "contents, command output, or URLs.\n" ++
     "- If an approach fails, diagnose why before switching. Don't retry blindly.\n" ++
+    "- Match reasoning depth to the task: for mechanical edits, act directly; don't re-derive a fact a tool can check (read the file instead of guessing line numbers or byte offsets).\n" ++
     "- Use absolute paths in tool arguments.\n" ++
     "- ALWAYS run_tests BEFORE git_commit when you have modified code. Fix " ++
     "failures before committing.\n\n" ++
