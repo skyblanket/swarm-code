@@ -551,6 +551,8 @@ fun main_loop(history, opts) {
             on_heartbeat_tick(count, history, opts)
         {'bg_done', task_id, exit_code, label} ->
             on_bg_done(task_id, exit_code, label, history, opts)
+        {'bg_stalled', task_id, label, tail} ->
+            on_bg_stalled(task_id, label, tail, history, opts)
         {'eof'} ->
             handle_eof(history, opts)
         _other ->
@@ -782,6 +784,42 @@ fun on_bg_done(task_id, exit_code, label, history, opts) {
     } else {
         print("  \e[38;5;240m⎿\e[0m  \e[38;5;244muse bg_result " ++ task_id ++ " to see output\e[0m")
         print("")
+        history
+    }
+}
+
+# Background task stall handler — a still-pending task whose log hasn't
+# grown for 45s and whose tail looks like an interactive prompt (it will
+# hang forever on /dev/null stdin). Mirrors on_bg_done's structure but
+# with a warning tint and a bg_stalled wake_event.
+fun on_bg_stalled(task_id, label, tail, history, opts) {
+    Log.bg_stalled(task_id, label, tail)
+    print_above("")
+    print_above(UI.warn_color() ++ "⏺" ++ UI.reset() ++ " \e[1mbg_stalled\e[0m " ++ task_id ++
+          "  \e[2m(" ++ label ++ ") — no output for 45s; tail looks interactive\e[0m")
+    print_above("  \e[2mbg_tail " ++ task_id ++ " / bg_kill " ++ task_id ++ "\e[0m")
+    print_above("")
+
+    autonomy = map_get(opts, 'autonomy')
+    in_wake = map_get(opts, 'in_wake_chain')
+    if (autonomy == 'true' && in_wake != 'true') {
+        wake_msg =
+            "<wake_event source=\"bg_stalled\">\n" ++
+            "Task " ++ task_id ++ " (" ++ label ++ ") has produced no output for " ++
+            "45s and its log tail looks like an interactive prompt.\n" ++
+            "Log tail:\n" ++ tail ++ "\n" ++
+            "</wake_event>\n\n" ++
+            "This background task may be waiting for interactive input. If the " ++
+            "tail shows a prompt you can answer non-interactively, kill it with " ++
+            "bg_kill and re-run the command with non-interactive flags (-y, " ++
+            "--yes, </dev/null, DEBIAN_FRONTEND=noninteractive, etc.). If it is " ++
+            "legitimately slow (compiles, downloads), leave it running."
+
+        print("\e[2m[autonomy: reacting to bg_stalled...]\e[0m")
+        with_wake = list_append(history, LLM.new_message_user(wake_msg))
+        wake_opts = map_put(opts, 'in_wake_chain', 'true')
+        run_turn(with_wake, wake_opts, 0)
+    } else {
         history
     }
 }

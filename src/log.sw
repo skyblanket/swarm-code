@@ -20,6 +20,7 @@ import Util
 #   - tool_call       {name, args_raw, args_preview}
 #   - tool_result     {name, chars, truncated, had_error}
 #   - bg_done         {task_id, exit, label}
+#   - bg_stalled      {task_id, label, tail}
 #   - heartbeat       {count, uptime_ms}   (sampled 1-in-10)
 #   - compaction      {before, after}
 #   - permission      {tool, decision}
@@ -33,7 +34,7 @@ export [
     user_input,
     llm_request, llm_response, llm_error,
     tool_call, tool_result,
-    bg_done, compaction, permission,
+    bg_done, bg_stalled, compaction, permission,
     tail_recent, summarize,
     redact
 ]
@@ -142,6 +143,15 @@ fun bg_done(task_id, exit_code, label) {
         task_id: task_id,
         exit: exit_code,
         label: label
+    })
+}
+
+fun bg_stalled(task_id, label, tail) {
+    event(%{
+        type: "bg_stalled",
+        task_id: task_id,
+        label: label,
+        tail: truncate(tail, 300)
     })
 }
 

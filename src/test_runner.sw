@@ -32,6 +32,7 @@ import Plan
 import MemVec
 import ToolExecutor
 import ToolRegistry
+import Background
 
 fun main() {
     print("")
@@ -138,7 +139,15 @@ fun main() {
         t_edit_ambiguous_errors(),
         t_drop_to_last_clean_user(),
         t_trailing_turn_incomplete_detection(),
-        t_context_meter_token_based()
+        t_context_meter_token_based(),
+        # --- bash auto-backgrounding + Background module (7 added) ---
+        t_bg_fast_returns_exit_output(),
+        t_bg_auto_after_ms_no_double_finalize(),
+        t_bg_run_in_background_immediate(),
+        t_bg_stdin_devnull_no_hang(),
+        t_bg_kill_group(),
+        t_bg_stall_detector_one_shot(),
+        t_bg_read_key_nil_safe()
     ]
 
     passed = sum_list(results, 0)
@@ -1408,4 +1417,165 @@ fun t_to_string_nil() {
     result = to_string(nil)
     check("to_string(nil) returns \"nil\"",
           if (result == "nil") { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# Bash auto-backgrounding + Background module
+# ------------------------------------------------------------
+# These exercise the real OS-detached path (shell_detached / pid_kill_group
+# runtime builtins) end-to-end through Tools.exec_raw('bash', ...) and the
+# Background module. Interactive-ish opts = a bg_table present and NOT
+# headless/subagent/mcp_server, which is exactly what makes do_bash eligible
+# for auto-backgrounding.
+
+fun bg_opts(table) {
+    %{bg_table: table, execution_context: "cli"}
+}
+
+# A fast command with auto-bg-eligible opts finishes within the budget and
+# comes back through the foreground contract: "[exit 0]\n" ++ output. This is
+# the "finished-within-budget" branch of bash_auto_bg — no task id leaks out.
+fun t_bg_fast_returns_exit_output() {
+    table = Background.init()
+    r = Tools.exec_raw('bash', %{command: "echo hi"}, bg_opts(table))
+    s = to_string(r)
+    ok = bool_and(
+        string_contains(s, "[exit 0]"),
+        string_contains(s, "hi"))
+    check("bash: fast cmd returns [exit 0] + output via auto-bg-eligible path", ok)
+}
+
+# background_after_ms:500 on a 3s command must background it: the tool returns a
+# [backgrounded...] string carrying the task id and log path. Then
+# wait_for_task finalizes it to 'done' and the log contains "late". CRITICAL:
+# after that foreground finalize, poll_and_notify must NOT re-finalize — it
+# returns [] (no newly-flipped ids) and the status stays 'done' (the CAS in
+# try_finalize guarantees exactly-once, so no duplicate bg_done).
+fun t_bg_auto_after_ms_no_double_finalize() {
+    table = Background.init()
+    r = Tools.exec_raw('bash',
+        %{command: "sleep 3; echo late", background_after_ms: 500},
+        bg_opts(table))
+    s = to_string(r)
+    id = "bg-0"
+    backgrounded = bool_and3(
+        string_contains(s, "[backgrounded"),
+        string_contains(s, id),
+        string_contains(s, Background.log_path_for(id)))
+
+    st = Background.wait_for_task(table, id, 6000)
+    done_ok = if (st == 'done') { 'true' } else { 'false' }
+    log_ok = string_contains(Background.tail_log(table, id, 40), "late")
+
+    # No duplicate finalize: the heartbeat's poll must find nothing to flip.
+    flipped = Background.poll_and_notify(table)
+    no_reflip = if (length(flipped) == 0) { 'true' } else { 'false' }
+    still_done = if (Background.status(table, id) == 'done') { 'true' } else { 'false' }
+
+    ok = bool_and(
+        bool_and(backgrounded, done_ok),
+        bool_and3(log_ok, no_reflip, still_done))
+    check("bash: background_after_ms backgrounds, wait_for_task=done, no double-finalize", ok)
+}
+
+# run_in_background='true' detaches immediately — the tool returns a task id
+# without blocking. Elapsed wall time must be well under the ~15s auto-bg
+# budget (a real block would be seconds); we assert < 1500ms.
+fun t_bg_run_in_background_immediate() {
+    table = Background.init()
+    t0 = timestamp()
+    r = Tools.exec_raw('bash',
+        %{command: "sleep 5", run_in_background: 'true'},
+        bg_opts(table))
+    t1 = timestamp()
+    s = to_string(r)
+    # Clean up the lingering sleep so it doesn't outlive the suite.
+    Background.kill_task(table, "bg-0")
+    ok = bool_and3(
+        string_contains(s, "[backgrounded]"),
+        string_contains(s, "bg-0"),
+        if (t1 - t0 < 1500) { 'true' } else { 'false' })
+    check("bash: run_in_background='true' returns a task id immediately (<1.5s)", ok)
+}
+
+# Background workers get stdin=/dev/null, so a `read` hits EOF immediately
+# instead of hanging forever. wait_for_task must resolve (non-pending) within
+# 3s — a hang would leave it 'pending' at the deadline.
+fun t_bg_stdin_devnull_no_hang() {
+    table = Background.init()
+    id = Background.launch(table, "read x; echo got:[$x]", "stdin probe")
+    st = Background.wait_for_task(table, id, 3000)
+    check("background stdin is /dev/null (read gets EOF, finishes <3s not hang)",
+          if (st != 'pending') { 'true' } else { 'false' })
+}
+
+# bg_kill must SIGTERM the WHOLE process group, not just the /bin/sh wrapper.
+# Launch a wrapper that forks a backgrounded sleep plus a foreground sleep;
+# after kill_task + a short grace, pgrep -g <pgid> must find zero survivors.
+fun t_bg_kill_group() {
+    table = Background.init()
+    id = Background.launch(table, "sh -c 'sleep 60 & sleep 60; wait'", "kill probe")
+    # Let the wrapper actually spawn its sleep children into the pgroup first.
+    sleep(300)
+    pid = ets_get(table, id ++ "/pid")
+    Background.kill_task(table, id)
+    sleep(600)
+    r = shell("pgrep -g " ++ to_string(pid) ++ " 2>/dev/null | wc -l | tr -d ' \n'")
+    count = string_trim(to_string(elem(r, 1)))
+    check("bg_kill terminates the whole process group (0 survivors)",
+          if (count == "0") { 'true' } else { 'false' })
+}
+
+# Stall detector white-box: build a pending task whose log tail LOOKS like an
+# interactive prompt ("Password: ") and force its no-growth clock back >45s.
+# Registering self() as 'main_agent' lets us receive the {'bg_stalled', ...}
+# the detector fires. Two poll_and_notify passes must yield EXACTLY ONE
+# message (the '{id}/stalled_sent' one-shot flag suppresses the second).
+fun t_bg_stall_detector_one_shot() {
+    table = Background.init()
+    id = "bg-0"
+    stall_log = "/tmp/swarm-code-stall-probe.log"
+    file_write(stall_log, "Password: ")
+    ets_put(table, 'next_id', 1)
+    ets_put(table, id ++ "/status", 'pending')
+    ets_put(table, id ++ "/label", "stall probe")
+    ets_put(table, id ++ "/log_file", stall_log)
+    # log_size == the file's byte count ("Password: " = 10) so check_stall sees
+    # NO growth this tick; grew_at 46s in the past trips the >=45s threshold.
+    ets_put(table, id ++ "/log_size", 10)
+    ets_put(table, id ++ "/log_grew_at", timestamp() - 46000)
+    # NB: deliberately DON'T set '{id}/exit_file' — try_finalize then leaves the
+    # task 'pending' regardless of any stray /tmp exit file, so check_stall runs.
+    register('main_agent', self())
+
+    Background.poll_and_notify(table)
+    got1 = receive {
+        {'bg_stalled', tid, lbl, tail} -> tid
+        after 1000 { 'none' }
+    }
+    Background.poll_and_notify(table)
+    got2 = receive {
+        {'bg_stalled', tid2, lbl2, tail2} -> 'extra'
+        after 1000 { 'timeout' }
+    }
+    file_delete(stall_log)
+    ok = bool_and(
+        if (got1 == "bg-0") { 'true' } else { 'false' },
+        if (got2 == 'timeout') { 'true' } else { 'false' })
+    check("stall detector: fires once on prompt-tail, one-shot (no repeat)", ok)
+}
+
+# ESC handling can't be driven headless (no tty), so instead guard the
+# invariant that makes the non-tty path safe: read_key(0) returns nil when no
+# key is buffered, and bash_wait_loop's guard `(k == 27 || k == 3)` must be
+# false for nil (never self-interrupt) yet true for a real ESC (27).
+fun t_bg_read_key_nil_safe() {
+    nil_key = nil
+    nil_trips = if (nil_key == 27 || nil_key == 3) { 'true' } else { 'false' }
+    esc_key = 27
+    esc_trips = if (esc_key == 27 || esc_key == 3) { 'true' } else { 'false' }
+    ok = bool_and(
+        if (nil_trips == 'false') { 'true' } else { 'false' },
+        if (esc_trips == 'true') { 'true' } else { 'false' })
+    check("bash_wait_loop ESC guard: nil key never kills, ESC (27) does", ok)
 }

@@ -78,8 +78,15 @@ fun bash_s() {
     tool("bash",
         "Execute a shell command. Use for running tests, builds, git, file " ++
         "operations, and any other system task. Commands run in /bin/sh with " ++
-        "a 120s default timeout.",
-        obj(%{command: s("The shell command to execute")}, ["command"]))
+        "a 120s default timeout. A command still running after ~15s is " ++
+        "auto-backgrounded: you get a task id + log path back and a bg_done " ++
+        "wake fires when it finishes — never poll it with sleep loops.",
+        obj(%{
+            command: s("The shell command to execute"),
+            timeout_ms: i("Optional: foreground timeout in ms (1000..600000, default 120000). Superseded once a command auto-backgrounds."),
+            run_in_background: b("Optional: run fully detached, return a task id immediately (don't wait)"),
+            background_after_ms: i("Optional: how long to wait in the foreground before auto-backgrounding; default 15000, 0 = never background (block like classic bash)")
+        }, ["command"]))
 }
 
 fun read_s() {

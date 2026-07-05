@@ -83,7 +83,7 @@ fun find_handler(entries, name) {
 # ============================================================
 fun all_tools() {
     [
-        %{atom: 'bash',               handler: fun(args, opts) { do_bash(args) }},
+        %{atom: 'bash',               handler: fun(args, opts) { do_bash(args, opts) }},
         %{atom: 'read',               handler: fun(args, opts) { do_read(args) }},
         %{atom: 'write',              handler: fun(args, opts) { do_write(args) }},
         %{atom: 'edit',               handler: fun(args, opts) { do_edit(args) }},
@@ -261,9 +261,21 @@ fun digit_of(ch) {
 # cap but blow the model's effective context anyway. The truncation
 # marker tells the model to use a tighter query next time.
 #
-# Accepts an optional `timeout_ms` (1000..600000, default 120000).
-# Hanging commands are killed via SIGALRM and the model is told to
-# retry with a larger budget.
+# Accepts an optional `timeout_ms` (1000..600000, default 120000) that
+# bounds the classic foreground path: a hung command has its whole
+# process group killed by shell_managed and the model is told to retry
+# with a larger budget.
+#
+# Claude-Code-style auto-background: in an interactive session (bg_table
+# present, not headless / subagent / mcp_server) a command that is still
+# running after `background_after_ms` (default 15000; 0 = never) is
+# detached into a Background task and control returns to the model with a
+# task id + log path — a heartbeat `bg_done` wake fires when it finishes.
+# ESC during the foreground wait kills the whole process group. In that
+# auto-background path `timeout_ms` is SUPERSEDED: the task is NOT killed
+# at timeout, it is backgrounded and keeps running; the 600s foreground
+# ceiling only applies to the shell_managed (foreground) path. Pass
+# `run_in_background: true` to detach immediately without waiting.
 #
 # Non-interactive by default. Every command runs with:
 #   * stdin redirected from /dev/null (no tool can read from a tty)
@@ -271,9 +283,8 @@ fun digit_of(ch) {
 # This prevents scaffolders like `npm create vite`, `cargo new`,
 # `yarn create`, and apt from hanging on prompts that would never
 # be answered. CI=1 also makes most tools skip interactive wizards.
-fun do_bash(args) {
+fun do_bash(args, opts) {
     cmd = map_get(args, 'command')
-    timeout_raw = map_get(args, 'timeout_ms')
     if (cmd == nil) {
         "error: missing 'command' argument"
     } else {
@@ -288,23 +299,159 @@ fun do_bash(args) {
             "error: sudo is disabled — set SWARM_CODE_ALLOW_SUDO=1 to enable (acknowledge that an agent running sudo is high-risk)"
         }
         else {
-            t_s = resolve_bash_timeout_s(timeout_raw)
-            user_cmd = cmd_s
-            # Keep the non-interactive env + stdin</dev/null + 2>&1 hardening,
-            # but hand the timeout AND the kill to shell_managed instead of the
-            # perl alarm: the alarm only SIGALRMs the single exec'd process, so
-            # node/python/server grandchildren leaked and kept running. shell_managed
-            # runs the command in its own process group, enforces the timeout in C,
-            # killpg's the WHOLE tree on timeout, and lets a user ESC stop a hung
-            # command mid-run (the alarm could never be cut short).
-            noninteractive = noninteractive_wrap(user_cmd)
-            r = shell_managed(noninteractive, t_s * 1000)
-            code = elem(r, 0)
-            out = elem(r, 1)
-            interrupted = elem(r, 2)
-            line_capped = truncate_output_lines(out, bash_max_lines())
-            byte_capped = truncate_output(line_capped, bash_output_cap())
-            format_managed_result(code, byte_capped, t_s, interrupted)
+            bg_table = map_get(opts, 'bg_table')
+            run_bg = bash_run_in_background(args)
+            after_ms = bash_background_after_ms(args)
+            eligible = bash_auto_bg_eligible(opts, bg_table)
+            # Explicit detach wins: return a task id immediately.
+            if (run_bg == 'true' && bg_table != nil) {
+                bash_launch_bg(bg_table, cmd_s)
+            } else {
+                # Auto-background only in an interactive session and only when
+                # the caller didn't set background_after_ms=0 (which pins the
+                # classic blocking path). Otherwise: EXACTLY the old foreground.
+                auto = if (eligible == 'true' && after_ms > 0) { 'true' } else { 'false' }
+                if (auto == 'true') {
+                    bash_auto_bg(bg_table, cmd_s, after_ms)
+                } else {
+                    bash_foreground(cmd_s, map_get(args, 'timeout_ms'))
+                }
+            }
+        }
+    }
+}
+
+# Classic blocking path: run under shell_managed with the resolved timeout.
+# shell_managed runs the command in its own process group, enforces the
+# timeout in C, killpg's the WHOLE tree on timeout, and lets a user ESC stop
+# a hung command mid-run. This is byte-for-byte the pre-auto-bg behaviour.
+fun bash_foreground(user_cmd, timeout_raw) {
+    t_s = resolve_bash_timeout_s(timeout_raw)
+    noninteractive = noninteractive_wrap(user_cmd)
+    r = shell_managed(noninteractive, t_s * 1000)
+    code = elem(r, 0)
+    out = elem(r, 1)
+    interrupted = elem(r, 2)
+    line_capped = truncate_output_lines(out, bash_max_lines())
+    byte_capped = truncate_output(line_capped, bash_output_cap())
+    format_managed_result(code, byte_capped, t_s, interrupted)
+}
+
+# run_in_background arrives from JSON as atom 'true'/'false' OR a "true"
+# string — belt-and-braces both (the atom/string trap that shipped a bug).
+fun bash_run_in_background(args) {
+    b = map_get(args, 'run_in_background')
+    if (b == 'true') { 'true' }
+    else { if (to_string(b) == "true") { 'true' } else { 'false' } }
+}
+
+# background_after_ms: nil → 15000; 0 → disables auto-bg (blocking path);
+# otherwise clamped to [500, 600000]. Non-numeric junk falls back to default.
+fun bash_background_after_ms(args) {
+    raw = map_get(args, 'background_after_ms')
+    if (raw == nil) { 15000 }
+    else {
+        parsed = parse_int_safe(to_string(raw), 15000)
+        if (parsed == 0) { 0 }
+        else { if (parsed < 500) { 500 }
+        else { if (parsed > 600000) { 600000 } else { parsed } } }
+    }
+}
+
+# Auto-bg is interactive-only: needs a bg_table and must NOT be headless,
+# a subagent, or the mcp_server context. execution_context is a STRING —
+# compare via to_string (atom 'x' == "x" is always false, silently).
+fun bash_auto_bg_eligible(opts, bg_table) {
+    if (bg_table == nil) { 'false' }
+    else { if (map_get(opts, 'headless') == 'true') { 'false' }
+    else { if (map_get(opts, 'is_subagent') == 'true') { 'false' }
+    else { if (to_string(map_get(opts, 'execution_context')) == "mcp_server") { 'false' }
+    else { 'true' } } } }
+}
+
+# First ~40 chars of the command as a human label.
+fun bash_label(cmd_s) {
+    if (string_length(cmd_s) <= 40) { cmd_s } else { string_sub(cmd_s, 0, 40) }
+}
+
+# Explicit detach — launch and return a task id immediately, no wait.
+fun bash_launch_bg(bg_table, cmd_s) {
+    id = Background.launch(bg_table, cmd_s, bash_label(cmd_s))
+    # launch returns an "error: ..." STRING if shell_detached failed — surface
+    # it directly instead of treating the error string as a task id.
+    if (string_starts_with(to_string(id), "error") == 'true') { id }
+    else {
+        "[backgrounded] task " ++ id ++ " — log: " ++ Background.log_path_for(id) ++
+            "\n(bg_tail / bg_result / bg_kill to manage; you'll get a bg_done wake when it finishes)"
+    }
+}
+
+# Auto-background: launch detached, then wait up to after_ms in the
+# foreground. Three outcomes: finished within budget (format like the
+# foreground contract), ESC (kill the whole pgroup, return partial tail),
+# or budget exhausted (leave it running so the heartbeat's bg_done fires).
+fun bash_auto_bg(bg_table, cmd_s, after_ms) {
+    id = Background.launch(bg_table, cmd_s, bash_label(cmd_s))
+    # launch returns an "error: ..." STRING if shell_detached failed — surface
+    # it directly (no task exists to wait on, claim, or release).
+    if (string_starts_with(to_string(id), "error") == 'true') { id }
+    else {
+        # Claim the task so the heartbeat's poll_loop won't finalize it out from
+        # under us and fire a spurious bg_done: this foreground wait owns the
+        # result until we return it or hand the task off to the heartbeat.
+        Background.fg_claim(bg_table, id)
+        deadline = timestamp() + after_ms
+        outcome = bash_wait_loop(bg_table, id, deadline)
+        if (outcome == 'esc') {
+            # kill_task already fired inside the loop; release + hand back tail.
+            Background.fg_release(bg_table, id)
+            "[interrupted] bash stopped by user (ESC)\n" ++
+                Background.tail_log(bg_table, id, 40)
+        } else {
+            if (outcome == 'pending') {
+                # Budget exhausted → hand off to the heartbeat: release the claim
+                # so poll_loop can finalize it and fire bg_done on completion.
+                Background.fg_release(bg_table, id)
+                path = Background.log_path_for(id)
+                "[backgrounded after " ++ to_string(after_ms / 1000) ++ "s] still running — task " ++
+                    id ++ ", log: " ++ path ++ "\n\nlast output:\n" ++
+                    Background.tail_log(bg_table, id, 20) ++
+                    "\n(bg_tail " ++ id ++ " to watch; bg_kill to stop; a bg_done wake fires on completion)"
+            } else {
+                # done / error (natural completion) → we finalized it ourselves in
+                # bash_wait_loop, so release the claim (poll_loop skips non-pending
+                # tasks anyway) and match the foreground contract: "[exit N]\n" ++
+                # log, capped by lines then bytes exactly like bash_foreground.
+                Background.fg_release(bg_table, id)
+                exit_code = ets_get(bg_table, id ++ "/exit")
+                log_out = Background.tail_log(bg_table, id, 400)
+                line_capped = truncate_output_lines(log_out, bash_max_lines())
+                byte_capped = truncate_output(line_capped, bash_output_cap())
+                "[exit " ++ to_string(exit_code) ++ "]\n" ++ byte_capped
+            }
+        }
+    }
+}
+
+# Self-tail-recursive foreground wait (deadline carried as an arg so it's a
+# pure self tail-call — mutual recursion isn't TCO'd). Each round: finalize
+# the task ourselves (no bg_done — we own the result if it finished here);
+# if it left 'pending', poll stdin for a bare ESC / Ctrl-C (read_key is a
+# no-op nil when not interactive), then honour the deadline and sleep.
+fun bash_wait_loop(bg_table, id, deadline) {
+    st = Background.finalize_if_done(bg_table, id)
+    if (st != 'pending') { st }
+    else {
+        k = read_key(0)
+        if (k == 27 || k == 3) {
+            Background.kill_task(bg_table, id)
+            'esc'
+        } else {
+            if (timestamp() >= deadline) { 'pending' }
+            else {
+                sleep(150)
+                bash_wait_loop(bg_table, id, deadline)
+            }
         }
     }
 }

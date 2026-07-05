@@ -516,9 +516,11 @@ fun session_search_desc() {
 }
 
 fun background_desc() {
-    "- background: Kick off a shell command as an async sw process and return " ++
-    "immediately with a task id. Use for long-running jobs (npm install, " ++
-    "pytest, cargo build, training runs) that shouldn't block the conversation.\n" ++
+    "- background: Kick off a shell command as a detached OS process and return " ++
+    "immediately with a task id. Mostly redundant now that bash auto-backgrounds " ++
+    "after ~15s (and takes run_in_background:true) — prefer plain bash and let it " ++
+    "background itself; reach for this only when you want to fire-and-forget from " ++
+    "the very first tick. A bg_done wake fires on completion; bg_tail/bg_result to inspect.\n" ++
     "  schema: {\"command\":\"string\",\"label\":\"string\"}"
 }
 
@@ -641,18 +643,19 @@ fun bash_desc() {
     "Still, pass explicit flags where you can: `-y`, `--yes`, `--force`, " ++
     "`--non-interactive`. Never run tools that genuinely need a tty (vim, " ++
     "less, watch, tail -f, ssh session, docker run -it) — they error out.\n" ++
-    "  TIMEOUT: every bash call is guarded by a per-command alarm. Default " ++
-    "is 120000ms (2 minutes); you can pass timeout_ms up to 600000 (10 min) " ++
-    "for long-running jobs like test suites or builds. On timeout the " ++
-    "process is killed with SIGALRM and partial output is returned with a " ++
-    "`[timed out after Xs]` banner — retry with a larger timeout_ms if you " ++
-    "genuinely need more.\n" ++
-    "  IMPORTANT: For builds, installs, and any command that takes >30s " ++
-    "(npm run build, cargo build, pip install, docker build, make, test " ++
-    "suites), use the `background` tool instead of bash. Bash blocks the " ++
-    "entire agent until the command finishes. Background launches it in a " ++
-    "detached process so you can continue working and check results later " ++
-    "with bg_status/bg_result.\n" ++
+    "  AUTO-BACKGROUND: a command still running after ~15s is detached into a " ++
+    "background task automatically — you get back a `[backgrounded after 15s]` " ++
+    "line with a task id + log path, and a bg_done message wakes you the moment " ++
+    "it finishes. So just run builds/installs/tests directly with bash; do NOT " ++
+    "poll them with `sleep` loops or repeated bg_status — wait for the bg_done " ++
+    "wake, then bg_tail/bg_result the task id. Pass run_in_background:true to " ++
+    "detach instantly, or background_after_ms:0 to force classic blocking (a " ++
+    "short command still returns inline with `[exit N]`).\n" ++
+    "  TIMEOUT: the foreground wait is bounded by timeout_ms (default 120000ms, " ++
+    "max 600000) — but that only matters for the classic blocking path; once a " ++
+    "command auto-backgrounds it keeps running past the timeout and is never " ++
+    "killed. On a genuine foreground timeout the whole process group is killed " ++
+    "and partial output is returned with a `[timed out after Xs]` banner.\n" ++
     "  COMMON MISTAKES TO AVOID:\n" ++
     "  * find REQUIRES a quoted pattern after -name: find ~ -name \"*.py\" " ++
     "(NOT: find ~ -name). Without a pattern after -name, find errors out.\n" ++
@@ -673,7 +676,7 @@ fun bash_desc() {
     "    find . -maxdepth 3 -type d -name \".git\" 2>/dev/null\n" ++
     "    grep -rn \"fn main\" src/\n" ++
     "    ls -la ./README.md\n" ++
-    "  schema: {\"command\":\"string\",\"timeout_ms\":\"number (optional, default 120000, max 600000)\"}"
+    "  schema: {\"command\":\"string\",\"timeout_ms\":\"number (optional, default 120000, max 600000)\",\"run_in_background\":\"boolean (optional, detach immediately)\",\"background_after_ms\":\"number (optional, default 15000, 0 = never background)\"}"
 }
 
 fun read_desc() {
