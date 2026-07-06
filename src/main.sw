@@ -47,6 +47,7 @@ import Mcp
 import ToolGuardrails
 import McpServer
 import Version
+import Util
 
 fun main() {
     # MCP server mode: `swarm --mcp-server` boots as a stdio JSON-RPC
@@ -722,7 +723,18 @@ fun parse_max_tokens_env(s, i, acc, saw) {
 
 fun resolve_cwd() {
     cwd_env = getenv("SWARM_CODE_CWD")
-    if (cwd_env == nil) { "." } else { cwd_env }
+    if (cwd_env != nil) {
+        raw = elem(shell("cd " ++ Util.shell_q(to_string(cwd_env)) ++
+                         " && pwd || echo " ++ Util.shell_q(to_string(cwd_env))), 1)
+        string_trim(to_string(raw))
+    } else {
+        pwd_env = getenv("PWD")
+        if (pwd_env != nil) {
+            to_string(pwd_env)
+        } else {
+            string_trim(elem(shell("pwd"), 1))
+        }
+    }
 }
 
 # ============================================================
@@ -756,8 +768,6 @@ fun verify_network_isolation(url, api_key) {
         "ok"
     }
     else { if (has_auth == 'true') {
-        # User supplied an API key → intentional remote provider.
-        print(" \e[38;5;214m⚠ remote endpoint " ++ host ++ " (auth via API key)\e[0m")
         "ok"
     }
     else {
