@@ -22,6 +22,7 @@ module Main
 import Markdown
 import LLM
 import Config
+import UI
 import Memory
 import Tools
 import Mcp
@@ -147,7 +148,64 @@ fun main() {
         t_bg_stdin_devnull_no_hang(),
         t_bg_kill_group(),
         t_bg_stall_detector_one_shot(),
-        t_bg_read_key_nil_safe()
+        t_bg_read_key_nil_safe(),
+        # --- Wave-4 surfaces & discoverability (7 added) ---
+        t_slash_shape_command_vs_path(),
+        t_known_slash_new_commands(),
+        t_mode_cycle_order(),
+        t_session_mode_get_set(),
+        t_auto_accept_edits_permission(),
+        t_bg_normalize_id(),
+        t_expand_and_bg_smoke(),
+        # --- Wave-1B stream_feed / stream_flush (7 added) ---
+        t_sf_midword_split(),
+        t_sf_mid_marker_split(),
+        t_sf_tilde_fence_keeps_backticks(),
+        t_sf_heading_selfcloses(),
+        t_sf_unterminated_fence_flush(),
+        t_sf_stream_vs_batch_chunked(),
+        t_sf_reason_never_in_content(),
+        # --- Wave-1A worker-routed stream timeout (2 added) ---
+        t_stream_timeout_transient(),
+        t_llm_timeout_config(),
+        # --- Wave-3 markdown inline/blocks (10 added) ---
+        t_md_italic_variants(),
+        t_md_bold_underscore(),
+        t_md_strike(),
+        t_md_escapes(),
+        t_md_indented_code(),
+        t_md_nested_quote(),
+        t_md_cjk_table(),
+        t_md_osc8_link(),
+        t_md_tilde_lang_label(),
+        t_md_code_wrap_arrow(),
+        # --- Wave-3 LCS edit diff (5 added) ---
+        t_diff_single_change(),
+        t_diff_insert(),
+        t_diff_delete(),
+        t_diff_identical(),
+        t_diff_fallback_and_write(),
+        # --- Wave-4 surfaces follow-ups (4 added) ---
+        t_bg_dispatch_tail_kill(),
+        t_route_unknown_slash_no_chat(),
+        t_auto_accept_hardline_denied(),
+        t_expand_full_content(),
+        # --- Wave-2C input builtins (3 added) ---
+        t_stdin_ring_roundtrip_utf8(),
+        t_rl_history_cap_1000(),
+        t_rl_history_append_rules(),
+        # --- test-phase gap fills (4 added) ---
+        t_sf_stream_vs_batch_random(),
+        t_sf_utf8_midchar_split(),
+        t_stream_timeout_after_activity(),
+        # --- fixer wave: review-finding regression locks (7 added) ---
+        t_stream_activity_rearms_deadline(),
+        t_stream_stale_chunks_dont_rearm(),
+        t_stream_err_not_content(),
+        t_deny_session_beats_auto_accept(),
+        t_route_toplevel_path_not_command(),
+        t_sf_blank_run_equiv(),
+        t_sf_four_backtick_fence()
     ]
 
     passed = sum_list(results, 0)
@@ -1578,4 +1636,830 @@ fun t_bg_read_key_nil_safe() {
         if (nil_trips == 'false') { 'true' } else { 'false' },
         if (esc_trips == 'true') { 'true' } else { 'false' })
     check("bash_wait_loop ESC guard: nil key never kills, ESC (27) does", ok)
+}
+
+# ------------------------------------------------------------
+# Wave-4 — surfaces & discoverability
+# ------------------------------------------------------------
+
+fun eqs(a, b) { if (a == b) { 'true' } else { 'false' } }
+
+# Command-shape test that gates the unknown-slash nudge: /halp is a typo,
+# /Users/... /tmp/a.png and bare / are paths/other and fall through to chat.
+fun t_slash_shape_command_vs_path() {
+    cmd_ok = bool_and3(
+        Agent.looks_like_slash_command("/halp"),
+        Agent.looks_like_slash_command("/mode"),
+        Agent.looks_like_slash_command("/export-trajectory"))  # hyphen allowed
+    path_rejected = bool_and(
+        bool_and(
+            eqs(Agent.looks_like_slash_command("/Users/sky/x"), 'false'),
+            eqs(Agent.looks_like_slash_command("/tmp/a.png"), 'false')),
+        bool_and(
+            eqs(Agent.looks_like_slash_command("/"), 'false'),
+            eqs(Agent.looks_like_slash_command("hello"), 'false')))
+    check("unknown-slash: /halp is command-shaped, paths/bare-/ are not",
+          bool_and(cmd_ok, path_rejected))
+}
+
+fun t_known_slash_new_commands() {
+    ok = bool_and(
+        bool_and3(
+            Agent.is_known_slash_command("/bg"),
+            Agent.is_known_slash_command("/mode"),
+            Agent.is_known_slash_command("/expand")),
+        eqs(Agent.is_known_slash_command("/nope"), 'false'))
+    check("/bg /mode /expand recognized; /nope is not", ok)
+}
+
+fun t_mode_cycle_order() {
+    ok = bool_and3(
+        eqs(Agent.next_mode("default"), "auto-accept-edits"),
+        eqs(Agent.next_mode("auto-accept-edits"), "plan"),
+        eqs(Agent.next_mode("plan"), "default"))
+    check("/mode cycles default → auto-accept-edits → plan → default", ok)
+}
+
+fun t_session_mode_get_set() {
+    tbl = ets_new()
+    o = %{perms_table: tbl}
+    m0 = Agent.get_session_mode(o)
+    Agent.set_session_mode(o, "plan")
+    m1 = Agent.get_session_mode(o)
+    m2 = Agent.get_session_mode(%{})   # no table → default
+    ok = bool_and3(eqs(m0, "default"), eqs(m1, "plan"), eqs(m2, "default"))
+    check("session mode get/set round-trips via perms_table ETS", ok)
+}
+
+# auto-accept-edits approves edit/write/multi_edit that would otherwise ASK,
+# and ONLY those — a non-edit tool still routes to the (reader-less → deny)
+# ask path. Uses settings.permissions.edit="ask" so check_permission returns
+# 'ask' (edits default to 'allow', where there'd be nothing to auto-accept).
+fun t_auto_accept_edits_permission() {
+    tbl = ets_new()
+    base = %{settings: %{permissions: %{edit: "ask"}}, perms_table: tbl, headless: 'false'}
+    d1 = Agent.resolve_permission('edit', %{path: "/tmp/x"}, base)   # default mode → deny (no reader)
+    Agent.set_session_mode(base, "auto-accept-edits")
+    d2 = Agent.resolve_permission('edit', %{path: "/tmp/x"}, base)   # auto-edits → allow
+    d3 = Agent.resolve_permission('mcp__x__y', %{}, base)            # non-edit, ask → deny
+    ok = bool_and3(eqs(d1, 'deny'), eqs(d2, 'allow'), eqs(d3, 'deny'))
+    check("auto-accept-edits allows edit-only, leaves other ask-tools denied", ok)
+}
+
+fun t_bg_normalize_id() {
+    ok = bool_and(
+        eqs(Agent.bg_normalize_id("3"), "bg-3"),
+        eqs(Agent.bg_normalize_id("bg-3"), "bg-3"))
+    check("/bg id normalize: bare '3' → 'bg-3', 'bg-3' unchanged", ok)
+}
+
+# Smoke the /expand and /bg dispatch paths end-to-end (they print + return 'ok').
+fun t_expand_and_bg_smoke() {
+    e_empty = Agent.show_expand(%{})                               # nothing stashed
+    et = ets_new()
+    ets_put(et, 'last_tool_output', "line1\nline2\nline3")
+    e_full = Agent.show_expand(%{expand_table: et})                # reprints uncapped
+    bg_list = Agent.handle_bg_command("/bg", %{bg_table: Background.init()})
+    bg_none = Agent.handle_bg_command("/bg", %{})                  # no table → graceful
+    ok = bool_and(
+        bool_and(eqs(e_empty, 'ok'), eqs(e_full, 'ok')),
+        bool_and(eqs(bg_list, 'ok'), eqs(bg_none, 'ok')))
+    check("/expand and /bg dispatch paths run and return ok", ok)
+}
+
+# ------------------------------------------------------------
+# Wave-1B — Markdown.stream_feed / stream_flush
+# ------------------------------------------------------------
+# All feed tests use a fresh ETS table (the session stream_state_table
+# stand-in); stream_feed returns the rendered segment at each block
+# boundary or nil, and stream_flush renders the remainder + resets.
+
+fun bool_not(b) { if (b == 'true') { 'false' } else { 'true' } }
+
+# A word split across two chunks must come out joined — boundaries are
+# detected over COMPLETE lines only, so the mid-word split can't emit.
+fun t_sf_midword_split() {
+    tbl = ets_new()
+    r1 = Markdown.stream_feed(tbl, "Hello wo")
+    r2 = Markdown.stream_feed(tbl, "rld")
+    r3 = Markdown.stream_feed(tbl, "\n\nSecond block\n")
+    fl = Markdown.stream_flush(tbl)
+    ok = bool_and(
+        bool_and(
+            if (r1 == nil && r2 == nil) { 'true' } else { 'false' },
+            if (r3 != nil && string_contains(to_string(r3), "Hello world") == 'true') { 'true' } else { 'false' }),
+        bool_and(
+            if (r3 != nil && string_contains(to_string(r3), "Second block") == 'false') { 'true' } else { 'false' },
+            if (fl != nil && string_contains(to_string(fl), "Second block") == 'true') { 'true' } else { 'false' }))
+    check("stream_feed: mid-word chunk split joins, blank-line boundary emits", ok)
+}
+
+# A fence marker split across chunks ("``" + "`") must not misfire; the
+# block emits only at the real toggle-close.
+fun t_sf_mid_marker_split() {
+    tbl = ets_new()
+    r1 = Markdown.stream_feed(tbl, "```sw\nco")
+    r2 = Markdown.stream_feed(tbl, "de()\n``")
+    r3 = Markdown.stream_feed(tbl, "`\nafter para\n\n")
+    s3 = to_string(r3)
+    ok = bool_and(
+        bool_and(
+            if (r1 == nil && r2 == nil) { 'true' } else { 'false' },
+            if (r3 != nil && string_contains(s3, "code()") == 'true') { 'true' } else { 'false' }),
+        bool_and(
+            string_contains(s3, "│"),
+            string_contains(s3, "after para")))
+    check("stream_feed: mid-fence-marker split waits for the real close", ok)
+}
+
+# A ``` line INSIDE a ~~~ fence is content, not a close — the fence
+# only closes on the marker that opened it.
+fun t_sf_tilde_fence_keeps_backticks() {
+    tbl = ets_new()
+    r1 = Markdown.stream_feed(tbl, "~~~\n")
+    r2 = Markdown.stream_feed(tbl, "```\ninner\n")
+    r3 = Markdown.stream_feed(tbl, "~~~\n\n")
+    s3 = to_string(r3)
+    ok = bool_and(
+        bool_and(
+            if (r1 == nil && r2 == nil) { 'true' } else { 'false' },
+            if (r3 != nil) { 'true' } else { 'false' }),
+        bool_and(
+            string_contains(s3, "```"),
+            string_contains(s3, "inner")))
+    check("stream_feed: ``` inside a ~~~ fence stays content (closer matches opener)", ok)
+}
+
+# A heading closes the pending block AND self-completes on its own
+# newline — three segments out of one feed, no raw '#'.
+fun t_sf_heading_selfcloses() {
+    tbl = ets_new()
+    r = Markdown.stream_feed(tbl, "intro text\n# Big\nmore\n\n")
+    s = to_string(r)
+    ok = bool_and(
+        bool_and(
+            if (r != nil) { 'true' } else { 'false' },
+            bool_and(string_contains(s, "intro text"), string_contains(s, "Big"))),
+        bool_and(
+            string_contains(s, "more"),
+            bool_not(string_contains(s, "# Big"))))
+    check("stream_feed: heading boundary closes block + self-completes", ok)
+}
+
+# EOF with an open fence: flush renders the remainder (walk_blocks
+# closes unterminated fences) and resets state (second flush = nil).
+fun t_sf_unterminated_fence_flush() {
+    tbl = ets_new()
+    r1 = Markdown.stream_feed(tbl, "```\nabc")
+    f1 = Markdown.stream_flush(tbl)
+    f2 = Markdown.stream_flush(tbl)
+    ok = bool_and3(
+        if (r1 == nil) { 'true' } else { 'false' },
+        if (f1 != nil && string_contains(to_string(f1), "abc") == 'true') { 'true' } else { 'false' },
+        if (f2 == nil) { 'true' } else { 'false' })
+    check("stream_flush: unterminated fence rendered at EOF, state reset", ok)
+}
+
+# Stream-vs-batch equivalence: feeding a fixed doc in chunks of 1, 7
+# and 23 bytes must produce byte-identical terminal output to one full
+# Markdown.render. (Doc uses single blank separators and ends with one
+# newline — the exact contract stream segments reproduce.)
+fun sf_equiv_doc() {
+    "# Title\n\nFirst para with **bold** and `code`.\n\n" ++
+    "- one\n- two\n  - nested\n\n" ++
+    "```sw\nlet x = 1\n```\n\n" ++
+    "| a | b |\n|---|---|\n| 1 | 2 |\n\n" ++
+    "> quoted line\n\nFinal para.\n"
+}
+
+fun sf_feed_chunks(tbl, doc, size, i, acc) {
+    n = string_length(doc)
+    if (i >= n) { acc }
+    else {
+        take = if (i + size > n) { n - i } else { size }
+        ret = Markdown.stream_feed(tbl, string_sub(doc, i, take))
+        acc2 = if (ret == nil) { acc } else { acc ++ to_string(ret) ++ "\n" }
+        sf_feed_chunks(tbl, doc, size, i + take, acc2)
+    }
+}
+
+fun sf_stream_total(doc, size) {
+    tbl = ets_new()
+    fed = sf_feed_chunks(tbl, doc, size, 0, "")
+    rem = Markdown.stream_flush(tbl)
+    if (rem == nil) { fed } else { fed ++ to_string(rem) ++ "\n" }
+}
+
+fun t_sf_stream_vs_batch_chunked() {
+    doc = sf_equiv_doc()
+    batch = Markdown.render(doc, UI.term_width())
+    s1 = sf_stream_total(doc, 1)
+    s7 = sf_stream_total(doc, 7)
+    s23 = sf_stream_total(doc, 23)
+    ok = bool_and3(
+        if (s1 == batch) { 'true' } else { 'false' },
+        if (s7 == batch) { 'true' } else { 'false' },
+        if (s23 == batch) { 'true' } else { 'false' })
+    check("stream_feed: stream == batch render for 1/7/23-byte chunkings", ok)
+}
+
+# ------------------------------------------------------------
+# Wave-1A — routed_collect (worker-routed LLM receive loop)
+# ------------------------------------------------------------
+
+# A worker that emits reasoning, then content, then done + result.
+# Reasoning must NEVER reach the accumulated content region.
+fun fake_stream_worker(caller, token) {
+    send(caller, {'stream_reason', token, "SECRET_REASONING"})
+    send(caller, {'stream_chunk', token, "visible answer"})
+    send(caller, {'stream_done', token})
+    send(caller, {'llm_result', token, {'ok', "rawbody"}})
+}
+
+fun t_sf_reason_never_in_content() {
+    token = "tok-reason-test"
+    w = spawn(fake_stream_worker(self(), token))
+    r = LLM.routed_collect(w, token, nil, "", 3000, timestamp() + 9000)
+    raw = elem(r, 0)
+    printed = to_string(elem(r, 1))
+    ok = bool_and3(
+        if (elem(raw, 0) == 'ok' && elem(raw, 1) == "rawbody") { 'true' } else { 'false' },
+        if (printed == "visible answer") { 'true' } else { 'false' },
+        bool_not(string_contains(printed, "SECRET")))
+    check("routed_collect: reasoning chunks never land in content", ok)
+}
+
+# A worker that never sends anything: the inactivity window must fire
+# and return the {'error', 0, msg} transient shape (retry/backoff path).
+fun hung_worker() {
+    receive {
+        {'never_sent'} -> 'ok'
+    }
+}
+
+fun t_stream_timeout_transient() {
+    w = spawn(hung_worker())
+    r = LLM.routed_collect(w, "tok-timeout-test", nil, "", 60, timestamp() + 180)
+    raw = elem(r, 0)
+    ok = bool_and3(
+        if (elem(raw, 0) == 'error') { 'true' } else { 'false' },
+        if (elem(raw, 1) == 0) { 'true' } else { 'false' },
+        string_contains(to_string(elem(raw, 2)), "no activity"))
+    check("routed_collect: silent worker -> {'error',0,..} transient within tiny window", ok)
+}
+
+# llm_timeout_ms: settings override wins over the 300000 default (env
+# check is skipped when SWARM_CODE_LLM_TIMEOUT_MS is set locally).
+fun t_llm_timeout_config() {
+    env = getenv("SWARM_CODE_LLM_TIMEOUT_MS")
+    d_ok = if (env == nil) {
+        if (Config.llm_timeout_ms(%{}) == 300000) { 'true' } else { 'false' }
+    } else { 'true' }
+    s_ok = if (env == nil) {
+        if (Config.llm_timeout_ms(%{settings: %{llm_timeout_ms: 1234}}) == 1234) { 'true' } else { 'false' }
+    } else { 'true' }
+    check("llm_timeout_ms: default 300000, settings override respected", bool_and(d_ok, s_ok))
+}
+
+# ------------------------------------------------------------
+# Wave-3 — markdown inline machine + block polish
+# ------------------------------------------------------------
+
+fun t_md_italic_variants() {
+    r = Markdown.render("*lean* and _slim_ but my_var_name stays.", 80)
+    ok = bool_and(
+        bool_and(
+            string_contains(r, "\e[3mlean"),
+            string_contains(r, "\e[3mslim")),
+        bool_and(
+            string_contains(r, "my_var_name"),
+            bool_not(string_contains(r, "*lean*"))))
+    check("markdown italic: *x* + _x_ styled, mid-word underscores literal", ok)
+}
+
+fun t_md_bold_underscore() {
+    r = Markdown.render("__strong__ but a__b__c stays.", 80)
+    ok = bool_and3(
+        string_contains(r, "\e[1mstrong"),
+        string_contains(r, "a__b__c"),
+        bool_not(string_contains(r, "__strong__")))
+    check("markdown __bold__: styled, mid-identifier __ literal", ok)
+}
+
+fun t_md_strike() {
+    r = Markdown.render("this is ~~gone~~ now.", 80)
+    ok = bool_and(
+        string_contains(r, "\e[9mgone"),
+        bool_not(string_contains(r, "~~")))
+    check("markdown ~~strike~~: ANSI strikethrough, no raw tildes", ok)
+}
+
+fun t_md_escapes() {
+    r = Markdown.render("say \\*not italic\\* and \\`not code\\`.", 80)
+    ok = bool_and3(
+        string_contains(r, "*not italic*"),
+        string_contains(r, "`not code`"),
+        bool_not(string_contains(r, "\e[3m")))
+    check("markdown escapes: \\* \\` stay literal, no markup fires", ok)
+}
+
+fun t_md_indented_code() {
+    r = Markdown.render("para\n\n    let x = 1\n    let y = 2\n", 80)
+    ok = bool_and3(
+        string_contains(r, "let x = 1"),
+        string_contains(r, "│"),
+        bool_not(string_contains(r, "para let x")))
+    check("markdown 4-space indented code: own block with gutter, no para soup", ok)
+}
+
+fun t_md_nested_quote() {
+    r = Markdown.render("> outer\n> > inner\n", 80)
+    ok = bool_and3(
+        string_contains(r, "outer"),
+        string_contains(r, "inner"),
+        string_contains(r, "│ │"))
+    check("markdown nested blockquote: `> >` stacks two gutter bars", ok)
+}
+
+fun t_md_cjk_table() {
+    w_cjk = Markdown.display_width("日本語")
+    w_ascii = Markdown.display_width("abc")
+    tbl = "| 名前 | count |\n|:-----|------:|\n| 日本語 | 7 |\n"
+    r = Markdown.render(tbl, 80)
+    lines = string_split(r, "\n")
+    head_w = Markdown.display_width(hd(lines))
+    data_w = Markdown.display_width(list_last_str(lines))
+    ok = bool_and3(
+        if (w_cjk == 6 && w_ascii == 3) { 'true' } else { 'false' },
+        if (head_w == data_w) { 'true' } else { 'false' },
+        string_contains(r, "    7"))
+    check("markdown CJK table: width-2 cells align, right-align applied", ok)
+}
+
+# Last NON-empty line (a trailing "\n" in rendered output produces a
+# final "" element after string_split).
+fun list_last_str(lst) {
+    lls_loop(lst, "")
+}
+
+fun lls_loop(lst, best) {
+    if (length(lst) == 0) { best }
+    else {
+        h = hd(lst)
+        nb = if (string_length(h) > 0) { h } else { best }
+        lls_loop(tl(lst), nb)
+    }
+}
+
+fun t_md_osc8_link() {
+    r = Markdown.render("See [docs](https://ex.com/d) now.", 80)
+    no_color = getenv("NO_COLOR")
+    ok = if (no_color == nil) {
+        bool_and(
+            string_contains(r, "\e]8;;https://ex.com/d"),
+            bool_not(string_contains(r, "](")))
+    } else {
+        bool_and(
+            string_contains(r, "docs (https://ex.com/d)"),
+            bool_not(string_contains(r, "](")))
+    }
+    check("markdown link: OSC-8 hyperlink emitted (or plain fallback), no raw [](…)", ok)
+}
+
+fun t_md_tilde_lang_label() {
+    r = Markdown.render("~~~python\nx = 1\n~~~\n", 80)
+    ok = bool_and3(
+        string_contains(r, "python"),
+        string_contains(r, "x = 1"),
+        bool_not(string_contains(r, "~~~")))
+    check("markdown ~~~ fence: language label shown, markers gone", ok)
+}
+
+fun t_md_code_wrap_arrow() {
+    long_line = "abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij"
+    r = Markdown.render("```\n" ++ long_line ++ "\n```", 40)
+    ok = bool_and(
+        string_contains(r, "↪"),
+        string_contains(r, "abcdefghij_"))
+    check("markdown code block wraps at width with ↪ continuation", ok)
+}
+
+# ------------------------------------------------------------
+# Wave-3 — LCS line diff (UI.diff_ops + edit_diff_render)
+# ------------------------------------------------------------
+
+fun count_kind(ops, kind, n) {
+    if (length(ops) == 0) { n }
+    else {
+        bump = if (elem(hd(ops), 0) == kind) { 1 } else { 0 }
+        count_kind(tl(ops), kind, n + bump)
+    }
+}
+
+fun find_kind_line(ops, kind) {
+    if (length(ops) == 0) { nil }
+    else { if (elem(hd(ops), 0) == kind) { elem(hd(ops), 1) }
+    else { find_kind_line(tl(ops), kind) }}
+}
+
+fun t_diff_single_change() {
+    a = ["l1", "l2", "l3", "l4", "l5", "l6"]
+    b = ["l1", "l2", "l3", "changed", "l5", "l6"]
+    ops = UI.diff_ops(a, b)
+    dels = count_kind(ops, 'del', 0)
+    adds = count_kind(ops, 'add', 0)
+    ctxs = count_kind(ops, 'ctx', 0)
+    ok = bool_and3(
+        if (dels == 1 && adds == 1 && ctxs == 5) { 'true' } else { 'false' },
+        if (find_kind_line(ops, 'del') == "l4") { 'true' } else { 'false' },
+        if (find_kind_line(ops, 'add') == "changed") { 'true' } else { 'false' })
+    check("LCS diff: 1-line change in 6 -> exactly one -/+ pair + 5 ctx", ok)
+}
+
+fun t_diff_insert() {
+    a = ["a", "b", "c"]
+    b = ["a", "b", "new", "c"]
+    ops = UI.diff_ops(a, b)
+    ok = bool_and3(
+        if (count_kind(ops, 'del', 0) == 0) { 'true' } else { 'false' },
+        if (count_kind(ops, 'add', 0) == 1) { 'true' } else { 'false' },
+        if (find_kind_line(ops, 'add') == "new") { 'true' } else { 'false' })
+    check("LCS diff: pure insert -> one +, zero -", ok)
+}
+
+fun t_diff_delete() {
+    a = ["a", "b", "gone", "c"]
+    b = ["a", "b", "c"]
+    ops = UI.diff_ops(a, b)
+    ok = bool_and3(
+        if (count_kind(ops, 'del', 0) == 1) { 'true' } else { 'false' },
+        if (count_kind(ops, 'add', 0) == 0) { 'true' } else { 'false' },
+        if (find_kind_line(ops, 'del') == "gone") { 'true' } else { 'false' })
+    check("LCS diff: pure delete -> one -, zero +", ok)
+}
+
+fun t_diff_identical() {
+    a = ["same", "lines", "here"]
+    ops = UI.diff_ops(a, a)
+    UI.edit_diff_render("same\nlines\nhere", "same\nlines\nhere")
+    ok = bool_and(
+        if (count_kind(ops, 'del', 0) == 0) { 'true' } else { 'false' },
+        if (count_kind(ops, 'add', 0) == 0) { 'true' } else { 'false' })
+    check("LCS diff: identical inputs -> zero changes (render is silent)", ok)
+}
+
+fun make_numbered(n, prefix, acc) {
+    if (n <= 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { "\n" }
+        make_numbered(n - 1, prefix, acc ++ sep ++ prefix ++ to_string(n))
+    }
+}
+
+# >200 lines/side falls back to the capped two-block preview (no O(n·m)
+# DP); a write overwrite stashes the prior bytes for a real diff.
+fun t_diff_fallback_and_write() {
+    big_old = make_numbered(210, "old", "")
+    big_new = make_numbered(210, "new", "")
+    UI.edit_diff_render(big_old, big_new)
+    p = "/tmp/swc_wave3_write_diff.txt"
+    file_write(p, "old1\nold2")
+    t = ets_new()
+    r = Tools.exec_raw('write', %{path: p, content: "new1\nnew2"}, %{write_diff_table: t})
+    prior = ets_get(t, p)
+    aft = file_read(p)
+    file_delete(p)
+    ok = bool_and3(
+        string_contains(to_string(r), "ok"),
+        if (prior == "old1\nold2") { 'true' } else { 'false' },
+        if (aft == "new1\nnew2") { 'true' } else { 'false' })
+    check("diff: >200-line render survives fallback; write stashes prior for overwrite diff", ok)
+}
+
+# ------------------------------------------------------------
+# Wave-4 follow-ups — surfaces through the real dispatch paths
+# ------------------------------------------------------------
+
+fun t_bg_dispatch_tail_kill() {
+    table = Background.init()
+    id = Background.launch(table, "echo tailme", "dispatch probe")
+    st = Background.wait_for_task(table, id, 5000)
+    opts = %{bg_table: table}
+    tail_out = Background.tail_log(table, id, 20)
+    r_tail = Agent.handle_bg_command("/bg tail 0", opts)
+    r_kill = Agent.handle_bg_command("/bg kill bg-0", opts)
+    r_bad = Agent.handle_bg_command("/bg frobnicate", opts)
+    ok = bool_and3(
+        if (st == 'done') { 'true' } else { 'false' },
+        string_contains(tail_out, "tailme"),
+        if (r_tail == 'ok' && r_kill == 'ok' && r_bad == 'ok') { 'true' } else { 'false' })
+    check("/bg tail/kill dispatch runs (log has output; unknown sub prints usage)", ok)
+}
+
+# /halp must short-circuit inside route_input — history comes back
+# UNCHANGED (no user message appended, no LLM turn attempted).
+fun t_route_unknown_slash_no_chat() {
+    h = [%{role: 'system', content: "s"}]
+    out = Agent.route_input("/halp", h, %{})
+    out2 = Agent.route_input("   ", h, %{})
+    ok = bool_and(
+        if (length(out) == 1) { 'true' } else { 'false' },
+        if (length(out2) == 1) { 'true' } else { 'false' })
+    check("unknown slash /halp never reaches chat (history unchanged)", ok)
+}
+
+# auto-accept-edits skips the edit ASK but must NOT lift the hardline
+# bash floor — Config.check_permission's 'deny' wins before the mode.
+fun t_auto_accept_hardline_denied() {
+    tbl = ets_new()
+    opts = %{settings: %{permissions: %{edit: "ask"}}, perms_table: tbl, headless: 'false'}
+    Agent.set_session_mode(opts, "auto-accept-edits")
+    d_edit = Agent.resolve_permission('edit', %{path: "/tmp/x"}, opts)
+    d_rmrf = Agent.resolve_permission('bash', %{command: "rm -rf /*"}, opts)
+    d_mkfs = Agent.resolve_permission('bash', %{command: "mkfs /dev/sda1"}, opts)
+    ok = bool_and3(
+        if (d_edit == 'allow') { 'true' } else { 'false' },
+        if (d_rmrf == 'deny') { 'true' } else { 'false' },
+        if (d_mkfs == 'deny') { 'true' } else { 'false' })
+    check("auto-accept-edits skips edit ask but hardline bash stays denied", ok)
+}
+
+fun t_expand_full_content() {
+    et = ets_new()
+    long_out = make_numbered(12, "row", "")
+    ets_put(et, 'last_tool_output', long_out)
+    r = Agent.show_expand(%{expand_table: et})
+    check("/expand reprints a 12-line (>8 cap) stashed output and returns ok",
+          if (r == 'ok') { 'true' } else { 'false' })
+}
+
+# ------------------------------------------------------------
+# Wave-2C — pending-input ring + history builtins (compiled path)
+# ------------------------------------------------------------
+
+fun t_stdin_ring_roundtrip_utf8() {
+    stdin_take_pending()
+    u = "héllo→世界🌏"
+    p1 = stdin_pending_push(u)
+    got = stdin_take_pending()
+    empty = stdin_take_pending()
+    bad_empty = stdin_pending_push("")
+    bad_int = stdin_pending_push(42)
+    ok = bool_and3(
+        if (p1 == 'true' && got == u) { 'true' } else { 'false' },
+        if (empty == nil) { 'true' } else { 'false' },
+        if (bad_empty == 'false' && bad_int == 'false') { 'true' } else { 'false' })
+    check("stdin ring: UTF-8 multi-byte round-trip, drain-once, bad args rejected", ok)
+}
+
+fun hist_lines(n, acc) {
+    if (n <= 0) { acc }
+    else { hist_lines(n - 1, acc ++ "cmd " ++ to_string(n) ++ "\n") }
+}
+
+fun t_rl_history_cap_1000() {
+    p = "/tmp/swc_hist_cap_test.txt"
+    file_write(p, hist_lines(1005, ""))
+    n = rl_history_load(p)
+    missing = rl_history_load("/tmp/swc_hist_definitely_missing.txt")
+    file_delete(p)
+    ok = bool_and(
+        if (n == 1000) { 'true' } else { 'false' },
+        if (missing == nil) { 'true' } else { 'false' })
+    check("rl_history_load: 1005-line file capped at newest 1000; missing file -> nil", ok)
+}
+
+fun t_rl_history_append_rules() {
+    p = "/tmp/swc_hist_append_dir/history"
+    file_delete(p)
+    a1 = rl_history_append(p, "cmd one")
+    a2 = rl_history_append(p, "bad\nline")
+    a3 = rl_history_append(p, "")
+    content = file_read(p)
+    n = rl_history_load(p)
+    file_delete(p)
+    ok = bool_and3(
+        if (a1 == 'true' && a2 == 'false' && a3 == 'false') { 'true' } else { 'false' },
+        if (content == "cmd one\n") { 'true' } else { 'false' },
+        if (n == 1) { 'true' } else { 'false' })
+    check("rl_history_append: creates parent dir, rejects blank/newline lines", ok)
+}
+
+# ------------------------------------------------------------
+# Test-phase gap fills — random chunking, UTF-8 splits, W1a
+# timeout variants (activity-then-silence + total deadline)
+# ------------------------------------------------------------
+
+# Deterministic LCG so the "random" chunkings are reproducible in CI.
+fun sf_lcg_next(s) {
+    (s * 1103515245 + 12345) % 2147483648
+}
+
+fun sf_feed_random(tbl, doc, seed, i, acc) {
+    n = string_length(doc)
+    if (i >= n) { acc }
+    else {
+        s2 = sf_lcg_next(seed)
+        size = (s2 % 16) + 1
+        take = if (i + size > n) { n - i } else { size }
+        ret = Markdown.stream_feed(tbl, string_sub(doc, i, take))
+        acc2 = if (ret == nil) { acc } else { acc ++ to_string(ret) ++ "\n" }
+        sf_feed_random(tbl, doc, s2, i + take, acc2)
+    }
+}
+
+fun sf_stream_random_total(doc, seed) {
+    tbl = ets_new()
+    fed = sf_feed_random(tbl, doc, seed, 0, "")
+    rem = Markdown.stream_flush(tbl)
+    if (rem == nil) { fed } else { fed ++ to_string(rem) ++ "\n" }
+}
+
+# Stream-vs-batch equivalence under pseudo-random chunk sizes (1..16
+# bytes) for three fixed seeds — boundaries can land anywhere, output
+# must stay byte-identical to one Markdown.render.
+fun t_sf_stream_vs_batch_random() {
+    doc = sf_equiv_doc()
+    batch = Markdown.render(doc, UI.term_width())
+    r1 = sf_stream_random_total(doc, 42)
+    r2 = sf_stream_random_total(doc, 1337)
+    r3 = sf_stream_random_total(doc, 999983)
+    ok = bool_and3(eqs(r1, batch), eqs(r2, batch), eqs(r3, batch))
+    check("stream_feed: stream == batch for 3 seeded random chunkings", ok)
+}
+
+# string_sub is BYTE-oriented, so 1-byte chunking splits every
+# multi-byte UTF-8 char mid-sequence — exactly what network chunk
+# boundaries do. The feed buffers raw bytes until a line boundary, so
+# the reassembled render must equal the batch render.
+fun t_sf_utf8_midchar_split() {
+    doc = "café **naïve** 世界 🌏\n\nsecond ✓ para\n"
+    batch = Markdown.render(doc, UI.term_width())
+    s1 = sf_stream_total(doc, 1)
+    s2 = sf_stream_total(doc, 2)
+    ok = bool_and3(
+        eqs(s1, batch),
+        eqs(s2, batch),
+        string_contains(batch, "世界"))
+    check("stream_feed: mid-UTF-8-char splits (1/2-byte chunks) reassemble", ok)
+}
+
+# Worker that streams two chunks and then hangs — the inactivity
+# window must fire even after activity, and the timeout arm must
+# reset the feed state (discarded partial, table clean for the retry).
+fun stall_after_two_worker(caller, token) {
+    send(caller, {'stream_chunk', token, "part one "})
+    send(caller, {'stream_chunk', token, "part two"})
+    receive {
+        {'never_sent'} -> 'ok'
+    }
+}
+
+fun t_stream_timeout_after_activity() {
+    tbl = ets_new()
+    token = "tok-stall-mid"
+    w = spawn(stall_after_two_worker(self(), token))
+    r = LLM.routed_collect(w, token, tbl, "", 80, timestamp() + 240)
+    raw = elem(r, 0)
+    printed = to_string(elem(r, 1))
+    resid = Markdown.stream_flush(tbl)
+    ok = bool_and(
+        bool_and(
+            eqs(elem(raw, 0), 'error'),
+            if (elem(raw, 1) == 0) { 'true' } else { 'false' }),
+        bool_and3(
+            string_contains(to_string(elem(raw, 2)), "no activity"),
+            string_contains(printed, "part one part two"),
+            if (resid == nil) { 'true' } else { 'false' }))
+    check("routed_collect: activity-then-silence times out, feed state reset", ok)
+}
+
+# Worker that drips chunks every 20ms well PAST the initial inactivity
+# deadline, then finishes. An actively-streaming healthy generation must
+# NEVER be killed by a wall-clock cap (the old 3x "total deadline"
+# killed slow-model responses at 15 min and burned full-length retries)
+# — matched activity re-arms the window, and the stream completes.
+fun drip_worker_n(caller, token, n) {
+    if (n <= 0) {
+        send(caller, {'stream_done', token})
+        send(caller, {'llm_result', token, {'ok', "dripbody"}})
+    } else {
+        send(caller, {'stream_chunk', token, "x"})
+        sleep(20)
+        drip_worker_n(caller, token, n - 1)
+    }
+}
+
+fun t_stream_activity_rearms_deadline() {
+    token = "tok-rearm-dl"
+    # 12 chunks * 20ms = ~240ms of streaming, initial deadline only 100ms
+    # out: without per-chunk re-arm this would time out mid-stream.
+    w = spawn(drip_worker_n(self(), token, 12))
+    r = LLM.routed_collect(w, token, nil, "", 100, timestamp() + 100)
+    raw = elem(r, 0)
+    ok = bool_and3(
+        eqs(elem(raw, 0), 'ok'),
+        eqs(elem(raw, 1), "dripbody"),
+        string_contains(to_string(elem(r, 1)), "xxxxxxxxxxxx"))
+    check("routed_collect: active streaming re-arms the deadline (no total-deadline kill)", ok)
+}
+
+# Stale-token chunks (a killed earlier stream still draining) must NOT
+# re-arm the inactivity window for the live token — the hung new stream
+# times out on schedule instead of being kept alive by the zombie.
+fun stale_chatter_worker(caller) {
+    send(caller, {'stream_chunk', "tok-OLD-dead", "zzz"})
+    sleep(20)
+    stale_chatter_worker(caller)
+}
+
+fun t_stream_stale_chunks_dont_rearm() {
+    w = spawn(hung_worker())
+    chatter = spawn(stale_chatter_worker(self()))
+    t0 = timestamp()
+    r = LLM.routed_collect(w, "tok-live-hung", nil, "", 120, timestamp() + 120)
+    took = timestamp() - t0
+    exit_proc(chatter, 'kill')
+    raw = elem(r, 0)
+    ok = bool_and3(
+        eqs(elem(raw, 0), 'error'),
+        string_contains(to_string(elem(raw, 2)), "no activity"),
+        if (took < 1000) { 'true' } else { 'false' })
+    check("routed_collect: stale-token chatter can't defer the live stream's idle timeout", ok)
+}
+
+# 'stream_err' (transport error / truncation marker in routed mode) is
+# painted as a status line, NEVER accumulated into printed content —
+# and it counts as stream activity (re-arms) without ending the call.
+fun err_then_done_worker(caller, token) {
+    send(caller, {'stream_chunk', token, "body text"})
+    send(caller, {'stream_err', token, "\n\n[Response truncated at max_tokens output limit.]"})
+    send(caller, {'stream_done', token})
+    send(caller, {'llm_result', token, {'ok', "errbody"}})
+}
+
+fun t_stream_err_not_content() {
+    token = "tok-stream-err"
+    w = spawn(err_then_done_worker(self(), token))
+    r = LLM.routed_collect(w, token, nil, "", 3000, timestamp() + 3000)
+    raw = elem(r, 0)
+    printed = to_string(elem(r, 1))
+    ok = bool_and3(
+        eqs(elem(raw, 0), 'ok'),
+        eqs(printed, "body text"),
+        eqs(string_contains(printed, "truncated"), 'false'))
+    check("routed_collect: stream_err stays out of the content region", ok)
+}
+
+# Deny-session cache must beat auto-accept-edits: an explicit "always
+# deny edit this session" answer survives a later /mode cycle.
+fun t_deny_session_beats_auto_accept() {
+    tbl = ets_new()
+    opts = %{settings: %{permissions: %{edit: "ask"}}, perms_table: tbl, headless: 'false'}
+    ets_put(tbl, "edit", 'deny_session')
+    Agent.set_session_mode(opts, "auto-accept-edits")
+    d_edit = Agent.resolve_permission('edit', %{path: "/tmp/x"}, opts)
+    d_write = Agent.resolve_permission('write', %{path: "/tmp/x"}, opts)
+    ok = bool_and(
+        eqs(d_edit, 'deny'),      # explicit session deny wins over the mode
+        eqs(d_write, 'allow'))    # un-cached edit tool still auto-accepted
+    check("permission: deny_session cache wins over auto-accept-edits mode", ok)
+}
+
+# Bare lowercase top-level paths (/tmp, /etc) are command-shaped but
+# exist on disk — they must reach the chat path, not "unknown command".
+fun t_route_toplevel_path_not_command() {
+    ok = bool_and3(
+        Agent.looks_like_slash_command("/tmp"),   # shape says command…
+        file_exists("/tmp"),                      # …but it exists on disk
+        eqs(file_exists("/halp"), 'false'))       # typo'd command does not
+    check("route: /tmp is command-shaped but exists → falls through to chat", ok)
+}
+
+# Blank-line RUNS must survive streaming: batch render keeps each blank
+# as a row, so stream output must too (they used to collapse to one).
+fun t_sf_blank_run_equiv() {
+    doc = "alpha\n\n\n\nbeta\n"
+    batch = Markdown.render(doc, UI.term_width())
+    s1 = sf_stream_total(doc, 1)
+    s5 = sf_stream_total(doc, 5)
+    ok = bool_and(eqs(s1, batch), eqs(s5, batch))
+    check("stream_feed: blank-line runs match batch render (no collapse)", ok)
+}
+
+# A ````-fence quoting ``` examples must not close at the inner ```
+# (CommonMark: closer run >= opener run), and its info string is "" —
+# not a bogus "`" language label.
+fun t_sf_four_backtick_fence() {
+    doc = "````\n```\ninner\n```\n````\n\nafter\n"
+    batch = Markdown.render(doc, UI.term_width())
+    s1 = sf_stream_total(doc, 1)
+    s9 = sf_stream_total(doc, 9)
+    ok = bool_and(
+        bool_and(eqs(s1, batch), eqs(s9, batch)),
+        bool_and3(
+            string_contains(batch, "inner"),
+            string_contains(batch, "```"),
+            eqs(Markdown.fence_info("````"), "")))
+    check("fence: 4-backtick opener needs >=4 closer; fence_info('````') is empty", ok)
 }

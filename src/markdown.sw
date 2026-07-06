@@ -25,12 +25,12 @@ module Markdown
 #   anything else           → paragraph text
 #
 # Inline handling (within paragraph / heading / bullet / blockquote):
-#   `**X**`                  → ANSI bold
+#   `**X**` / `__X__`        → ANSI bold
+#   `*X*` / `_X_`            → ANSI italic (flanking heuristic; `_` not mid-word)
+#   `~~X~~`                  → ANSI strikethrough
 #   `` `X` ``                → ANSI inline-code color
-#
-# Italic (`*X*` / `_X_`) is NOT handled in v1 — too many false
-# positives (model uses bare `*` for emphasis, glob patterns, math).
-# We can add it later behind smarter heuristics.
+#   `\*` `\_` `` \` ``       → backslash escapes (literal char, no markup)
+#   `[label](url)`          → OSC-8 hyperlink (or `label (url)` when colors off)
 #
 # Soft word-wrap: every output line is wrapped at `width` columns at
 # WORD boundaries. Never break a word mid-string. Display width
@@ -38,7 +38,8 @@ module Markdown
 
 import UI
 
-export [render, repaint_streamed_prose, has_markdown, display_width]
+export [render, repaint_streamed_prose, has_markdown, display_width,
+        stream_feed, stream_flush, fence_info]
 
 # ------------------------------------------------------------
 # Public entry: render(content, width) -> string
@@ -54,7 +55,7 @@ fun render(content, width) {
         else {
             lines = string_split(text, "\n")
             inner_w = width - 2
-            blocks = walk_blocks(lines, [], 'false', [])
+            blocks = walk_blocks(lines, [], 'false', [], nil, "")
             join_blocks(blocks, inner_w, "")
         }
     }
@@ -72,10 +73,15 @@ fun render(content, width) {
 #          para   → text (joined lines of the paragraph)
 #          blank  → ""
 # ------------------------------------------------------------
-fun walk_blocks(lines, code_acc, in_code, blocks) {
+# `code_acc` accumulates the lines of an open FENCED block; `fence_mk`
+# is the marker that opened it ("```" or "~~~") — a fence only closes on
+# its own marker, so a ``` line inside a ~~~ block stays content — and
+# `code_lang` is the info-string language captured from the opening
+# fence. Code blocks carry payload {lang, lines}.
+fun walk_blocks(lines, code_acc, in_code, blocks, fence_mk, code_lang) {
     if (length(lines) == 0) {
         if (in_code == 'true') {
-            list_append(blocks, {'code', code_acc})
+            list_append(blocks, {'code', {code_lang, code_acc}})
         } else {
             blocks
         }
@@ -83,28 +89,32 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
         line = hd(lines)
         rest = tl(lines)
         if (in_code == 'true') {
-            if (is_fence(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'code', code_acc}))
+            if (sf_fence_closes(line, fence_mk) == 'true') {
+                walk_blocks(rest, [], 'false', list_append(blocks, {'code', {code_lang, code_acc}}), nil, "")
             } else {
-                walk_blocks(rest, list_append(code_acc, line), 'true', blocks)
+                walk_blocks(rest, list_append(code_acc, line), 'true', blocks, fence_mk, code_lang)
             }
         } else {
-            if (is_fence(line) == 'true') {
-                walk_blocks(rest, [], 'true', blocks)
+            fm = sf_fence_marker(line)
+            if (fm != nil) {
+                # Fence OPEN (``` or ~~~) — capture the info-string language.
+                walk_blocks(rest, [], 'true', blocks, fm, fence_info(line))
             } else { if (is_blank(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'blank', ""}))
+                walk_blocks(rest, [], 'false', list_append(blocks, {'blank', ""}), nil, "")
             } else { if (is_hr(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'hr', ""}))
+                walk_blocks(rest, [], 'false', list_append(blocks, {'hr', ""}), nil, "")
             } else { if (header_depth(line) > 0) {
                 d = header_depth(line)
                 t = strip_prefix(line, header_prefix(d))
-                walk_blocks(rest, [], 'false', list_append(blocks, {'header', {d, t}}))
+                walk_blocks(rest, [], 'false', list_append(blocks, {'header', {d, t}}), nil, "")
             } else { if (is_bullet(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'bullet', {bullet_level(line), bullet_text(line)}}))
+                walk_blocks(rest, [], 'false', list_append(blocks, {'bullet', {bullet_level(line), bullet_text(line)}}), nil, "")
             } else { if (is_ordered(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'ordered', {bullet_level(line), ordered_marker(line), ordered_text(line)}}))
+                walk_blocks(rest, [], 'false', list_append(blocks, {'ordered', {bullet_level(line), ordered_marker(line), ordered_text(line)}}), nil, "")
             } else { if (is_quote(line) == 'true') {
-                walk_blocks(rest, [], 'false', list_append(blocks, {'quote', quote_text(line)}))
+                # Blockquote — capture nesting depth (`> >` → 2) so the
+                # renderer can stack gutter bars, and the stripped content.
+                walk_blocks(rest, [], 'false', list_append(blocks, {'quote', {quote_depth(line), quote_content(line)}}), nil, "")
             } else { if (is_table_row(line) == 'true') {
                 # Collect this and any consecutive table rows into a
                 # single 'table' block. Without this they fell through
@@ -114,9 +124,27 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
                 if (tbl_last != nil && elem(tbl_last, 0) == 'table') {
                     tbl_rows = elem(tbl_last, 1)
                     tbl_blocks = list_set_last(blocks, {'table', list_append(tbl_rows, string_trim(line))})
-                    walk_blocks(rest, [], 'false', tbl_blocks)
+                    walk_blocks(rest, [], 'false', tbl_blocks, nil, "")
                 } else {
-                    walk_blocks(rest, [], 'false', list_append(blocks, {'table', [string_trim(line)]}))
+                    walk_blocks(rest, [], 'false', list_append(blocks, {'table', [string_trim(line)]}), nil, "")
+                }
+            } else { if (is_indented_code(line) == 'true' && indcode_ok(blocks) == 'true') {
+                # A run of >=4-space / tab-indented lines that begins
+                # outside another block is an indented code block. It
+                # renders through the same gutter path as a fence (lang
+                # unknown). is_indented_code sits AFTER the bullet check
+                # so "    - nested" is still a nested list, and indcode_ok
+                # requires the previous block to be blank/none/code so a
+                # 4-space wrapped paragraph continuation is not captured.
+                stripped = strip_indent(line)
+                ic_last = if (length(blocks) == 0) { nil } else { list_last(blocks) }
+                if (ic_last != nil && elem(ic_last, 0) == 'code') {
+                    cd = elem(ic_last, 1)
+                    clines = elem(cd, 1)
+                    ic_blocks = list_set_last(blocks, {'code', {elem(cd, 0), list_append(clines, stripped)}})
+                    walk_blocks(rest, [], 'false', ic_blocks, nil, "")
+                } else {
+                    walk_blocks(rest, [], 'false', list_append(blocks, {'code', {"", [stripped]}}), nil, "")
                 }
             } else {
                 # Paragraph — extend or start. We keep paragraphs as
@@ -126,12 +154,61 @@ fun walk_blocks(lines, code_acc, in_code, blocks) {
                     cur = elem(last, 1)
                     merged = cur ++ " " ++ string_trim(line)
                     new_blocks = list_set_last(blocks, {'para', merged})
-                    walk_blocks(rest, [], 'false', new_blocks)
+                    walk_blocks(rest, [], 'false', new_blocks, nil, "")
                 } else {
-                    walk_blocks(rest, [], 'false', list_append(blocks, {'para', string_trim(line)}))
+                    walk_blocks(rest, [], 'false', list_append(blocks, {'para', string_trim(line)}), nil, "")
                 }
-            }}}}}}}}
+            }}}}}}}}}
         }
+    }
+}
+
+# Info-string language from an opening fence line: the first token after
+# the marker. "```sw" → "sw", "~~~python {.numberLines}" → "python",
+# "```" → "".
+fun fence_info(line) {
+    t = string_trim(line)
+    mk = sf_fence_marker(t)
+    if (mk == nil) { "" }
+    else {
+        # Skip the WHOLE marker run — a 4-backtick fence must not yield a
+        # bogus "`" language label.
+        ml = string_length(mk)
+        rest = string_trim(string_sub(t, ml, string_length(t) - ml))
+        parts = string_split(rest, " ")
+        if (length(parts) == 0) { "" } else { string_trim(hd(parts)) }
+    }
+}
+
+# An indented code line: 4+ leading spaces or a leading tab, non-blank.
+fun is_indented_code(line) {
+    if (is_blank(line) == 'true') { 'false' }
+    else {
+        if (leading_spaces(line, 0) >= 4) { 'true' }
+        else { if (string_length(line) > 0 && string_sub(line, 0, 1) == "\t") { 'true' }
+        else { 'false' }}
+    }
+}
+
+# Strip exactly one indent level (a tab or 4 spaces), preserving any
+# deeper internal indentation inside the code block.
+fun strip_indent(line) {
+    if (string_length(line) > 0 && string_sub(line, 0, 1) == "\t") {
+        string_sub(line, 1, string_length(line) - 1)
+    } else {
+        n = string_length(line)
+        if (n >= 4) { string_sub(line, 4, n - 4) } else { line }
+    }
+}
+
+# Indented code may only START when the previous block is a blank, a
+# code block (continuation), or nothing — never mid-paragraph/list, so
+# reflowed prose and nested lists are not swallowed.
+fun indcode_ok(blocks) {
+    if (length(blocks) == 0) { 'true' }
+    else {
+        k = elem(list_last(blocks), 0)
+        if (k == 'blank' || k == 'code') { 'true' } else { 'false' }
     }
 }
 
@@ -144,13 +221,6 @@ fun is_blank(line) {
 fun is_hr(line) {
     t = string_trim(line)
     if (t == "---" || t == "***" || t == "___") { 'true' } else { 'false' }
-}
-
-fun is_fence(line) {
-    t = string_trim(line)
-    # Match plain ``` or ```language
-    if (string_length(t) < 3) { 'false' }
-    else { if (string_sub(t, 0, 3) == "```") { 'true' } else { 'false' }}
 }
 
 fun is_bullet(line) {
@@ -266,10 +336,29 @@ fun is_quote(line) {
     }
 }
 
-fun quote_text(line) {
-    t = string_trim(line)
-    if (string_sub(t, 0, 2) == "> ") { string_sub(t, 2, string_length(t) - 2) }
-    else { string_sub(t, 1, string_length(t) - 1) }
+# Nesting depth of a blockquote: the count of leading ">" markers,
+# tolerating spaces between them. "> x" → 1, "> > x" / ">> x" → 2.
+fun quote_depth(line) {
+    qd_loop(string_trim(line), 0)
+}
+
+fun qd_loop(s, n) {
+    t = string_trim(s)
+    if (string_length(t) > 0 && string_sub(t, 0, 1) == ">") {
+        qd_loop(string_sub(t, 1, string_length(t) - 1), n + 1)
+    } else { n }
+}
+
+# The quote text with every leading ">" (and its padding) stripped.
+fun quote_content(line) {
+    qc_strip(string_trim(line))
+}
+
+fun qc_strip(s) {
+    t = string_trim(s)
+    if (string_length(t) > 0 && string_sub(t, 0, 1) == ">") {
+        qc_strip(string_sub(t, 1, string_length(t) - 1))
+    } else { t }
 }
 
 # Returns 0 if not a header, else depth (1, 2, 3, 4+).
@@ -433,27 +522,193 @@ fun render_ordered(payload, width) {
     wrap_with_prefixes(rendered, prefix, cont, width)
 }
 
+# Blockquote — stack one dim "│ " gutter bar per nesting level, so a
+# `> >` quote shows two bars. payload is {depth, content}.
 fun render_quote(payload, width) {
-    bar = "  " ++ UI.grey_border() ++ "│ " ++ UI.reset()
-    rendered = render_inline(payload)
-    wrap_with_prefixes(rendered, bar, bar, width - 2)
+    depth = elem(payload, 0)
+    content = elem(payload, 1)
+    d = if (depth < 1) { 1 } else { depth }
+    bar = "  " ++ UI.grey_border() ++ qb_loop(d, "") ++ UI.reset()
+    rendered = render_inline(content)
+    wrap_with_prefixes(rendered, bar, bar, width)
 }
 
-# Code block: indent each line, color dimly. No syntax highlight in v1.
-fun render_code(lines, width) {
-    bg = UI.grey_text()
-    code_indent_loop(lines, bg, "")
+fun qb_loop(n, acc) {
+    if (n <= 0) { acc }
+    else { qb_loop(n - 1, acc ++ "│ ") }
 }
 
-fun code_indent_loop(lines, color, acc) {
+# ------------------------------------------------------------
+# Code block rendering — payload {lang, lines}
+# ------------------------------------------------------------
+# A dim "│ " gutter runs down the left. Long lines hard-wrap at the
+# available width; continuation rows swap the gutter for a dim "↪ " so
+# the alignment (2-space indent + 2-col gutter) is preserved. A dim
+# language label sits above the block when the fence carried an info
+# string. Recognized languages get a small keyword highlighter.
+#
+# Wrapping is computed on the RAW line (display-width aware, so CJK code
+# never overflows) and each physical segment is highlighted afterwards —
+# so the highlighter's ANSI never confuses the column math.
+fun render_code(payload, width) {
+    lang = to_string(elem(payload, 0))
+    lines = elem(payload, 1)
+    avail = if (width - 4 < 4) { 4 } else { width - 4 }
+    body = code_render_loop(lines, lang, avail, "")
+    if (string_length(lang) == 0) { body }
+    else {
+        label = "  " ++ UI.grey_text() ++ lang ++ UI.reset()
+        if (string_length(body) == 0) { label } else { label ++ "\n" ++ body }
+    }
+}
+
+fun code_render_loop(lines, lang, avail, acc) {
     if (length(lines) == 0) { acc }
     else {
-        line = hd(lines)
-        formatted = "  " ++ color ++ line ++ UI.reset()
-        next_acc = if (string_length(acc) == 0) { formatted }
-                   else { acc ++ "\n" ++ formatted }
-        code_indent_loop(tl(lines), color, next_acc)
+        rendered = render_code_line(hd(lines), lang, avail)
+        next = if (string_length(acc) == 0) { rendered } else { acc ++ "\n" ++ rendered }
+        code_render_loop(tl(lines), lang, avail, next)
     }
+}
+
+# One logical code line → one or more physical rows (wrapped at `avail`).
+fun render_code_line(line, lang, avail) {
+    rcl_join(wrap_code_line(line, avail), lang, 'true', "")
+}
+
+fun rcl_join(segs, lang, first, acc) {
+    if (length(segs) == 0) { acc }
+    else {
+        glyph = if (first == 'true') { "│ " } else { "↪ " }
+        gutter = UI.grey_border() ++ glyph ++ UI.reset()
+        row = "  " ++ gutter ++ highlight_code(hd(segs), lang)
+        next = if (string_length(acc) == 0) { row } else { acc ++ "\n" ++ row }
+        rcl_join(tl(segs), lang, 'false', next)
+    }
+}
+
+# Hard-wrap a raw line into segments each <= `avail` DISPLAY columns,
+# breaking on codepoint boundaries (never mid-UTF-8, wide chars count 2).
+fun wrap_code_line(line, avail) {
+    a = if (avail < 1) { 1 } else { avail }
+    wcl(string_chars(line), a, "", 0, [])
+}
+
+fun wcl(chars, avail, cur, curw, acc) {
+    if (length(chars) == 0) {
+        if (string_length(cur) == 0 && length(acc) > 0) { acc }
+        else { list_append(acc, cur) }
+    } else {
+        c = hd(chars)
+        cw = cp_width(first_cp(c))
+        if (curw + cw > avail && curw > 0) {
+            wcl(chars, avail, "", 0, list_append(acc, cur))
+        } else {
+            wcl(tl(chars), avail, cur ++ c, curw + cw, acc)
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# Small keyword highlighter — bold keywords, green string spans, dim
+# comments. Naive by design (per-segment, no cross-line state): good
+# enough to make code scannable without a real lexer. Unknown languages
+# pass through untouched.
+# ------------------------------------------------------------
+fun highlight_code(line, lang) {
+    if (is_supported_lang(lang) == 'false') { line }
+    else { hl_scan(line, 0, string_length(line), keywords_for(lang), comment_marker(lang), "", "") }
+}
+
+fun hl_scan(s, i, n, kws, cmt, word, acc) {
+    if (i >= n) { acc ++ flush_word(word, kws) }
+    else {
+        ch = string_sub(s, i, 1)
+        if (is_ident_char(ch) == 'true') {
+            hl_scan(s, i + 1, n, kws, cmt, word ++ ch, acc)
+        } else {
+            acc2 = acc ++ flush_word(word, kws)
+            if (ch == "\"" || ch == "'") {
+                close = find_close(s, i + 1, ch)
+                if (close < 0) {
+                    acc2 ++ UI.green() ++ string_sub(s, i, n - i) ++ UI.reset()
+                } else {
+                    span = string_sub(s, i, close - i + 1)
+                    hl_scan(s, close + 1, n, kws, cmt, "", acc2 ++ UI.green() ++ span ++ UI.reset())
+                }
+            } else { if (cmt != "" && is_comment_at(s, i, n, cmt) == 'true') {
+                acc2 ++ UI.grey_text() ++ string_sub(s, i, n - i) ++ UI.reset()
+            } else {
+                hl_scan(s, i + 1, n, kws, cmt, "", acc2 ++ ch)
+            }}
+        }
+    }
+}
+
+fun flush_word(word, kws) {
+    if (string_length(word) == 0) { "" }
+    else { if (keyword_member(word, kws) == 'true') { UI.bold() ++ word ++ UI.reset() }
+    else { word }}
+}
+
+fun keyword_member(w, kws) {
+    if (length(kws) == 0) { 'false' }
+    else { if (hd(kws) == w) { 'true' } else { keyword_member(w, tl(kws)) }}
+}
+
+fun is_ident_char(ch) {
+    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
+        || (ch >= "0" && ch <= "9") || ch == "_") { 'true' }
+    else { 'false' }
+}
+
+fun is_comment_at(s, i, n, cmt) {
+    cl = string_length(cmt)
+    if (i + cl > n) { 'false' }
+    else { if (string_sub(s, i, cl) == cmt) { 'true' } else { 'false' }}
+}
+
+fun is_supported_lang(lang) {
+    if (lang == "sw" || lang == "rust" || lang == "rs" || lang == "python"
+        || lang == "py" || lang == "js" || lang == "javascript" || lang == "ts"
+        || lang == "typescript" || lang == "go" || lang == "c") { 'true' }
+    else { 'false' }
+}
+
+fun comment_marker(lang) {
+    if (lang == "sw" || lang == "python" || lang == "py") { "#" }
+    else { if (lang == "rust" || lang == "rs" || lang == "js" || lang == "javascript"
+             || lang == "ts" || lang == "typescript" || lang == "go" || lang == "c") { "//" }
+    else { "" }}
+}
+
+fun keywords_for(lang) {
+    if (lang == "sw") {
+        ["fun","if","else","module","import","export","receive","spawn","send",
+         "self","after","match","case","true","false","nil","for","while","return","let"]
+    } else { if (lang == "rust" || lang == "rs") {
+        ["fn","let","mut","pub","struct","enum","impl","use","mod","match","if","else",
+         "for","while","loop","return","self","trait","where","async","await","move",
+         "ref","const","static","type","as","dyn","break","continue"]
+    } else { if (lang == "python" || lang == "py") {
+        ["def","class","if","elif","else","for","while","return","import","from","as",
+         "with","try","except","finally","lambda","yield","pass","break","continue",
+         "and","or","not","in","is","None","True","False","global","nonlocal","raise",
+         "assert","async","await"]
+    } else { if (lang == "js" || lang == "javascript" || lang == "ts" || lang == "typescript") {
+        ["function","let","const","var","if","else","for","while","return","class","new",
+         "this","import","export","from","async","await","try","catch","finally","throw",
+         "typeof","instanceof","null","undefined","true","false","of","in","switch","case",
+         "break","continue","default","extends","super","yield"]
+    } else { if (lang == "go") {
+        ["func","var","const","if","else","for","range","return","package","import","type",
+         "struct","interface","map","chan","go","defer","select","switch","case","default",
+         "break","continue","nil","true","false"]
+    } else { if (lang == "c") {
+        ["int","char","void","float","double","long","short","unsigned","signed","struct",
+         "enum","union","static","const","if","else","for","while","do","return","switch",
+         "case","break","continue","sizeof","typedef","goto","extern","volatile","register","inline"]
+    } else { [] }}}}}}
 }
 
 fun render_hr(width) {
@@ -465,33 +720,63 @@ fun render_hr(width) {
 # Table rendering
 # ------------------------------------------------------------
 # rows: list of raw "| a | b | c |" lines (alignment row included).
-# Strategy: parse each row into trimmed cells, drop the alignment-only
-# row, compute max width per column, then re-render padded with a │
-# separator. Header row gets a dim ─── divider beneath.
+# Strategy: parse the alignment row for per-column :---: alignment, parse
+# the data rows into trimmed cells, compute max width per column, clamp to
+# fit `width`, then render. A cell wider than its (clamped) column WRAPS to
+# multiple physical rows — siblings are padded with blank continuation
+# rows so the columns stay aligned — rather than being truncated with an
+# ellipsis. Only degenerate columns clamped to <=2 cols fall back to
+# single-line ellipsis truncation (wrapping to 1-2 cols is unreadable).
 fun render_table(rows, width) {
-    # Parse rows into [cells]. Skip alignment-only rows.
+    aligns = parse_alignments(rows)
     parsed = parse_rows(rows, [])
     if (length(parsed) == 0) { "" }
     else {
         raw_widths = compute_col_widths(parsed, [])
-        # Clamp the column widths so the whole row fits `width`. Without this
-        # a wide table overflows and the terminal hard-wraps it mid-cell (the
-        # final render goes through plain print(), not the column-aware
-        # streaming emitter), destroying alignment.
         widths = clamp_table_widths(raw_widths, width)
-        # First parsed row is the header. Render it, then the divider,
-        # then the body rows.
         head = hd(parsed)
         body = tl(parsed)
-        head_line = render_header_row(head, widths)
+        head_line = render_wrapped_row(head, widths, aligns, 'true')
         div_line = render_divider(widths)
-        body_lines = render_body_rows(body, widths, "")
+        body_lines = render_body_wrapped(body, widths, aligns, "")
         if (string_length(body_lines) == 0) {
             head_line ++ "\n" ++ div_line
         } else {
             head_line ++ "\n" ++ div_line ++ "\n" ++ body_lines
         }
     }
+}
+
+# Per-column alignment from the `|:---|---:|:--:|` row: 'left / 'right /
+# 'center. Empty list when there is no alignment row (default left).
+fun parse_alignments(rows) {
+    ar = find_align_row(rows)
+    if (ar == nil) { [] }
+    else { aligns_of(parse_table_row(ar), []) }
+}
+
+fun find_align_row(rows) {
+    if (length(rows) == 0) { nil }
+    else { if (is_table_align_row(hd(rows)) == 'true') { hd(rows) }
+    else { find_align_row(tl(rows)) }}
+}
+
+fun aligns_of(cells, acc) {
+    if (length(cells) == 0) { acc }
+    else { aligns_of(tl(cells), list_append(acc, align_of_cell(string_trim(hd(cells))))) }
+}
+
+fun align_of_cell(c) {
+    n = string_length(c)
+    starts = if (n > 0 && string_sub(c, 0, 1) == ":") { 'true' } else { 'false' }
+    ends = if (n > 0 && string_sub(c, n - 1, 1) == ":") { 'true' } else { 'false' }
+    if (starts == 'true' && ends == 'true') { 'center' }
+    else { if (ends == 'true') { 'right' } else { 'left' }}
+}
+
+fun align_at(aligns, i) {
+    if (length(aligns) == 0) { 'left' }
+    else { if (i <= 0) { hd(aligns) } else { align_at(tl(aligns), i - 1) }}
 }
 
 fun parse_rows(rows, acc) {
@@ -573,69 +858,149 @@ fun merge_widths(a, b, acc) {
     }}}
 }
 
-# Render one row as "  cell1 │ cell2 │ cell3" with each cell padded.
-fun render_row(cells, widths) {
-    "  " ++ row_cells_loop(cells, widths, "")
-}
-
-# Header row — same layout, each padded cell wrapped in bold. A reset
-# inside a cell (inline code/bold) only un-bolds the rest of THAT cell.
-fun render_header_row(cells, widths) {
-    "  " ++ header_cells_loop(cells, widths, "")
-}
-
-fun header_cells_loop(cells, widths, acc) {
-    if (length(cells) == 0) { acc }
-    else {
-        cell = hd(cells)
-        col_width = if (length(widths) == 0) { display_width(render_inline(cell)) } else { hd(widths) }
-        padded = render_cell(cell, col_width)
-        sep = if (string_length(acc) == 0) { "" } else { " " ++ UI.grey_border() ++ "│" ++ UI.reset() ++ " " }
-        next_widths = if (length(widths) == 0) { [] } else { tl(widths) }
-        header_cells_loop(tl(cells), next_widths, acc ++ sep ++ "\e[1m" ++ padded ++ "\e[0m")
-    }
-}
-
-fun row_cells_loop(cells, widths, acc) {
-    if (length(cells) == 0) { acc }
-    else {
-        cell = hd(cells)
-        col_width = if (length(widths) == 0) { display_width(cell) } else { hd(widths) }
-        padded = render_cell(cell, col_width)
-        sep = if (string_length(acc) == 0) { "" } else { " " ++ UI.grey_border() ++ "│" ++ UI.reset() ++ " " }
-        next_widths = if (length(widths) == 0) { [] } else { tl(widths) }
-        row_cells_loop(tl(cells), next_widths, acc ++ sep ++ padded)
-    }
-}
-
 fun pad_chars(n, acc) {
     if (n <= 0) { acc }
     else { pad_chars(n - 1, acc ++ " ") }
 }
 
-# Render one cell to exactly `col_width` display columns. When the content
-# is too wide we truncate the RAW text (before render_inline adds ANSI), so
-# we never split an escape sequence, then append a 1-col ellipsis.
-fun render_cell(cell, col_width) {
-    rendered = render_inline(cell)
-    dw = display_width(rendered)
-    if (dw <= col_width) {
-        rendered ++ pad_chars(col_width - dw, "")
-    } else {
-        room = if (col_width > 1) { col_width - 1 } else { 1 }
-        r2 = render_inline(truncate_raw(cell, room))
-        dw2 = display_width(r2)
-        pad_n = col_width - dw2 - 1
-        r2 ++ "…" ++ pad_chars(if (pad_n > 0) { pad_n } else { 0 }, "")
+# ------------------------------------------------------------
+# Wrapped-cell row rendering
+# ------------------------------------------------------------
+# Render one logical table row (a list of raw cell strings). Each cell is
+# wrapped to its column width into a list of physical lines; the row's
+# height is the tallest cell, and shorter cells are padded with blank
+# lines so the │ separators stay aligned down the whole row.
+fun render_wrapped_row(cells, widths, aligns, is_header) {
+    collines = wrap_all_cells(cells, widths, [])
+    height = max_len(collines, 0)
+    h = if (height < 1) { 1 } else { height }
+    rwr_lines(collines, widths, aligns, is_header, 0, h, "")
+}
+
+fun render_body_wrapped(rows, widths, aligns, acc) {
+    if (length(rows) == 0) { acc }
+    else {
+        line = render_wrapped_row(hd(rows), widths, aligns, 'false')
+        next = if (string_length(acc) == 0) { line } else { acc ++ "\n" ++ line }
+        render_body_wrapped(tl(rows), widths, aligns, next)
     }
 }
 
-# Truncate a raw string to at most `n` bytes. Cells are typically ASCII; a
-# rare multibyte cut is cosmetic and far better than a table overflowing the
-# terminal and hard-wrapping mid-cell.
-fun truncate_raw(s, n) {
-    if (string_length(s) <= n) { s }
-    else { string_sub(s, 0, n) }
+# Wrap every cell to its column width → list (per column) of physical
+# raw lines.
+fun wrap_all_cells(cells, widths, acc) {
+    if (length(cells) == 0) { acc }
+    else {
+        cw = if (length(widths) == 0) { display_width(hd(cells)) } else { hd(widths) }
+        nw = if (length(widths) == 0) { [] } else { tl(widths) }
+        wrap_all_cells(tl(cells), nw, list_append(acc, wrap_cell_raw(hd(cells), cw)))
+    }
+}
+
+fun max_len(collines, m) {
+    if (length(collines) == 0) { m }
+    else {
+        l = length(hd(collines))
+        max_len(tl(collines), if (l > m) { l } else { m })
+    }
+}
+
+# Emit `height` physical rows. For each, take the k-th line of every
+# column, render + pad it, and join columns with the dim │ separator.
+fun rwr_lines(collines, widths, aligns, is_header, k, height, acc) {
+    if (k >= height) { acc }
+    else {
+        row = "  " ++ rwr_row(collines, widths, aligns, is_header, k, 0, "")
+        next = if (string_length(acc) == 0) { row } else { acc ++ "\n" ++ row }
+        rwr_lines(collines, widths, aligns, is_header, k + 1, height, next)
+    }
+}
+
+fun rwr_row(collines, widths, aligns, is_header, k, ci, acc) {
+    if (length(collines) == 0) { acc }
+    else {
+        cw = if (length(widths) == 0) { 0 } else { hd(widths) }
+        nw = if (length(widths) == 0) { [] } else { tl(widths) }
+        raw = nth_or_empty(hd(collines), k)
+        cell_str = pad_aligned(render_inline(raw), cw, align_at(aligns, ci))
+        piece = if (is_header == 'true') { UI.bold() ++ cell_str ++ UI.reset() } else { cell_str }
+        sep = if (string_length(acc) == 0) { "" } else { " " ++ UI.grey_border() ++ "│" ++ UI.reset() ++ " " }
+        rwr_row(tl(collines), nw, aligns, is_header, k, ci + 1, acc ++ sep ++ piece)
+    }
+}
+
+fun nth_or_empty(lst, k) {
+    if (k < 0 || length(lst) == 0) { "" }
+    else { if (k == 0) { hd(lst) } else { nth_or_empty(tl(lst), k - 1) }}
+}
+
+# Pad a rendered (ANSI-carrying) cell line to `col_width` display columns
+# honoring alignment. Never truncates — callers guarantee dw <= col_width.
+fun pad_aligned(rendered, col_width, align) {
+    dw = display_width(rendered)
+    if (dw >= col_width) { rendered }
+    else {
+        pad = col_width - dw
+        if (align == 'right') { pad_chars(pad, "") ++ rendered }
+        else { if (align == 'center') {
+            l = pad / 2
+            pad_chars(l, "") ++ rendered ++ pad_chars(pad - l, "")
+        } else { rendered ++ pad_chars(pad, "") }}
+    }
+}
+
+# Wrap a RAW cell into physical lines each <= col_width display columns.
+# Word-wraps on spaces; a single word longer than the column is hard-broken
+# on codepoint boundaries. Columns clamped to <=2 cols truncate with an
+# ellipsis instead (wrapping that narrow is unreadable).
+fun wrap_cell_raw(cell, col_width) {
+    if (col_width <= 2) { [ellipsis_raw(cell, col_width)] }
+    else {
+        words = split_words(cell)
+        if (length(words) == 0) { [""] }
+        else { wc_pack_raw(words, col_width, "", []) }
+    }
+}
+
+fun wc_pack_raw(words, cw, cur, acc) {
+    if (length(words) == 0) {
+        if (string_length(cur) == 0 && length(acc) > 0) { acc }
+        else { list_append(acc, cur) }
+    } else {
+        w = hd(words)
+        wdisp = display_width(w)
+        if (string_length(cur) == 0) {
+            if (wdisp > cw) {
+                segs = wrap_code_line(w, cw)
+                acc2 = add_all_but_last(segs, acc)
+                wc_pack_raw(tl(words), cw, list_last(segs), acc2)
+            } else {
+                wc_pack_raw(tl(words), cw, w, acc)
+            }
+        } else {
+            if (display_width(cur) + 1 + wdisp <= cw) {
+                wc_pack_raw(tl(words), cw, cur ++ " " ++ w, acc)
+            } else {
+                wc_pack_raw(words, cw, "", list_append(acc, cur))
+            }
+        }
+    }
+}
+
+fun add_all_but_last(segs, acc) {
+    n = length(segs)
+    if (n <= 1) { acc }
+    else { take_n(segs, n - 1, acc) }
+}
+
+# Truncate a RAW cell to <= cw display cols with a trailing ellipsis.
+fun ellipsis_raw(cell, cw) {
+    if (display_width(cell) <= cw) { cell }
+    else {
+        room = if (cw > 1) { cw - 1 } else { 0 }
+        head = if (room == 0) { "" } else { hd(wrap_code_line(cell, room)) }
+        head ++ "…"
+    }
 }
 
 # Shrink column widths so the whole row fits `width`. Layout is
@@ -727,15 +1092,6 @@ fun divider_loop(widths, acc) {
     }
 }
 
-fun render_body_rows(rows, widths, acc) {
-    if (length(rows) == 0) { acc }
-    else {
-        line = render_row(hd(rows), widths)
-        next_acc = if (string_length(acc) == 0) { line } else { acc ++ "\n" ++ line }
-        render_body_rows(tl(rows), widths, next_acc)
-    }
-}
-
 fun make_dashes(n, acc) {
     if (n <= 0) { acc }
     else { make_dashes(n - 1, acc ++ "─") }
@@ -759,14 +1115,20 @@ fun render_inline(text) {
 fun inline_loop(s, i, acc) {
     if (i >= string_length(s)) { acc }
     else {
-        # Try to match `` `...` `` first (code spans have priority over emphasis).
-        if (peek1(s, i) == "`") {
+        # Backslash escape (`\*`, `\_`, `` \` ``, …): emit the next char
+        # literally and skip both, so it never triggers markup.
+        if (peek1(s, i) == "\\" && is_escapable(peek1(s, i + 1)) == 'true') {
+            inline_loop(s, i + 2, acc ++ peek1(s, i + 1))
+        } else { if (peek1(s, i) == "`") {
+            # Code spans have priority over emphasis.
             code_close = find_close(s, i + 1, "`")
             if (code_close < 0) {
                 inline_loop(s, i + 1, acc ++ "`")
             } else {
                 code_inner = string_sub(s, i + 1, code_close - (i + 1))
-                colored = UI.brand_color() ++ code_inner ++ UI.reset()
+                # De-red (Wave-3B item 1): inline code is teal/cyan now;
+                # brand red is reserved for headings + the ⏺ tool bullet.
+                colored = UI.code_color() ++ code_inner ++ UI.reset()
                 inline_loop(s, code_close + 1, acc ++ colored)
             }
         } else { if (peek2(s, i) == "**") {
@@ -780,12 +1142,36 @@ fun inline_loop(s, i, acc) {
                 inline_loop(s, i + 2, acc ++ "**")
             } else {
                 bold_inner = string_sub(s, i + 2, bold_close - (i + 2))
-                inline_loop(s, bold_close + 2, acc ++ "\e[1m" ++ bold_inner ++ UI.reset())
+                inline_loop(s, bold_close + 2, acc ++ UI.bold() ++ bold_inner ++ UI.reset())
+            }
+        } else { if (peek2(s, i) == "__") {
+            # __bold__ — same flanking as ** PLUS the not-mid-word rule
+            # (underscores don't emphasize inside identifiers like a__b__c).
+            und_close = find_close(s, i + 2, "__")
+            if (und_close < 0 || und_close == i + 2
+                || string_sub(s, i + 2, 1) == " "
+                || string_sub(s, und_close - 1, 1) == " "
+                || is_word_char(char_before(s, i)) == 'true'
+                || is_word_char(peek1(s, und_close + 2)) == 'true') {
+                inline_loop(s, i + 2, acc ++ "__")
+            } else {
+                und_inner = string_sub(s, i + 2, und_close - (i + 2))
+                inline_loop(s, und_close + 2, acc ++ UI.bold() ++ und_inner ++ UI.reset())
+            }
+        } else { if (peek2(s, i) == "~~") {
+            # ~~strikethrough~~
+            st_close = find_close(s, i + 2, "~~")
+            if (st_close < 0 || st_close == i + 2
+                || string_sub(s, i + 2, 1) == " "
+                || string_sub(s, st_close - 1, 1) == " ") {
+                inline_loop(s, i + 2, acc ++ "~~")
+            } else {
+                st_inner = string_sub(s, i + 2, st_close - (i + 2))
+                inline_loop(s, st_close + 2, acc ++ UI.strikethrough() ++ st_inner ++ UI.reset())
             }
         } else { if (peek1(s, i) == "[") {
-            # Markdown link [label](url): render the label, then the URL
-            # dimmed in parens. Falls through to a literal "[" on any
-            # non-match (lone bracket, missing "](", unclosed paren).
+            # Markdown link [label](url). Falls through to a literal "[" on
+            # any non-match (lone bracket, missing "](", unclosed paren).
             close_br = find_close(s, i + 1, "]")
             if (close_br < 0 || peek1(s, close_br + 1) != "(") {
                 inline_loop(s, i + 1, acc ++ "[")
@@ -796,16 +1182,70 @@ fun inline_loop(s, i, acc) {
                 } else {
                     label = string_sub(s, i + 1, close_br - (i + 1))
                     url = string_sub(s, close_br + 2, close_paren - (close_br + 2))
-                    link_out = render_inline(label) ++ " " ++
-                               UI.grey_text() ++ "(" ++ url ++ ")" ++ UI.reset()
-                    inline_loop(s, close_paren + 1, acc ++ link_out)
+                    inline_loop(s, close_paren + 1, acc ++ render_link(label, url))
                 }
+            }
+        } else { if (peek1(s, i) == "*") {
+            # *italic* — flanking heuristic mirroring **.
+            it_close = find_close(s, i + 1, "*")
+            if (it_close < 0 || it_close == i + 1
+                || string_sub(s, i + 1, 1) == " "
+                || string_sub(s, it_close - 1, 1) == " ") {
+                inline_loop(s, i + 1, acc ++ "*")
+            } else {
+                it_inner = string_sub(s, i + 1, it_close - (i + 1))
+                inline_loop(s, it_close + 1, acc ++ "\e[3m" ++ it_inner ++ UI.reset())
+            }
+        } else { if (peek1(s, i) == "_") {
+            # _italic_ — flanking PLUS not-mid-word (so my_var_name stays
+            # literal).
+            us_close = find_close(s, i + 1, "_")
+            if (us_close < 0 || us_close == i + 1
+                || string_sub(s, i + 1, 1) == " "
+                || string_sub(s, us_close - 1, 1) == " "
+                || is_word_char(char_before(s, i)) == 'true'
+                || is_word_char(peek1(s, us_close + 1)) == 'true') {
+                inline_loop(s, i + 1, acc ++ "_")
+            } else {
+                us_inner = string_sub(s, i + 1, us_close - (i + 1))
+                inline_loop(s, us_close + 1, acc ++ "\e[3m" ++ us_inner ++ UI.reset())
             }
         } else {
             ch = string_sub(s, i, 1)
             inline_loop(s, i + 1, acc ++ ch)
-        }}}
+        }}}}}}}}
     }
+}
+
+# Render a [label](url) link. When colors are on, use an OSC-8 hyperlink
+# so the terminal makes `label` clickable; when off, fall back to the
+# plain "label (url)" form so the URL is still visible.
+fun render_link(label, url) {
+    if (UI.colors_off() == 'true') {
+        render_inline(label) ++ " (" ++ url ++ ")"
+    } else {
+        "\e]8;;" ++ url ++ "\e\\" ++ render_inline(label) ++ "\e]8;;\e\\"
+    }
+}
+
+# Chars a backslash may escape into a literal (the markdown-active
+# punctuation set).
+fun is_escapable(ch) {
+    if (ch == "\\" || ch == "`" || ch == "*" || ch == "_" || ch == "~"
+        || ch == "[" || ch == "]" || ch == "(" || ch == ")" || ch == "#"
+        || ch == "+" || ch == "-" || ch == "." || ch == "!" || ch == "|"
+        || ch == ">" || ch == "<" || ch == "{" || ch == "}") { 'true' }
+    else { 'false' }
+}
+
+fun is_word_char(ch) {
+    if (string_length(ch) == 0) { 'false' }
+    else { if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
+            || (ch >= "0" && ch <= "9")) { 'true' } else { 'false' }}
+}
+
+fun char_before(s, i) {
+    if (i <= 0) { "" } else { string_sub(s, i - 1, 1) }
 }
 
 fun peek1(s, i) {
@@ -903,41 +1343,95 @@ fun filter_empty(items, acc) {
     }
 }
 
-# Display width of a string — counts non-ANSI chars only. ANSI escape
-# sequences start with \x1b[ and end with a letter.
+# Display width of a string in terminal COLUMNS. Escape sequences count
+# zero; UTF-8 is decoded so wide CJK and emoji codepoints count 2. Byte
+# values come from codepoint_at (byte-indexed by design). States:
+#   'norm'     normal text
+#   'csi'      inside a CSI seq (ESC [ … final 0x40-0x7E) — zero width
+#   'osc'      inside an OSC seq (ESC ] … BEL or ST) — e.g. OSC-8 links
+#   'osc_esc'  saw ESC inside OSC — consume the ST's trailing "\"
 fun display_width(s) {
-    dw_loop(s, 0, 0, 'false')
+    dw_loop(s, 0, string_length(s), 0, 'norm')
 }
 
-fun dw_loop(s, i, count, in_esc) {
-    if (i >= string_length(s)) { count }
+fun dw_loop(s, i, slen, count, st) {
+    if (i >= slen) { count }
     else {
-        ch = string_sub(s, i, 1)
-        if (in_esc == 'true') {
-            # ANSI sequences end at any letter (m, K, J, A, etc.)
-            if (is_ansi_end_char(ch) == 'true') {
-                dw_loop(s, i + 1, count, 'false')
-            } else {
-                dw_loop(s, i + 1, count, 'true')
-            }
+        b = codepoint_at(s, i)
+        if (st == 'csi') {
+            if (b >= 64 && b <= 126) { dw_loop(s, i + 1, slen, count, 'norm') }
+            else { dw_loop(s, i + 1, slen, count, 'csi') }
+        } else { if (st == 'osc') {
+            if (b == 7) { dw_loop(s, i + 1, slen, count, 'norm') }
+            else { if (b == 27) { dw_loop(s, i + 1, slen, count, 'osc_esc') }
+            else { dw_loop(s, i + 1, slen, count, 'osc') }}
+        } else { if (st == 'osc_esc') {
+            dw_loop(s, i + 1, slen, count, 'norm')
         } else {
-            if (ch == "\e") {
-                dw_loop(s, i + 1, count, 'true')
+            if (b == 27) {
+                nb = codepoint_at(s, i + 1)
+                if (nb == 91) { dw_loop(s, i + 2, slen, count, 'csi') }
+                else { if (nb == 93) { dw_loop(s, i + 2, slen, count, 'osc') }
+                else { dw_loop(s, i + 1, slen, count, 'csi') }}
             } else {
-                dw_loop(s, i + 1, count + 1, 'false')
+                seq = utf8_seq_len(b)
+                dw_loop(s, i + seq, slen, count + cp_width(utf8_decode(s, i, b, seq)), 'norm')
             }
-        }
+        }}}
     }
 }
 
-fun is_ansi_end_char(ch) {
-    # A CSI sequence's FINAL byte is a letter (m, K, J, H, A-G, n, …). The
-    # introducer '[', the digits, and ';' parameter bytes are NOT terminators,
-    # so accepting any ASCII letter terminates correctly without prematurely
-    # ending on '['. The old hand-list missed many valid finals (I, L, M, etc.),
-    # which made display_width swallow following text as zero-width.
-    if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z")) { 'true' }
-    else { 'false' }
+# UTF-8 lead-byte → sequence length (1-4). A stray continuation byte
+# resyncs as width 1.
+fun utf8_seq_len(b) {
+    if (b < 128) { 1 }
+    else { if (b >= 240) { 4 }
+    else { if (b >= 224) { 3 }
+    else { if (b >= 192) { 2 }
+    else { 1 }}}}
+}
+
+# Decode the codepoint value of the UTF-8 sequence starting at byte i.
+fun utf8_decode(s, i, b, seq) {
+    if (seq == 1) { b }
+    else { if (seq == 2) {
+        (b - 192) * 64 + cont_byte(s, i + 1)
+    } else { if (seq == 3) {
+        (b - 224) * 4096 + cont_byte(s, i + 1) * 64 + cont_byte(s, i + 2)
+    } else {
+        (b - 240) * 262144 + cont_byte(s, i + 1) * 4096
+            + cont_byte(s, i + 2) * 64 + cont_byte(s, i + 3)
+    }}}
+}
+
+fun cont_byte(s, i) {
+    v = codepoint_at(s, i)
+    if (v < 0) { 0 } else { v - 128 }
+}
+
+# Codepoint value at the START of a (typically single-codepoint) string.
+fun first_cp(cs) {
+    b = codepoint_at(cs, 0)
+    if (b < 0) { 0 } else { utf8_decode(cs, 0, b, utf8_seq_len(b)) }
+}
+
+# Terminal column width of a codepoint: 2 for CJK/fullwidth + emoji, else 1.
+fun cp_width(cp) {
+    if (cp_is_wide(cp) == 'true') { 2 } else { 1 }
+}
+
+fun cp_is_wide(cp) {
+    if (cp >= 4352 && cp <= 4447) { 'true' }            # Hangul Jamo 1100-115F
+    else { if (cp >= 11904 && cp <= 42191) { 'true' }   # CJK/Kana/… 2E80-A4CF
+    else { if (cp >= 44032 && cp <= 55203) { 'true' }   # Hangul syllables AC00-D7A3
+    else { if (cp >= 63744 && cp <= 64255) { 'true' }   # CJK compat F900-FAFF
+    else { if (cp >= 65072 && cp <= 65103) { 'true' }   # CJK compat forms FE30-FE4F
+    else { if (cp >= 65280 && cp <= 65376) { 'true' }   # Fullwidth forms FF00-FF60
+    else { if (cp >= 65504 && cp <= 65510) { 'true' }   # Fullwidth signs FFE0-FFE6
+    else { if (cp >= 131072) { 'true' }                 # SIP+ >= 20000
+    else { if (cp >= 127744 && cp <= 129791) { 'true' } # emoji 1F300-1FAFF
+    else { if (cp >= 9728 && cp <= 10175) { 'true' }    # misc symbols 2600-27BF
+    else { 'false' }}}}}}}}}}
 }
 
 # ------------------------------------------------------------
@@ -1032,12 +1526,14 @@ fun has_markdown(s) {
     else { if (string_starts_with(s, "- ") == 'true') { 'true' }
     else { if (string_contains(s, "\n* ") == 'true') { 'true' }
     else { if (string_starts_with(s, "* ") == 'true') { 'true' }
+    else { if (string_contains(s, "\n+ ") == 'true') { 'true' }
+    else { if (string_starts_with(s, "+ ") == 'true') { 'true' }
     else { if (string_contains(s, "\n> ") == 'true') { 'true' }
     else { if (string_contains(s, "\n|") == 'true') { 'true' }
     else { if (string_starts_with(s, "|") == 'true') { 'true' }
     else { if (string_contains(s, "](") == 'true') { 'true' }
     else { if (has_ordered_item(s) == 'true') { 'true' }
-    else { 'false' }}}}}}}}}}}}
+    else { 'false' }}}}}}}}}}}}}}
 }
 
 # True when any line is an ordered-list item ("1. x" / "2) y"). These
@@ -1112,6 +1608,228 @@ fun clear_rows_up(n) {
         print_inline("\e[1A\e[K")
         clear_rows_up(n - 1)
     }
+}
+
+# ============================================================
+# Wave-1B — incremental block streaming (docs/TUI_UX_REVIEW_2026-07-06.md)
+# ============================================================
+# stream_feed(tbl, chunk) / stream_flush(tbl): ETS-backed incremental
+# markdown renderer for the worker-routed LLM stream (llm.sw
+# routed_collect). Instead of painting raw tokens and repainting the
+# whole response afterwards, the stream buffers per BLOCK and each
+# block renders exactly once — through the same Markdown.render as the
+# final view, ALWAYS (no has_markdown gate: streamed output must look
+# identical to a full render, plain prose included).
+#
+# Block boundaries are detected ON FEED, over COMPLETE lines only — a
+# partial line stays pending until its newline arrives, so a fence
+# marker or heading split mid-chunk can never misfire:
+#   · blank line outside a fence → close the pending block
+#   · fence toggle-CLOSE (``` and ~~~; the closing marker must match
+#     the opener, so a ``` line inside a ~~~ fence stays content)
+#   · heading line start → close the pending block; the heading line
+#     itself completes immediately (it's a one-line block)
+# Fence OPEN is NOT a boundary: prose directly above a fence rides
+# along and renders with it, exactly as a full-document render joins
+# them.
+#
+# Return value: the rendered text for the caller to print (the caller
+# owns the terminal), or nil when no block completed. Segments after
+# the first carry a leading "\n" so consecutive prints reproduce the
+# one blank line join_blocks puts between blocks at these boundaries.
+#
+# ETS keys on the session stream_state_table — md_-prefixed to stay
+# clear of ui.sw's agent-block keys ('block'/'sline') and the ticker
+# counters ('stream_tok'/'stream_think'/'ticker_pid'):
+#   'md_buf'      complete lines of the in-flight block ("\n"-joined)
+#   'md_tail'     partial line still waiting for its newline
+#   'md_fence'    'true' while inside a fence
+#   'md_fence_mk' "```" | "~~~" — the marker that opened the fence
+#   'md_emitted'  'true' once any segment was returned this stream
+# stream_flush renders the remainder (walk_blocks closes unterminated
+# fences at EOF) and RESETS every key — llm.sw calls it on each exit
+# path of the receive loop, so the table is always clean for the next
+# call.
+# ------------------------------------------------------------
+fun stream_feed(tbl, chunk) {
+    if (tbl == nil) { nil }
+    else {
+        data = sf_tail(tbl) ++ to_string(chunk)
+        parts = string_split(data, "\n")
+        sf_walk(tbl, parts, sf_buf(tbl), sf_fence(tbl), sf_mk(tbl), sf_pblank(tbl), nil)
+    }
+}
+
+fun stream_flush(tbl) {
+    if (tbl == nil) { nil }
+    else {
+        buf = sf_buf(tbl)
+        tail = sf_tail(tbl)
+        full = if (string_length(tail) == 0) { buf } else { sf_append(buf, tail) }
+        was = ets_get(tbl, 'md_emitted')
+        ets_put(tbl, 'md_buf', "")
+        ets_put(tbl, 'md_tail', "")
+        ets_put(tbl, 'md_fence', 'false')
+        ets_put(tbl, 'md_fence_mk', nil)
+        ets_put(tbl, 'md_emitted', nil)
+        ets_put(tbl, 'md_prev_blank', nil)
+        if (string_length(string_trim(full)) == 0) { nil }
+        else {
+            rendered = render(full, UI.term_width())
+            if (string_length(rendered) == 0) { nil }
+            else { if (was == 'true') { "\n" ++ rendered } else { rendered } }
+        }
+    }
+}
+
+# Line walker over the split parts. The LAST element is the text after
+# the final "\n" (possibly "") — that's the new pending tail, never
+# classified. Self-tail-recursive only (swarmrt TCO's nothing else).
+fun sf_walk(tbl, parts, buf, fence, mk, pblank, out) {
+    if (length(parts) <= 1) {
+        tail = if (length(parts) == 0) { "" } else { hd(parts) }
+        ets_put(tbl, 'md_tail', tail)
+        ets_put(tbl, 'md_buf', buf)
+        ets_put(tbl, 'md_fence', fence)
+        ets_put(tbl, 'md_fence_mk', mk)
+        ets_put(tbl, 'md_prev_blank', pblank)
+        out
+    } else {
+        line = hd(parts)
+        rest = tl(parts)
+        if (fence == 'true') {
+            nbuf = sf_append(buf, line)
+            if (sf_fence_closes(line, mk) == 'true') {
+                # Toggle-close — the completed block includes the fence.
+                sf_walk(tbl, rest, "", 'false', nil, 'false', sf_emit(tbl, nbuf, out))
+            } else {
+                sf_walk(tbl, rest, nbuf, 'true', mk, 'false', out)
+            }
+        } else {
+            fm = sf_fence_marker(line)
+            if (fm != nil) {
+                # Fence OPEN — not a boundary; the fence joins the
+                # pending block and closes it later.
+                sf_walk(tbl, rest, sf_append(buf, line), 'true', fm, 'false', out)
+            } else { if (is_blank(line) == 'true') {
+                # The FIRST blank after content is the block separator the
+                # emit convention already reproduces (it closes the pending
+                # block, or follows a self-closed fence/heading). Every
+                # ADDITIONAL blank in a run is a real row in the batch
+                # render, so the stream emits one empty segment for it.
+                out_b = if (string_length(string_trim(buf)) > 0) {
+                    sf_emit(tbl, buf, out)
+                } else { if (pblank == 'true') {
+                    sf_blank_extra(tbl, out)
+                } else { out }}
+                sf_walk(tbl, rest, "", 'false', nil, 'true', out_b)
+            } else { if (header_depth(line) > 0) {
+                # Heading start closes the pending block; the heading
+                # itself is complete the moment its newline arrived.
+                out2 = sf_emit(tbl, buf, out)
+                sf_walk(tbl, rest, "", 'false', nil, 'false', sf_emit(tbl, line, out2))
+            } else {
+                sf_walk(tbl, rest, sf_append(buf, line), 'false', nil, 'false', out)
+            }}}
+        }
+    }
+}
+
+# Render one completed block and append it to the outgoing segment
+# accumulator. Whitespace-only blocks (e.g. consecutive blank lines)
+# contribute nothing. Segments after the first get a leading "\n" —
+# printed after the previous segment's trailing newline that makes
+# exactly one blank separator line, matching join_blocks' "\n\n".
+fun sf_emit(tbl, text, out) {
+    if (string_length(string_trim(text)) == 0) { out }
+    else {
+        rendered = render(text, UI.term_width())
+        if (string_length(rendered) == 0) { out }
+        else {
+            was = ets_get(tbl, 'md_emitted')
+            ets_put(tbl, 'md_emitted', 'true')
+            piece = if (was == 'true') { "\n" ++ rendered } else { rendered }
+            if (out == nil) { piece } else { out ++ "\n" ++ piece }
+        }
+    }
+}
+
+fun sf_append(buf, line) {
+    if (string_length(buf) == 0) { line } else { buf ++ "\n" ++ line }
+}
+
+# One extra blank line inside a RUN of blanks (the first blank of the
+# run already closed the block and yields the standard one-blank
+# separator). Contributes exactly one empty segment → one blank row
+# when printed, matching join_blocks' per-'blank'-block "\n". Leading
+# blanks (nothing emitted yet) are dropped, as the batch joiner does.
+fun sf_blank_extra(tbl, out) {
+    was = ets_get(tbl, 'md_emitted')
+    if (was != 'true') { out }
+    else { if (out == nil) { "" } else { out ++ "\n" } }
+}
+
+# The full fence-marker RUN of a line: "```..." → "```" + any further
+# backticks ("````" for a 4-tick fence), "~~~~~..." → the ~ run;
+# anything else → nil. The run LENGTH matters: CommonMark requires a
+# closing fence at least as long as its opener, so ``` inside a
+# ````-quoted example must stay content.
+fun sf_fence_marker(line) {
+    t = string_trim(line)
+    if (string_length(t) < 3) { nil }
+    else { if (string_sub(t, 0, 3) == "```") { "```" ++ sf_fence_run(t, 3, "`") }
+    else { if (string_sub(t, 0, 3) == "~~~") { "~~~" ++ sf_fence_run(t, 3, "~") }
+    else { nil }}}
+}
+
+fun sf_fence_run(t, i, ch) {
+    if (i >= string_length(t)) { "" }
+    else { if (string_sub(t, i, 1) == ch) { ch ++ sf_fence_run(t, i + 1, ch) }
+    else { "" }}
+}
+
+# Does `line` CLOSE a fence opened by marker `mk`? Same fence char,
+# run at least as long as the opener, and nothing but the marker on
+# the line (a closer carries no info string — "```python" inside a
+# fence is content, per CommonMark).
+fun sf_fence_closes(line, mk) {
+    if (mk == nil) { 'false' }
+    else {
+        fm = sf_fence_marker(line)
+        if (fm == nil) { 'false' }
+        else {
+            mks = to_string(mk)
+            if (string_sub(fm, 0, 1) != string_sub(mks, 0, 1)) { 'false' }
+            else { if (string_length(fm) < string_length(mks)) { 'false' }
+            else { if (string_trim(line) == fm) { 'true' }
+            else { 'false' }}}
+        }
+    }
+}
+
+# nil-tolerant state readers — a fresh table needs no priming.
+fun sf_buf(tbl) {
+    v = ets_get(tbl, 'md_buf')
+    if (v == nil) { "" } else { to_string(v) }
+}
+
+fun sf_tail(tbl) {
+    v = ets_get(tbl, 'md_tail')
+    if (v == nil) { "" } else { to_string(v) }
+}
+
+fun sf_fence(tbl) {
+    v = ets_get(tbl, 'md_fence')
+    if (v == 'true') { 'true' } else { 'false' }
+}
+
+fun sf_mk(tbl) {
+    ets_get(tbl, 'md_fence_mk')
+}
+
+fun sf_pblank(tbl) {
+    v = ets_get(tbl, 'md_prev_blank')
+    if (v == 'true') { 'true' } else { 'false' }
 }
 
 fun list_last(lst) {

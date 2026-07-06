@@ -27,16 +27,20 @@ module UI
 
 export [
     banner, divider, brand_color, brand_dark, reset,
-    tool_header, tool_result, edit_diff_render,
+    tool_header, tool_result, tool_header_str, tool_result_str,
+    edit_diff_render, diff_ops,
     rationale_box, answer_box,
     input_prompt, input_box_top, input_box_bottom, input_box_bottom_full,
+    input_box_bottom_ctx, tool_result_full,
+    set_title, set_title_cwd, set_title_turn,
     input_divider, footer_hint,
-    status_line, spinner_start, spinner_stop,
+    status_line, stream_ticker_start, stream_ticker_stop,
     tool_progress, tool_progress_clear,
     enter_alt_screen, leave_alt_screen,
     term_width,
     todo_list_render, todo_summary,
     green, grey_text, grey_border, ui_text, warn_color, err_color, accent_color,
+    code_color, warn_text, err_text, ok_text, dim_text,
     agent_color, agent_tool_header, agent_emit_render,
     agent_reply_render, agent_block_leave, agents_table,
     stream_chunk_render, stream_reason_render, stream_done_render
@@ -58,21 +62,105 @@ fun colors_off() {
 
 fun paint(code) { if (colors_off() == 'true') { "" } else { code } }
 
-fun brand_color() { paint("\e[38;2;175;0;0m") }     # #af0000 — deep red (brand/primary)
-fun brand_dark()  { paint("\e[38;2;135;0;0m") }     # #870000 — darker red
-fun brand_dim()   { paint("\e[38;2;95;0;0m")  }     # #5f0000 — very dark red
+# ------------------------------------------------------------
+# COLORTERM detection + theme (Wave-4 item 8)
+# ------------------------------------------------------------
+# The palette is authored in 24-bit RGB. On a truecolor terminal
+# (COLORTERM=truecolor|24bit) it emits `38;2;r;g;b`; otherwise it
+# degrades every slot to the nearest xterm-256 index (`38;5;N`).
+fun term_truecolor() {
+    ct = getenv("COLORTERM")
+    if (ct == nil) { 'false' }
+    else {
+        s = to_string(ct)
+        if (string_contains(s, "truecolor") == 'true') { 'true' }
+        else { if (string_contains(s, "24bit") == 'true') { 'true' } else { 'false' }}
+    }
+}
 
-# OpenCode dark-theme neutrals (step scale).
-fun grey_border() { paint("\e[38;2;72;72;72m")    } # #484848 — borders
-fun grey_text()   { paint("\e[38;2;128;128;128m") } # #808080 — muted / secondary text
-fun ui_text()     { paint("\e[38;2;238;238;238m") } # #eeeeee — primary text
+# "dark" (default) | "light". Light uses DARKER slot tones — the same
+# semantic slots, tuned for contrast on a light background. main.sw
+# copies the config `theme` into SWARM_CODE_THEME so this pure palette
+# can read it globally without threading opts through every render fn.
+fun ui_theme() {
+    v = getenv("SWARM_CODE_THEME")
+    if (v == nil) { "dark" }
+    else { if (to_string(v) == "light") { "light" } else { "dark" }}
+}
 
-# OpenCode semantic colors.
-fun teal_info()   { paint("\e[38;2;86;182;194m")  } # #56b6c2 — info / cyan
-fun warn_color()  { paint("\e[38;2;245;167;66m")  } # #f5a742 — warning / orange
-fun err_color()   { paint("\e[38;2;224;108;117m") } # #e06c75 — error / red
-fun accent_color(){ paint("\e[38;2;157;124;216m") } # #9d7cd8 — accent / purple
+# rgb → an SGR foreground escape (truecolor or 256-nearest), NO_COLOR-gated.
+fun rgb(r, g, b) {
+    if (term_truecolor() == 'true') {
+        paint("\e[38;2;" ++ to_string(r) ++ ";" ++ to_string(g) ++ ";" ++ to_string(b) ++ "m")
+    } else {
+        paint("\e[38;5;" ++ to_string(rgb_to_256(r, g, b)) ++ "m")
+    }
+}
+
+# Nearest xterm-256 index: grayscale ramp (232-255) when r≈g≈b, else the
+# 6×6×6 color cube (16-231).
+fun rgb_to_256(r, g, b) {
+    if (near_gray(r, g, b) == 'true') { gray_index(r, g, b) }
+    else { 16 + 36 * cube6(r) + 6 * cube6(g) + cube6(b) }
+}
+
+fun near_gray(r, g, b) {
+    if (absdiff(r, g) <= 10 && absdiff(g, b) <= 10 && absdiff(r, b) <= 10) { 'true' }
+    else { 'false' }
+}
+
+fun absdiff(a, b) { if (a >= b) { a - b } else { b - a } }
+
+# 0..255 → 0..5 cube step (xterm cube values are 0,95,135,175,215,255;
+# thresholds are the midpoints).
+fun cube6(v) {
+    if (v < 48) { 0 }
+    else { if (v < 115) { 1 }
+    else { if (v < 155) { 2 }
+    else { if (v < 195) { 3 }
+    else { if (v < 235) { 4 }
+    else { 5 }}}}}
+}
+
+# Grayscale ramp: 24 steps (indices 232..255), values 8..238.
+fun gray_index(r, g, b) {
+    avg = (r + g + b) / 3
+    if (avg < 8) { 16 }
+    else { if (avg > 238) { 231 }
+    else { 232 + ((avg - 8) / 10) }}
+}
+
+fun brand_color() { if (ui_theme() == "light") { rgb(135, 0, 0) } else { rgb(175, 0, 0) } }   # deep red (brand/primary)
+fun brand_dark()  { if (ui_theme() == "light") { rgb(110, 0, 0) } else { rgb(135, 0, 0) } }   # darker red
+fun brand_dim()   { if (ui_theme() == "light") { rgb(80, 0, 0)  } else { rgb(95, 0, 0)  } }   # very dark red
+
+# Neutrals (step scale).
+fun grey_border() { if (ui_theme() == "light") { rgb(170, 170, 170) } else { rgb(72, 72, 72)   } } # borders
+fun grey_text()   { if (ui_theme() == "light") { rgb(90, 90, 90)    } else { rgb(128, 128, 128) } } # muted / secondary
+fun ui_text()     { if (ui_theme() == "light") { rgb(30, 30, 30)    } else { rgb(238, 238, 238) } } # primary text
+
+# Semantic colors.
+fun teal_info()   { if (ui_theme() == "light") { rgb(30, 120, 132) } else { rgb(86, 182, 194)  } } # info / cyan
+fun warn_color()  { if (ui_theme() == "light") { rgb(176, 110, 20) } else { rgb(245, 167, 66)  } } # warning / orange
+fun err_color()   { if (ui_theme() == "light") { rgb(176, 40, 50)  } else { rgb(224, 108, 117) } } # error / red
+fun accent_color(){ if (ui_theme() == "light") { rgb(104, 72, 168) } else { rgb(157, 124, 216) } } # accent / purple
+# Inline code — a calm teal/cyan (Wave-3B item 1), harmonious with the
+# brand palette but DISTINCT from the deep red, which is now reserved for
+# headings + the ⏺ tool bullet. Truecolor here; degrades to xterm-256
+# index 80 (teal) automatically via rgb_to_256 on non-truecolor terms.
+fun code_color()  { if (ui_theme() == "light") { rgb(18, 112, 128) } else { rgb(102, 204, 214) } } # inline code / cyan
 fun reset()       { "\e[0m" }
+
+# ------------------------------------------------------------
+# Semantic text helpers (Wave-3B item 2). Wrap a string in a
+# NO_COLOR-gated color + reset(), so diagnostic prints in agent/llm/
+# main/tools never emit a raw, ungated escape. The color codes come
+# from the paint()-gated palette, so under NO_COLOR they collapse to
+# "" and only the (allowed) reset() survives.
+fun warn_text(s) { warn_color() ++ to_string(s) ++ reset() }
+fun err_text(s)  { err_color() ++ to_string(s) ++ reset() }
+fun ok_text(s)   { green() ++ to_string(s) ++ reset() }
+fun dim_text(s)  { grey_text() ++ to_string(s) ++ reset() }
 
 # ------------------------------------------------------------
 # Terminal width via ioctl(TIOCGWINSZ) — the sw builtin `term_cols`
@@ -186,9 +274,15 @@ fun divider() {
 # Indented 2 cols to line up with the bordered input box's content.
 # ------------------------------------------------------------
 fun tool_header(name, args_preview) {
-    display_name = capitalize_first(to_string(name))
     print("")
-    print("  " ++ brand_color() ++ "⏺" ++ reset() ++ " \e[1m" ++ display_name ++ "\e[0m(" ++ args_preview ++ ")")
+    print(tool_header_str(name, args_preview))
+}
+
+# String form — wake turns route it through print_above so tool output
+# never scribbles over the pinned input line (agent.execute_all).
+fun tool_header_str(name, args_preview) {
+    display_name = capitalize_first(to_string(name))
+    "  " ++ brand_color() ++ "⏺" ++ reset() ++ " \e[1m" ++ display_name ++ "\e[0m(" ++ args_preview ++ ")"
 }
 
 # Capitalize first letter of a tool name (bash → Bash, multi_edit → Multi_edit)
@@ -209,14 +303,27 @@ fun capitalize_first(s) {
 # align under the first result character (5-space indent).
 # ------------------------------------------------------------
 fun tool_result(text) {
+    print(tool_result_str(text))
+}
+
+# String form (multi-line) — wake turns split it and print_above each
+# line so bg/pulse tool output lands above the pinned prompt.
+fun tool_result_str(text) {
     lines = string_split(text, "\n")
     preview_lines = take_n_lines(lines, 8, [])
     total = length(lines)
     rendered = render_result_lines(preview_lines, 0)
-    print(rendered)
     if (total > 8) {
-        print("     " ++ grey_text() ++ "… +" ++ to_string(total - 8) ++ " more lines" ++ reset())
-    }
+        rendered ++ "\n" ++ "     " ++ grey_text() ++ "… +" ++ to_string(total - 8) ++
+            " more lines (/expand)" ++ reset()
+    } else { rendered }
+}
+
+# /expand — reprint a stashed tool result UNCAPPED, through the same
+# ⎿-gutter renderer as tool_result (just no 8-line ceiling).
+fun tool_result_full(text) {
+    lines = string_split(text, "\n")
+    print(render_result_lines(lines, 0))
 }
 
 fun render_result_lines(lines, i) {
@@ -256,20 +363,188 @@ fun take_n_lines(lines, n, acc) {
 }
 
 # ------------------------------------------------------------
-# Edit diff preview — colored ± lines under the tool result, so the
-# user sees WHAT changed instead of just "ok: edited path".
-#   - old   ← red,  capped
-#   + new   ← green, capped
+# Edit diff preview — a REAL line-level diff (Wave-3B item 3).
+#
+# The old renderer printed the WHOLE old_string red then the WHOLE
+# new_string green — so a one-line change in a six-line old_string
+# looked like six deletions and six additions, and the changed line
+# could fall past the 4-line cap. This computes an LCS line diff and
+# interleaves the sides: dim context, red `-`, green `+`, with dim
+# `@@ ⋯` hunk headers wherever unchanged runs are collapsed.
+#
+# Cap: 200 lines/side. A larger edit (or a full-file rewrite) falls
+# back to the original two-block preview — the DP is O(n·m) and a
+# quadratic blow-up on a huge paste isn't worth it for a preview.
 # ------------------------------------------------------------
 fun edit_diff_render(old_s, new_s) {
     o = if (old_s == nil) { "" } else { to_string(old_s) }
     n = if (new_s == nil) { "" } else { to_string(new_s) }
-    if (string_length(o) > 0) {
-        diff_side(string_split(o, "\n"), "-", err_color(), 4)
+    old_lines = if (string_length(o) == 0) { [] } else { string_split(o, "\n") }
+    new_lines = if (string_length(n) == 0) { [] } else { string_split(n, "\n") }
+    na = length(old_lines)
+    nb = length(new_lines)
+    if (na > 200 || nb > 200) {
+        # Fallback: the original whole-block preview, capped.
+        if (na > 0) { diff_side(old_lines, "-", err_color(), 4) }
+        if (nb > 0) { diff_side(new_lines, "+", green(), 4) }
+    } else {
+        ops = diff_ops(old_lines, new_lines)
+        diff_print_hunks(ops)
     }
-    if (string_length(n) > 0) {
-        diff_side(string_split(n, "\n"), "+", green(), 4)
+}
+
+# LCS line diff → an ordered list of {kind, line} where kind is
+# 'ctx' (unchanged), 'del' (old-only) or 'add' (new-only). Dels sort
+# before adds at the same position, so a replacement reads "- / +".
+fun diff_ops(a, b) {
+    na = length(a)
+    nb = length(b)
+    arr_a = list_to_ets(a)
+    arr_b = list_to_ets(b)
+    dp = ets_new()
+    dp_fill(dp, arr_a, arr_b, na, nb, na - 1)
+    diff_backtrack(dp, arr_a, arr_b, na, nb, 0, 0, [])
+}
+
+# Index a list into an ETS table (integer keys) for O(1) access.
+fun list_to_ets(xs) {
+    t = ets_new()
+    list_to_ets_loop(t, xs, 0)
+    t
+}
+
+fun list_to_ets_loop(t, xs, i) {
+    if (length(xs) == 0) { t }
+    else {
+        ets_put(t, i, hd(xs))
+        list_to_ets_loop(t, tl(xs), i + 1)
     }
+}
+
+# Fill the suffix-LCS length table backward: dp[i][j] = LCS of a[i..],
+# b[j..]. Missing cells read as 0 (the base row/column). The outer loop
+# self-tail-recurses over i; the inner over j — each is TCO'd on its own,
+# so the stack never grows past one frame per loop.
+fun dp_fill(dp, arr_a, arr_b, na, nb, i) {
+    if (i < 0) { 'ok' }
+    else {
+        dp_fill_row(dp, arr_a, arr_b, na, nb, i, nb - 1)
+        dp_fill(dp, arr_a, arr_b, na, nb, i - 1)
+    }
+}
+
+fun dp_fill_row(dp, arr_a, arr_b, na, nb, i, j) {
+    if (j < 0) { 'ok' }
+    else {
+        ai = ets_get(arr_a, i)
+        bj = ets_get(arr_b, j)
+        v = if (ai == bj) {
+            1 + dp_get(dp, nb, i + 1, j + 1)
+        } else {
+            d1 = dp_get(dp, nb, i + 1, j)
+            d2 = dp_get(dp, nb, i, j + 1)
+            if (d1 >= d2) { d1 } else { d2 }
+        }
+        ets_put(dp, i * (nb + 1) + j, v)
+        dp_fill_row(dp, arr_a, arr_b, na, nb, i, j - 1)
+    }
+}
+
+fun dp_get(dp, nb, i, j) {
+    v = ets_get(dp, i * (nb + 1) + j)
+    if (v == nil) { 0 } else { v }
+}
+
+# Walk the table forward from (0,0), emitting the standard edit script.
+fun diff_backtrack(dp, arr_a, arr_b, na, nb, i, j, acc) {
+    if (i >= na && j >= nb) { acc }
+    else { if (i >= na) {
+        diff_backtrack(dp, arr_a, arr_b, na, nb, i, j + 1,
+                       list_append(acc, {'add', ets_get(arr_b, j)}))
+    } else { if (j >= nb) {
+        diff_backtrack(dp, arr_a, arr_b, na, nb, i + 1, j,
+                       list_append(acc, {'del', ets_get(arr_a, i)}))
+    } else {
+        ai = ets_get(arr_a, i)
+        bj = ets_get(arr_b, j)
+        if (ai == bj) {
+            diff_backtrack(dp, arr_a, arr_b, na, nb, i + 1, j + 1,
+                           list_append(acc, {'ctx', ai}))
+        } else {
+            down = dp_get(dp, nb, i + 1, j)
+            right = dp_get(dp, nb, i, j + 1)
+            if (down >= right) {
+                diff_backtrack(dp, arr_a, arr_b, na, nb, i + 1, j,
+                               list_append(acc, {'del', ai}))
+            } else {
+                diff_backtrack(dp, arr_a, arr_b, na, nb, i, j + 1,
+                               list_append(acc, {'add', bj}))
+            }
+        }
+    }}}
+}
+
+# Render the edit script: keep a change ± its 2-line context window,
+# collapse longer unchanged runs, and print a dim `@@ ⋯` header wherever
+# a run is actually skipped (never a spurious leading header). No changes
+# at all → nothing printed (identical old/new).
+fun diff_ctx_window() { 2 }
+
+fun diff_print_hunks(ops) {
+    n = length(ops)
+    if (n == 0) { 'ok' }
+    else {
+        arr = list_to_ets(ops)
+        changes = diff_collect_changes(arr, n, 0, [])
+        if (length(changes) == 0) { 'ok' }
+        else { diff_emit(arr, n, changes, 0, 0 - 1) }
+    }
+}
+
+fun diff_collect_changes(arr, n, i, acc) {
+    if (i >= n) { acc }
+    else {
+        op = ets_get(arr, i)
+        na = if (elem(op, 0) == 'ctx') { acc } else { list_append(acc, i) }
+        diff_collect_changes(arr, n, i + 1, na)
+    }
+}
+
+fun diff_emit(arr, n, changes, i, last_kept) {
+    if (i >= n) { 'ok' }
+    else {
+        op = ets_get(arr, i)
+        kind = elem(op, 0)
+        keep = if (kind != 'ctx') { 'true' }
+               else { diff_near_change(i, changes, diff_ctx_window()) }
+        new_last = if (keep == 'true') {
+            gap = if (last_kept < 0) { if (i > 0) { 'true' } else { 'false' } }
+                  else { if (i - last_kept > 1) { 'true' } else { 'false' } }
+            if (gap == 'true') { print(diff_hunk_header()) }
+            print(diff_line_str(kind, elem(op, 1)))
+            i
+        } else { last_kept }
+        diff_emit(arr, n, changes, i + 1, new_last)
+    }
+}
+
+fun diff_near_change(i, changes, w) {
+    if (length(changes) == 0) { 'false' }
+    else {
+        c = hd(changes)
+        d = if (i >= c) { i - c } else { c - i }
+        if (d <= w) { 'true' } else { diff_near_change(i, tl(changes), w) }
+    }
+}
+
+fun diff_line_str(kind, line) {
+    if (kind == 'del') { "     " ++ err_color() ++ "- " ++ to_string(line) ++ reset() }
+    else { if (kind == 'add') { "     " ++ green() ++ "+ " ++ to_string(line) ++ reset() }
+    else { "     " ++ grey_text() ++ dim() ++ "  " ++ to_string(line) ++ reset() }}
+}
+
+fun diff_hunk_header() {
+    "     " ++ grey_text() ++ dim() ++ "@@ ⋯" ++ reset()
 }
 
 fun diff_side(lines, sign, color, cap) {
@@ -329,6 +604,13 @@ fun input_box_bottom(model_name, token_count) {
 }
 
 fun input_box_bottom_full(model_name, token_count, budget) {
+    input_box_bottom_ctx(model_name, token_count, budget, "", "", "")
+}
+
+# Enriched footer (Wave-4 item 4/7): /help · model · cwd (branch) · [mode] · tokens.
+# cwd_base / branch are plain strings computed by agent.sw; mode_chip is a
+# pre-colored, self-contained fragment (already "· "-terminated) or "".
+fun input_box_bottom_ctx(model_name, token_count, budget, cwd_base, branch, mode_chip) {
     token_str = if (budget > 0) {
         format_tokens_short(token_count) ++ " / " ++ format_tokens_short(budget)
     } else {
@@ -341,9 +623,116 @@ fun input_box_bottom_full(model_name, token_count, budget) {
         else { if (ratio > 60) { warn_color() ++ token_str ++ reset() }
         else { grey_text() ++ token_str ++ reset() }}
     } else { grey_text() ++ token_str ++ reset() }
-    # Footer: one calm muted line — slash-help hint · model · token meter.
-    print("  " ++ grey_text() ++ "/help  ·  " ++ model_name ++ "  ·  " ++
-          reset() ++ colored_tokens)
+    loc = footer_location(cwd_base, branch)
+    # One calm muted line. The grey span stays open through loc; reset()
+    # before the (self-contained) mode chip and the tinted token meter.
+    print("  " ++ grey_text() ++ "/help  ·  " ++ model_name ++ loc ++ "  ·  " ++
+          reset() ++ mode_chip ++ colored_tokens)
+}
+
+# "  ·  swarm-code (main)" / "  ·  swarm-code" / "" — rendered inside the
+# footer's grey span, so no color codes of its own (keeps it calm + robust).
+fun footer_location(cwd_base, branch) {
+    if (string_length(cwd_base) == 0) { "" }
+    else {
+        b = if (string_length(branch) == 0) { "" } else { " (" ++ branch ++ ")" }
+        "  ·  " ++ cwd_base ++ b
+    }
+}
+
+# ------------------------------------------------------------
+# Terminal title (OSC 2) — Wave-4 item 8. Gated by SW_NO_TITLE (any
+# non-empty value disables it). BEL-terminated (0x07) like xterm's OSC 2;
+# swarmrt's string lexer has no \a escape, so the BEL is built from a byte.
+# ------------------------------------------------------------
+fun title_enabled() {
+    v = getenv("SW_NO_TITLE")
+    if (v == nil) { 'true' }
+    else { if (string_length(to_string(v)) > 0) { 'false' } else { 'true' }}
+}
+
+fun set_title(s) {
+    if (title_enabled() == 'true') {
+        print_inline("\e]2;" ++ title_sanitize(s) ++ bytes_to_string(byte(7)))
+    }
+    'ok'
+}
+
+# Strip C0 control bytes + DEL from the title text: a pasted ESC/BEL in
+# the user's prompt would otherwise corrupt or terminate the OSC 2
+# sequence and leak raw bytes to the terminal. UTF-8 high bytes pass
+# through untouched (byte-wise walk keeps multibyte chars intact).
+fun title_sanitize(s) {
+    title_san_loop(to_string(s), 0, "")
+}
+
+fun title_san_loop(s, i, acc) {
+    if (i >= string_length(s)) { acc }
+    else {
+        ch = string_sub(s, i, 1)
+        o = ord(ch)
+        keep = if (o < 32 || o == 127) { 'false' } else { 'true' }
+        title_san_loop(s, i + 1, if (keep == 'true') { acc ++ ch } else { acc })
+    }
+}
+
+# "swarm-code — <cwd base>" at startup.
+fun set_title_cwd(cwd) {
+    set_title("swarm-code — " ++ title_base(cwd))
+}
+
+# "swarm-code — <cwd base>: <prompt…>" per turn (short suffix).
+fun set_title_turn(cwd, prompt) {
+    p = title_clip(string_trim(to_string(prompt)), 40)
+    if (string_length(p) == 0) { set_title_cwd(cwd) }
+    else { set_title("swarm-code — " ++ title_base(cwd) ++ ": " ++ p) }
+}
+
+fun title_base(p) {
+    title_last(string_split(to_string(p), "/"), "")
+}
+
+fun title_last(lst, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        na = if (string_length(h) == 0) { acc } else { h }
+        title_last(tl(lst), na)
+    }
+}
+
+fun title_clip(s, n) {
+    if (string_length(s) <= n) { s }
+    else { title_trim_partial(string_sub(s, 0, n)) ++ "…" }
+}
+
+# string_sub is BYTE-oriented, so a clip can split a UTF-8 codepoint —
+# drop any incomplete trailing sequence (mirror of the runtime's
+# _sw_utf8_trim_incomplete) so the title never carries invalid bytes.
+fun title_trim_partial(s) {
+    len = string_length(s)
+    cont = count_trailing_cont(s, len, 0)
+    if (cont >= len) { "" }
+    else {
+        lead_i = len - cont - 1
+        o = ord(string_sub(s, lead_i, 1))
+        need = if (o < 128) { 1 }
+               else { if (o >= 240) { 4 }
+               else { if (o >= 224) { 3 }
+               else { if (o >= 192) { 2 }
+               else { 1 }}}}
+        have = 1 + cont
+        if (have >= need) { s } else { string_sub(s, 0, lead_i) }
+    }
+}
+
+fun count_trailing_cont(s, len, acc) {
+    i = len - acc - 1
+    if (i < 0) { acc }
+    else {
+        o = ord(string_sub(s, i, 1))
+        if (o >= 128 && o < 192) { count_trailing_cont(s, len, acc + 1) } else { acc }
+    }
 }
 
 # Short format: "3.7k" (no " tokens" suffix) for the budget display
@@ -432,14 +821,116 @@ fun footer_hint(model_name, token_count) {
 }
 
 # ------------------------------------------------------------
-# Spinner
+# Live stream ticker (Wave-1B) — replaces the dead spinner_start/stop
 # ------------------------------------------------------------
-fun spinner_start(label) {
-    print_inline("\r\e[K " ++ brand_color() ++ "◐" ++ reset() ++ " " ++ grey_text() ++ label ++ "…" ++ reset())
+# One dim \r-rewritten status line owned by a spawned ~1s tick process
+# while the worker-routed LLM stream runs:
+#
+#   ◐ 12s · 176 tok · esc to interrupt
+#   ◓ 3s · thinking · 2.1k · esc to interrupt     (pure-reasoning)
+#
+# Counters live in the stream_state_table ETS, written by llm.sw's
+# receive loop: 'stream_tok' = content chunks seen (≈ tokens),
+# 'stream_think' = reasoning chars seen. The RECEIVE LOOP owns the
+# terminal — it clears the line before printing each rendered block;
+# the ticker only ever does single-line \r rewrites, so the worst race
+# is one stale frame that the next clear wipes (accepted; no locks).
+# stream_ticker_stop kills the tick process AND clears the line —
+# llm.sw calls it on EVERY exit path (done / interrupt / timeout /
+# error), and calling it twice is a harmless no-op.
+fun stream_ticker_start(tbl) {
+    if (tbl == nil) { 'ok' }
+    else {
+        ets_put(tbl, 'stream_tok', 0)
+        ets_put(tbl, 'stream_think', 0)
+        pid = spawn(stream_ticker_loop(tbl, timestamp(), 0))
+        ets_put(tbl, 'ticker_pid', pid)
+        'ok'
+    }
 }
 
-fun spinner_stop() {
-    print_inline("\r\e[K")
+fun stream_ticker_stop(tbl) {
+    if (tbl == nil) { 'ok' }
+    else {
+        pid = ets_get(tbl, 'ticker_pid')
+        if (pid != nil) {
+            # SYNCHRONOUS handshake: exit_proc only sets an async kill_flag,
+            # so a ticker already past its receive (mid-print_inline on
+            # another scheduler thread) could still paint a frame AFTER the
+            # \r\e[K below and the next plain print would append to the
+            # stale "◐ Ns · …" text. Send a tokened stop and WAIT for the
+            # ack — the ack is sent from the ticker's receive arm, so any
+            # in-flight frame print has already completed when it arrives.
+            # The 250ms `after` is only a dead-ticker backstop.
+            tok = to_string(timestamp()) ++ "-" ++ to_string(random_int(1, 1000000))
+            send(pid, {'ticker_stop', self(), tok})
+            wait_ticker_ack(tok)
+            exit_proc(pid, 'kill')
+            ets_put(tbl, 'ticker_pid', nil)
+        }
+        print_inline("\r\e[K")
+        'ok'
+    }
+}
+
+fun wait_ticker_ack(tok) {
+    receive {
+        {'ticker_ack', t} -> if (t == tok) { 'ok' } else { wait_ticker_ack(tok) }
+        after 250 { 'ok' }
+    }
+}
+
+# ~1s tick. SELF-tail-recursive (incl. the receive-after body) — the
+# only loop shape swarmrt TCO's.
+fun stream_ticker_loop(tbl, start_ms, tick) {
+    m = receive {
+        {'ticker_stop', from, tok} -> {'stop', from, tok}
+        after 1000 { 'tick' }
+    }
+    if (m == 'tick') {
+        print_inline(stream_ticker_frame(tbl, start_ms, tick))
+        stream_ticker_loop(tbl, start_ms, tick + 1)
+    } else {
+        # Ack AFTER any frame print above has returned — this ordering is
+        # what lets stream_ticker_stop guarantee no frame after its clear.
+        send(elem(m, 1), {'ticker_ack', elem(m, 2)})
+        'ok'
+    }
+}
+
+fun stream_ticker_frame(tbl, start_ms, tick) {
+    elapsed = (timestamp() - start_ms) / 1000
+    tok = ticker_count(tbl, 'stream_tok')
+    think = ticker_count(tbl, 'stream_think')
+    mid = if (tok == 0 && think > 0) { "thinking · " ++ ticker_fmt_k(think) }
+          else { ticker_fmt_k(tok) ++ " tok" }
+    "\r\e[K  " ++ dim() ++ ticker_glyph(tick) ++ " " ++ to_string(elapsed) ++
+        "s · " ++ mid ++ " · esc to interrupt" ++ reset()
+}
+
+fun ticker_count(tbl, key) {
+    v = ets_get(tbl, key)
+    if (v == nil) { 0 } else { v }
+}
+
+# ◐◓◑◒ — same cycle as FlowsRender.spinner_char. Modulo the long way
+# (see agent_color).
+fun ticker_glyph(tick) {
+    idx = tick - (tick / 4) * 4
+    if (idx == 0) { "◐" }
+    else { if (idx == 1) { "◓" }
+    else { if (idx == 2) { "◑" }
+    else { "◒" }}}
+}
+
+# 1437 → "1.4k", 999 → "999"
+fun ticker_fmt_k(n) {
+    if (n < 1000) { to_string(n) }
+    else {
+        whole = n / 1000
+        tenth = (n - whole * 1000) / 100
+        to_string(whole) ++ "." ++ to_string(tenth) ++ "k"
+    }
 }
 
 # ------------------------------------------------------------
@@ -465,7 +956,7 @@ fun leave_alt_screen() {
 # In-progress items get bold.
 # Pending items are normal.
 
-fun green()      { paint("\e[38;2;127;216;143m") }   # #7fd88f — success (OpenCode)
+fun green()      { if (ui_theme() == "light") { rgb(30, 140, 70) } else { rgb(127, 216, 143) } }   # success
 fun strikethrough() { "\e[9m" }
 fun dim()        { "\e[2m" }
 fun bold()       { "\e[1m" }
@@ -605,9 +1096,30 @@ fun djb2_hash(s, h) {
     }
 }
 
+# Uppercase A–Z → 65..90, else 0. Split out so char_ord can try it first:
+# capitals were previously folded to 0, so every agent name starting with a
+# capital (Builder, Reviewer, …) hashed to the same bucket and drew the same
+# color. Now they spread across the palette like lowercase names do.
+fun char_ord_upper(ch) {
+    if (ch == "A") { 65 } else { if (ch == "B") { 66 } else { if (ch == "C") { 67 }
+    else { if (ch == "D") { 68 } else { if (ch == "E") { 69 } else { if (ch == "F") { 70 }
+    else { if (ch == "G") { 71 } else { if (ch == "H") { 72 } else { if (ch == "I") { 73 }
+    else { if (ch == "J") { 74 } else { if (ch == "K") { 75 } else { if (ch == "L") { 76 }
+    else { if (ch == "M") { 77 } else { if (ch == "N") { 78 } else { if (ch == "O") { 79 }
+    else { if (ch == "P") { 80 } else { if (ch == "Q") { 81 } else { if (ch == "R") { 82 }
+    else { if (ch == "S") { 83 } else { if (ch == "T") { 84 } else { if (ch == "U") { 85 }
+    else { if (ch == "V") { 86 } else { if (ch == "W") { 87 } else { if (ch == "X") { 88 }
+    else { if (ch == "Y") { 89 } else { if (ch == "Z") { 90 }
+    else { 0 }}}}}}}}}}}}}}}}}}}}}}}}}}
+}
+
 fun char_ord(ch) {
     # Approximate ord via comparison ladder for ASCII letters/digits;
-    # other chars fold to 0. Good enough for color hashing.
+    # other chars fold to 0. Good enough for color hashing. Uppercase is
+    # tried first (see char_ord_upper) so capitalized names don't collide.
+    up = char_ord_upper(ch)
+    if (up > 0) { up }
+    else {
     if (ch == "a") { 97 } else { if (ch == "b") { 98 } else { if (ch == "c") { 99 }
     else { if (ch == "d") { 100 } else { if (ch == "e") { 101 } else { if (ch == "f") { 102 }
     else { if (ch == "g") { 103 } else { if (ch == "h") { 104 } else { if (ch == "i") { 105 }
@@ -622,6 +1134,7 @@ fun char_ord(ch) {
     else { if (ch == "3") { 51 } else { if (ch == "4") { 52 } else { if (ch == "5") { 53 }
     else { if (ch == "6") { 54 } else { if (ch == "7") { 55 } else { if (ch == "8") { 56 }
     else { if (ch == "9") { 57 } else { 0 }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }
 }
 
 fun pick_palette(i) {
@@ -823,9 +1336,11 @@ fun format_agent_row(name, entry) {
 # columns. The old version discarded `s` and emitted only spaces.
 fun pad_right(s, width) {
     len = string_length(s)
-    if (len >= width) {
-        if (width <= 1) { string_sub(s, 0, 1) }
-        else { string_sub(s, 0, width - 1) ++ " " }
+    if (len > width) {
+        # Truncated — mark it with an ellipsis in the last column so a
+        # clipped name/role reads as clipped, not as a real short value.
+        if (width <= 1) { "…" }
+        else { string_sub(s, 0, width - 1) ++ "…" }
     } else {
         s ++ s_pad(width - len, "")
     }

@@ -85,7 +85,7 @@ fun all_tools() {
     [
         %{atom: 'bash',               handler: fun(args, opts) { do_bash(args, opts) }},
         %{atom: 'read',               handler: fun(args, opts) { do_read(args) }},
-        %{atom: 'write',              handler: fun(args, opts) { do_write(args) }},
+        %{atom: 'write',              handler: fun(args, opts) { do_write(args, opts) }},
         %{atom: 'edit',               handler: fun(args, opts) { do_edit(args) }},
         %{atom: 'multi_edit',         handler: fun(args, opts) { do_multi_edit(args) }},
         %{atom: 'glob',               handler: fun(args, opts) { do_glob(args) }},
@@ -436,14 +436,15 @@ fun bash_auto_bg(bg_table, cmd_s, after_ms) {
 # Self-tail-recursive foreground wait (deadline carried as an arg so it's a
 # pure self tail-call — mutual recursion isn't TCO'd). Each round: finalize
 # the task ourselves (no bg_done — we own the result if it finished here);
-# if it left 'pending', poll stdin for a bare ESC / Ctrl-C (read_key is a
-# no-op nil when not interactive), then honour the deadline and sleep.
+# if it left 'pending', drain any buffered stdin — a bare ESC / Ctrl-C aborts
+# and kills the task, every other byte is captured as type-ahead (read_key is
+# a no-op nil when not interactive) — then honour the deadline and sleep.
 fun bash_wait_loop(bg_table, id, deadline) {
     st = Background.finalize_if_done(bg_table, id)
     if (st != 'pending') { st }
     else {
-        k = read_key(0)
-        if (k == 27 || k == 3) {
+        drained = drain_stdin_keys()
+        if (drained == 'esc') {
             Background.kill_task(bg_table, id)
             'esc'
         } else {
@@ -454,6 +455,24 @@ fun bash_wait_loop(bg_table, id, deadline) {
             }
         }
     }
+}
+
+# Drain ALL currently-buffered stdin bytes in one non-blocking pass (read_key(0)
+# returns nil the instant the buffer empties). A bare ESC / Ctrl-C returns 'esc'
+# to abort the wait; every other byte is type-ahead — deposited into the runtime
+# pending-input ring so the next read_line seeds it instead of dropping it. This
+# is a drain LOOP rather than one read per 150ms tick, so a queued ESC sitting
+# behind other type-ahead isn't delayed a full poll-slice per preceding byte.
+# Self-tail-recursive; returns the moment an interrupt byte is seen or the
+# buffer empties ('none').
+fun drain_stdin_keys() {
+    k = read_key(0)
+    if (k == nil) { 'none' }
+    else { if (k == 27 || k == 3) { 'esc' }
+    else {
+        stdin_pending_push(bytes_to_string(byte(k)))
+        drain_stdin_keys()
+    }}
 }
 
 # Wrap a user command in a subshell that:
@@ -629,7 +648,7 @@ fun mkdir_walk(p, i, acc) {
     }
 }
 
-fun do_write(args) {
+fun do_write(args, opts) {
     path = resolve_path_arg(args)
     content = map_get(args, 'content')
     if (path == nil) {
@@ -641,6 +660,11 @@ fun do_write(args) {
             guard = PathGuard.validate_write(to_string(path))
             if (guard != "ok") { guard }
             else {
+                # Before clobbering an existing file, stash its prior bytes
+                # so the caller can show a real overwrite diff. Display-only
+                # (headless suppresses the render). Skipped for files ≥64KB —
+                # a large paste isn't worth diffing in the preview.
+                capture_write_prior(opts, to_string(path))
                 ensure_parent_dirs(to_string(path))
                 rc = file_write(path, content)
                 if (rc == 'ok') {
@@ -649,6 +673,33 @@ fun do_write(args) {
                     "error: file_write failed for " ++ path
                 }
             }
+        }
+    }
+}
+
+# Stash an about-to-be-overwritten file's prior content into the
+# 'write_diff_table' ETS (keyed by the raw path arg, matching
+# resolve_path_key in agent.sw), so show_edit_diff can render a real
+# overwrite diff. No table (subagent / test opts) → no-op. Only for an
+# existing file under 64KB; a fresh create or a huge blob is left alone.
+fun capture_write_prior(opts, path) {
+    wd = if (opts == nil) { nil } else { map_get(opts, 'write_diff_table') }
+    if (wd == nil) { 'ok' }
+    else {
+        if (file_exists(path) == 'true') {
+            prior = file_read(path)
+            if (prior != nil && string_length(prior) < 65536) {
+                ets_put(wd, path, prior)
+            } else {
+                # ≥64KB (or unreadable): clear any stale prior from an
+                # earlier write to the same path so show_edit_diff doesn't
+                # render a bogus diff against outdated content.
+                ets_delete(wd, path)
+            }
+        } else {
+            # Fresh create: same stale-entry guard (the path may have been
+            # written before, then deleted out-of-band).
+            ets_delete(wd, path)
         }
     }
 }
@@ -1928,7 +1979,7 @@ fun do_web_fetch(args, opts) {
                     # mcp_server mode reserves stdout for JSON-RPC — never print there.
                     else { if (map_get(opts, 'execution_context') == "mcp_server") { 'false' } else { 'true' } } }
         if (show_wait == 'true') {
-            print_inline("\r\e[K  \e[38;5;240m⋯ fetching " ++ fetch_host_label(url) ++ "…\e[0m")
+            print_inline("\r\e[K  " ++ UI.dim_text("⋯ fetching " ++ fetch_host_label(url) ++ "…"))
         }
         # http_get(url, headers) → response body string, or nil on failure
         body = http_get(url, [])

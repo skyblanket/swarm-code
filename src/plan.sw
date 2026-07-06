@@ -595,20 +595,45 @@ fun repeat_ch(ch, n) {
 # ============================================================
 fun confirm(opts) {
     reader_pid = if (opts == nil) { nil } else { map_get(opts, 'reader_pid') }
-    prompt = UI.warn_color() ++ "  Proceed? [y / n, or type a revised plan]  " ++
-             UI.reset() ++ UI.brand_color() ++ "❯" ++ UI.reset() ++ " "
-    line = if (reader_pid == nil) {
+    if (reader_pid == nil) {
+        # Headless / test fallback — no Reader owns stdin, so read the line
+        # directly and parse y / n / revised-text (unchanged legacy path).
+        prompt = UI.warn_color() ++ "  Proceed? [y / n, or type a revised plan]  " ++
+                 UI.reset() ++ UI.brand_color() ++ "❯" ++ UI.reset() ++ " "
         print(prompt)
         raw = read_line("  " ++ UI.brand_color() ++ "❯" ++ UI.reset() ++ " ")
-        if (raw == nil) { "" } else { to_string(raw) }
+        line = if (raw == nil) { "" } else { to_string(raw) }
+        t = string_trim(line)
+        parse_confirm(string_lower(t), t)
     } else {
+        # Arrow-key picker via the Reader (mirrors agent.sw ask_via_reader):
+        # Proceed / Edit plan / Cancel. read_choice returns -1 on ESC/Ctrl+C,
+        # so ESC == Cancel. Edit falls back to a line read for the new plan.
+        header = "\n  " ++ UI.brand_color() ++ "⏺" ++ UI.reset() ++
+                 " \e[1mProceed with this plan?\e[0m"
+        options = ["Proceed", "Edit plan", "Cancel"]
         token = to_string(self()) ++ "/" ++ to_string(timestamp())
-        send(reader_pid, {'confirm_ask', prompt, self(), token})
-        await_confirm(token)
+        send(reader_pid, {'picker_ask', header, options, self(), token})
+        idx = await_picker(token)
+        if (idx == 0) { 'yes' }
+        else { if (idx == 1) {
+            eprompt = UI.warn_color() ++ "  Type the revised plan (blank = cancel):" ++ UI.reset()
+            etoken = to_string(self()) ++ "/edit/" ++ to_string(timestamp())
+            send(reader_pid, {'confirm_ask', eprompt, self(), etoken})
+            revised = string_trim(to_string(await_confirm(etoken)))
+            if (string_length(revised) == 0) { 'no' } else { {'edit', revised} }
+        }
+        else { 'no' }}
     }
-    t = string_trim(line)
-    lower = string_lower(t)
-    parse_confirm(lower, t)
+}
+
+# Wait for THIS picker's answer; drop stale tokens (mirrors agent.sw
+# await_picker). -1 backstop on a dead Reader.
+fun await_picker(token) {
+    receive {
+        {'picker_answer', t, i} -> if (t == token) { i } else { await_picker(token) }
+        after 600000 { 0 - 1 }
+    }
 }
 
 # Wait for THIS confirmation's answer; drop stale tokens. The 600s backstop

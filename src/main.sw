@@ -104,7 +104,6 @@ fun main() {
     # to a remote provider). This guarantees no conversation data leaves
     # the user's network by accident.
     endpoint_url = to_string(map_get(base_opts, 'endpoint'))
-    verify_network_isolation(endpoint_url, map_get(base_opts, 'api_key'))
 
     # Optional full-terminal alt-screen mode (interactive only)
     tui_env = getenv("SWARM_CODE_TUI")
@@ -117,6 +116,14 @@ fun main() {
                   endpoint_url,
                   cwd)
     }
+
+    # Network isolation — verified AFTER the banner so any ⚠ remote /
+    # bypass notice lands beneath swarm-code's identity (and isn't wiped
+    # by the alt-screen clear above). The refusal path still hard-exits;
+    # in_alt tells it to LEAVE the alt screen first so the explanation
+    # isn't discarded with the alt buffer (silent-exit bug).
+    in_alt = if (tui_env == "1" && headless == 'false') { 'true' } else { 'false' }
+    verify_network_isolation(endpoint_url, map_get(base_opts, 'api_key'), in_alt)
 
     # Load settings (user-global + project-local merged) and project context.
     settings = Config.load()
@@ -134,6 +141,13 @@ fun main() {
     # same agent merge inline and prefix lines only print on agent
     # transitions. Single key 'current' → name | nil.
     stream_state = ets_new()
+    # Stashes the FULL text of the most recent tool result so /expand can
+    # reprint it uncapped (the ⎿ view caps at 8 lines). Single key
+    # 'last_tool_output'.
+    expand_table = ets_new()
+    # Stashes a file's prior bytes just before a `write` overwrites it,
+    # keyed by path, so show_edit_diff can render a real overwrite diff.
+    write_diff_table = ets_new()
 
     # Phase E features: memory, heartbeat, background tasks
     memory_table = Memory.load()
@@ -185,6 +199,8 @@ fun main() {
     opts3c = map_put(opts3c_stats, 'bg_table', bg_table)
     opts3c = map_put(opts3c, 'browser_table', browser_table)
     opts3c = map_put(opts3c, 'stream_state_table', stream_state)
+    opts3c = map_put(opts3c, 'expand_table', expand_table)
+    opts3c = map_put(opts3c, 'write_diff_table', write_diff_table)
     opts3c = map_put(opts3c, 'mcp_table', mcp_table)
     opts3c = map_put(opts3c, 'mcp_schemas', mcp_schemas)
     # Vision: session-scoped ETS queue. read_image tool appends data
@@ -243,6 +259,18 @@ fun main() {
         heartbeat_section ++
         mcp_section ++
         telemetry_section
+
+    # Load persistent line history (~/.swarm-code/history) once, before the
+    # Reader draws the first prompt, so up-arrow recall survives a restart.
+    # Interactive only — headless has no Reader/prompt. Safe here (before any
+    # read_line/termios setup): rl_history_load only reads the file into the
+    # in-memory history array, and is a no-op nil if the file doesn't exist yet.
+    if (headless == 'false') {
+        hist_home = getenv("HOME")
+        if (hist_home != nil) {
+            rl_history_load(hist_home ++ "/.swarm-code/history")
+        }
+    }
 
     if (headless == 'true') {
         Agent.run_headless(map_put(opts5, 'no_resume', no_resume),
@@ -752,7 +780,7 @@ fun resolve_cwd() {
 # reports, NO hardcoded "phone home" URLs. This check enforces that the
 # LLM endpoint is local/private by default. Set SWARM_CODE_ALLOW_REMOTE=1
 # to bypass (e.g., when running against a remote LAN box intentionally).
-fun verify_network_isolation(url, api_key) {
+fun verify_network_isolation(url, api_key, in_alt) {
     bypass = getenv("SWARM_CODE_ALLOW_REMOTE")
     has_auth = if (api_key == nil) { 'false' }
                else { if (string_length(to_string(api_key)) == 0) { 'false' }
@@ -761,7 +789,7 @@ fun verify_network_isolation(url, api_key) {
     is_local = is_local_host(host)
 
     if (bypass == "1") {
-        print(" \e[38;5;214m⚠ SWARM_CODE_ALLOW_REMOTE=1 — network isolation disabled\e[0m")
+        print(" " ++ UI.warn_text("⚠ SWARM_CODE_ALLOW_REMOTE=1 — network isolation disabled"))
         "ok"
     }
     else { if (is_local == 'true') {
@@ -771,8 +799,12 @@ fun verify_network_isolation(url, api_key) {
         "ok"
     }
     else {
+        # Hard refusal — if we're inside the optional alt screen, leave it
+        # BEFORE printing: sys_exit would otherwise discard the explanation
+        # with the alt buffer and leave the terminal un-restored.
+        if (in_alt == 'true') { UI.leave_alt_screen() }
         print("")
-        print("\e[38;5;124m\e[1m⏺ swarm-code\e[0m refuses to contact non-local endpoints.")
+        print(UI.brand_color() ++ "\e[1m⏺ swarm-code" ++ UI.reset() ++ " refuses to contact non-local endpoints.")
         print("")
         print(" endpoint : " ++ url)
         print(" host     : " ++ host)
@@ -1074,8 +1106,8 @@ fun run_doctor() {
               " warning(s) — swarm-code will run, but check the items above" ++ UI.reset())
         1
     } else {
-        print("\e[31m   ✗ " ++ to_string(errors) ++ " error(s), " ++
-              to_string(warnings) ++ " warning(s) — fix the ✗ items before launching\e[0m")
+        print(UI.err_text("   ✗ " ++ to_string(errors) ++ " error(s), " ++
+              to_string(warnings) ++ " warning(s) — fix the ✗ items before launching"))
         2
     }}
 }

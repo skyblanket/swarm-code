@@ -32,7 +32,8 @@ import Util
 #   }
 # }
 
-export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash]
+export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
+        llm_timeout_ms]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
@@ -55,6 +56,52 @@ fun load_one(path) {
         } else {
             decoded = json_decode(file_content)
             if (decoded == nil) { map_new() } else { decoded }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# llm_timeout_ms — inactivity window (ms) for the worker-routed LLM
+# stream (llm.sw stream_call). If no stream message (chunk / reason /
+# done / result) arrives within this window the in-flight call is
+# treated as a TRANSIENT failure (hung connection) so the normal
+# retry/backoff engages — closing the "a hung connection blocks the
+# turn forever" hole. A coarse total deadline of 3x this value bounds
+# even a trickling-but-never-finishing stream.
+#
+# Priority: SWARM_CODE_LLM_TIMEOUT_MS env → settings.json
+# "llm_timeout_ms" → 300000 (5 minutes) default.
+# ------------------------------------------------------------
+fun llm_timeout_ms(opts) {
+    env = getenv("SWARM_CODE_LLM_TIMEOUT_MS")
+    env_n = if (env == nil) { 0 - 1 } else { parse_pos_int_cfg(to_string(env), 0, 0, 'false') }
+    if (env_n > 0) { env_n }
+    else {
+        settings = map_get(opts, 'settings')
+        sv = if (settings == nil) { nil } else { map_get(settings, 'llm_timeout_ms') }
+        sn = if (sv == nil) { 0 - 1 } else { parse_pos_int_cfg(to_string(sv), 0, 0, 'false') }
+        if (sn > 0) { sn } else { 300000 }
+    }
+}
+
+# Positive-int parser (same pattern as agent.sw parse_budget_env /
+# llm.sw parse_positive_int_local — kept local so config.sw stays
+# dependency-free). Returns -1 when the string holds no leading digits.
+fun parse_pos_int_cfg(s, i, acc, saw_digit) {
+    if (i >= string_length(s)) {
+        if (saw_digit == 'true') { acc } else { 0 - 1 }
+    } else {
+        ch = string_sub(s, i, 1)
+        d = if (ch == "0") { 0 } else { if (ch == "1") { 1 }
+            else { if (ch == "2") { 2 } else { if (ch == "3") { 3 }
+            else { if (ch == "4") { 4 } else { if (ch == "5") { 5 }
+            else { if (ch == "6") { 6 } else { if (ch == "7") { 7 }
+            else { if (ch == "8") { 8 } else { if (ch == "9") { 9 }
+            else { 0 - 1 }}}}}}}}}}
+        if (d < 0) {
+            if (saw_digit == 'true') { acc } else { 0 - 1 }
+        } else {
+            parse_pos_int_cfg(s, i + 1, acc * 10 + d, 'true')
         }
     }
 }

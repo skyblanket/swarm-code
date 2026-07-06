@@ -37,8 +37,6 @@ fun reader_loop() {
     receive {
         {'draw_and_read'} ->
             handle_main_read()
-        {'permission_ask', prompt_text, reply_pid} ->
-            handle_permission(prompt_text, reply_pid)
         {'picker_ask', header, options, reply_pid, token} ->
             handle_picker(header, options, reply_pid, token)
         {'confirm_ask', prompt_text, reply_pid, token} ->
@@ -72,6 +70,14 @@ fun watch_loop(token) {
             # filters out arrow/F-key escape sequences, so k==27 is a bare Esc).
             main_pid = whereis('main_agent')
             if (main_pid != nil) { send(main_pid, {'interrupt', token}) }
+        } else {
+            # Every other key the user types mid-tool is type-ahead, not an
+            # interrupt. Instead of dropping it, deposit the raw byte into the
+            # runtime pending-input ring so the NEXT read_line seeds it as the
+            # start of the following prompt (CC-style queued input). read_key
+            # already drained arrow/F-key/paste framing, so k is a lone byte;
+            # nil means poll-timeout / no key, so guard that.
+            if (k != nil) { stdin_pending_push(bytes_to_string(byte(k))) }
         }
         watch_loop(token)
     }
@@ -99,20 +105,35 @@ fun handle_main_read() {
         if (main_pid != nil) { send(main_pid, {'eof'}) }
     } else {
         if (main_pid != nil) { send(main_pid, {'user_input', line}) }
+        # Persist the submitted line to ~/.swarm-code/history so up-arrow recall
+        # survives a restart. In-session recall already works via read_line's own
+        # history push; this only adds cross-restart persistence.
+        maybe_append_history(line)
     }
     'ok'
 }
 
-# Permission-prompt path: print the prompt text main gave us, read a
-# single line, hand it straight back to the caller (not main_agent by
-# default — the sender might be a subagent). No box drawing; the
-# prompt is inline under the tool header.
-fun handle_permission(prompt_text, reply_pid) {
-    print(prompt_text)
-    answer = read_line("  > ")
-    reply = if (answer == nil) { "" } else { answer }
-    if (reply_pid != nil) { send(reply_pid, {'permission_answer', reply}) }
-    'ok'
+# Append one submitted line to the persistent history file, honouring the
+# leading-space "don't record" convention and skipping blanks. rl_history_append
+# creates the parent dir and rejects blank/multiline input itself; this is the
+# policy layer on top of it.
+fun maybe_append_history(line) {
+    if (string_length(line) == 0) { 'ok' }
+    else { if (string_starts_with(line, " ") == 'true') { 'ok' }
+    else {
+        path = history_path()
+        if (path == nil) { 'ok' }
+        else {
+            rl_history_append(path, line)
+            'ok'
+        }
+    }}
+}
+
+# Resolve ~/.swarm-code/history from $HOME, or nil if HOME is unset.
+fun history_path() {
+    home = getenv("HOME")
+    if (home == nil) { nil } else { home ++ "/.swarm-code/history" }
 }
 
 # Plan-confirmation path: print the prompt, read one line, hand the RAW

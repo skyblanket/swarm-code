@@ -43,7 +43,10 @@ import Flows
 import ToolExecutor
 
 export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
-        drop_to_last_clean_user, trailing_turn_incomplete, trim_incomplete]
+        drop_to_last_clean_user, trailing_turn_incomplete, trim_incomplete,
+        looks_like_slash_command, is_known_slash_command, bg_normalize_id,
+        get_session_mode, set_session_mode, next_mode, resolve_permission,
+        show_expand, handle_bg_command, route_input]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -456,10 +459,15 @@ fun run(opts, system_prompt_text) {
 
     reader_pid = Reader.start()
     print("")
+    opts_with_reader = map_put(opts_journal, 'reader_pid', reader_pid)
+    # Terminal title (gated by SW_NO_TITLE) + the enriched footer BEFORE the
+    # first prompt, so cwd/branch/mode show from turn zero instead of only
+    # after the first user turn (Wave-4 item 4/8).
+    UI.set_title_cwd(to_string(map_get(opts_with_reader, 'cwd')))
     if (reader_pid != nil) {
+        draw_footer(history, opts_with_reader)
         send(reader_pid, {'draw_and_read'})
     }
-    opts_with_reader = map_put(opts_journal, 'reader_pid', reader_pid)
     main_loop(history, opts_with_reader)
 }
 
@@ -569,8 +577,10 @@ fun main_loop(history, opts) {
 
 fun handle_user_input_msg(line, history, opts) {
     Log.user_input(line)
-    UI.input_box_bottom_full(to_string(map_get(opts, 'model')),
-        display_tokens(history, opts), context_budget_tokens())
+    # Per-turn terminal title suffix (gated by SW_NO_TITLE) + enriched footer
+    # (model · cwd (branch) · [mode chip] · tokens) above the prompt.
+    UI.set_title_turn(to_string(map_get(opts, 'cwd')), line)
+    draw_footer(history, opts)
     post_input_history = route_input(line, history, opts)
     print("")
     reader_pid = map_get(opts, 'reader_pid')
@@ -597,6 +607,23 @@ fun route_input(line, history, opts) {
         else { if (string_starts_with(trimmed, "/") == 'true' &&
                    is_known_slash_command(first_token(trimmed)) == 'true') {
             slash_dispatch(trimmed, history, opts)
+        }
+        # A command-shaped leading slash — /[a-z_-]+ only, no further slash,
+        # dot, or uppercase — that ISN'T a known command is a typo, not chat.
+        # Tell the user instead of quietly sending "/halp" to the LLM.
+        # Filesystem paths (/Users/…, /tmp/x, ./a.png) fail the command-shape
+        # test (they contain "/", ".", or uppercase after the first char) and
+        # fall through to the chat path unchanged. Returning history with no
+        # LLM turn; handle_user_input_msg redraws the prompt afterwards.
+        # Extra guard: bare all-lowercase top-level paths (/tmp, /etc, /usr,
+        # /var, /opt, /bin, /srv …) are command-shaped too — "/tmp got full"
+        # must reach the LLM, not die as "unknown command: /tmp". Anything
+        # that exists on disk is a path, not a typo'd command.
+        else { if (looks_like_slash_command(first_token(trimmed)) == 'true' &&
+                   file_exists(first_token(trimmed)) != 'true') {
+            print(UI.warn_text("unknown command: " ++ first_token(trimmed)) ++
+                  " \e[2m— type /help\e[0m")
+            history
         }
         else {
             Config.run_hooks("UserPromptSubmit", 'user', line, opts)
@@ -626,7 +653,7 @@ fun route_input(line, history, opts) {
                 # ("compacting on every turn"). Token-gated = compact rarely, late.
                 run_turn(gated, opts, 0)
             }
-        }}}}
+        }}}}}
     }
 }
 
@@ -712,7 +739,12 @@ fun cognitive_pulse(tick_count, history, opts) {
         "work without user approval."
 
     pulse_msgs = list_append(history, LLM.new_message_user(pulse_msg))
-    wake_opts = map_put(opts, 'in_wake_chain', 'true')
+    wake_opts0 = map_put(opts, 'in_wake_chain', 'true')
+    # 'wake_turn': the pulse fires while the Reader is pinned in
+    # read_line — any streaming/diag output must go above the prompt
+    # (chat_silent itself is non-streaming, but tools the pulse fires
+    # inherit these opts).
+    wake_opts = map_put(wake_opts0, 'wake_turn', 'true')
     response = LLM.chat_silent(pulse_msgs, wake_opts)
 
     if (response == nil) { history }
@@ -724,8 +756,10 @@ fun cognitive_pulse(tick_count, history, opts) {
                   else { 'false' }}
         if (is_idle == 'true') { history }
         else {
-            print("")
-            print("\e[2m[daemon pulse — acting autonomously]\e[0m")
+            # print_above throughout — the Reader is pinned in read_line
+            # and plain prints would land on top of the prompt.
+            print_above("")
+            print_above("\e[2m[daemon pulse — acting autonomously]\e[0m")
             with_pulse = list_append(history, LLM.new_message_user(pulse_msg))
             # chat_silent returns a string; pulse may have emitted inband
             # tool markers. Parse them once via LLM.parse_inband_tool_calls.
@@ -735,11 +769,14 @@ fun cognitive_pulse(tick_count, history, opts) {
             with_response = list_append(with_pulse,
                 LLM.new_message_assistant(pulse_prose, pulse_tcs, nil))
             if (length(pulse_tcs) == 0) {
-                print("  " ++ UI.grey_text() ++ pulse_prose ++ UI.reset())
-                print("")
+                print_above("  " ++ UI.grey_text() ++ pulse_prose ++ UI.reset())
+                print_above("")
                 with_response
             } else {
-                execute_all(pulse_tcs, with_response, wake_opts)
+                post_pulse = execute_all(pulse_tcs, with_response, wake_opts)
+                # In-place prompt redraw after the pulse's tool output.
+                print_above("")
+                post_pulse
             }
         }
     }
@@ -748,7 +785,7 @@ fun cognitive_pulse(tick_count, history, opts) {
 # Background task completion handler.
 fun on_bg_done(task_id, exit_code, label, history, opts) {
     Log.bg_done(task_id, exit_code, label)
-    color = if (exit_code == 0) { UI.brand_color() } else { "\e[31m" }
+    color = if (exit_code == 0) { UI.brand_color() } else { UI.err_color() }
     print_above("")
     print_above(color ++ "⏺" ++ UI.reset() ++ " \e[1mbg_done\e[0m " ++ task_id ++
           "  \e[2mexit " ++ to_string(exit_code) ++ " · " ++ label ++ "\e[0m")
@@ -777,13 +814,29 @@ fun on_bg_done(task_id, exit_code, label, history, opts) {
             "there's nothing to do, just say something short like \"ok, done.\" " ++
             "Do NOT start new long-running work without user approval."
 
-        print("\e[2m[autonomy: reacting to bg_done...]\e[0m")
+        print_above("\e[2m[autonomy: reacting to bg_done...]\e[0m")
         with_wake = list_append(history, LLM.new_message_user(wake_msg))
-        wake_opts = map_put(opts, 'in_wake_chain', 'true')
-        run_turn(with_wake, wake_opts, 0)
+        wake_opts0 = map_put(opts, 'in_wake_chain', 'true')
+        # Wake turns run while the Reader is pinned in read_line.
+        # 'wake_turn' makes llm.sw stream silently (self-routed 5-arg
+        # call, nothing painted mid-stream) and emit the final rendered
+        # output via print_above — so the turn never scribbles over the
+        # pinned prompt (autonomy/stream collision fix, Wave-1A).
+        wake_opts = map_put(wake_opts0, 'wake_turn', 'true')
+        post_wake = run_turn(with_wake, wake_opts, 0)
+        # Clean prompt redraw under anything the turn printed. NOT a
+        # {'draw_and_read'} re-send: the reader never left read_line —
+        # a queued draw_and_read would fire a spurious second prompt +
+        # read after the user submits the current line. print_above("")
+        # wipes and redraws the live input line in place instead.
+        print_above("")
+        post_wake
     } else {
-        print("  \e[38;5;240m⎿\e[0m  \e[38;5;244muse bg_result " ++ task_id ++ " to see output\e[0m")
-        print("")
+        # print_above like the sibling header lines: the Reader is pinned in
+        # read_line, a plain print here landed on the live input line.
+        print_above("  " ++ UI.grey_border() ++ "⎿" ++ UI.reset() ++ "  " ++
+              UI.dim_text("/bg tail " ++ task_id ++ " to see output"))
+        print_above("")
         history
     }
 }
@@ -797,7 +850,7 @@ fun on_bg_stalled(task_id, label, tail, history, opts) {
     print_above("")
     print_above(UI.warn_color() ++ "⏺" ++ UI.reset() ++ " \e[1mbg_stalled\e[0m " ++ task_id ++
           "  \e[2m(" ++ label ++ ") — no output for 45s; tail looks interactive\e[0m")
-    print_above("  \e[2mbg_tail " ++ task_id ++ " / bg_kill " ++ task_id ++ "\e[0m")
+    print_above("  \e[2m/bg tail " ++ task_id ++ "  ·  /bg kill " ++ task_id ++ "\e[0m")
     print_above("")
 
     autonomy = map_get(opts, 'autonomy')
@@ -815,10 +868,15 @@ fun on_bg_stalled(task_id, label, tail, history, opts) {
             "--yes, </dev/null, DEBIAN_FRONTEND=noninteractive, etc.). If it is " ++
             "legitimately slow (compiles, downloads), leave it running."
 
-        print("\e[2m[autonomy: reacting to bg_stalled...]\e[0m")
+        print_above("\e[2m[autonomy: reacting to bg_stalled...]\e[0m")
         with_wake = list_append(history, LLM.new_message_user(wake_msg))
-        wake_opts = map_put(opts, 'in_wake_chain', 'true')
-        run_turn(with_wake, wake_opts, 0)
+        wake_opts0 = map_put(opts, 'in_wake_chain', 'true')
+        # Same wake-turn discipline as on_bg_done — silent stream +
+        # print_above render, then an in-place prompt redraw.
+        wake_opts = map_put(wake_opts0, 'wake_turn', 'true')
+        post_wake = run_turn(with_wake, wake_opts, 0)
+        print_above("")
+        post_wake
     } else {
         history
     }
@@ -876,18 +934,26 @@ fun slash_dispatch(cmd, history, opts) {
         if (plan_arg == "on" || plan_arg == "off" || plan_arg == "auto") {
             p = Plan.plan_mode_override_path()
             if (p != nil) { file_write(p, plan_arg) }
+            # Keep the /mode chip + resolve_permission in sync with the
+            # override file: "/plan on" lights the plan chip; leaving via
+            # "/plan off|auto" clears it (only if plan was the active mode —
+            # never stomp auto-accept-edits).
+            if (plan_arg == "on") { set_session_mode(opts, "plan") }
+            else { if (get_session_mode(opts) == "plan") {
+                set_session_mode(opts, "default")
+            } else { 'ok' }}
             print(UI.brand_color() ++ "✓ plan mode set to " ++ plan_arg ++ UI.reset())
             print(UI.grey_text() ++ "  takes effect on next request. " ++
                   "Use /plan to check." ++ UI.reset())
         } else {
-            print("\e[33musage: /plan [on | off | auto]\e[0m")
+            print(UI.warn_text("usage: /plan [on | off | auto]"))
         }
         history
     }
     else { if (string_starts_with(cmd, "/search ") == 'true') {
         query = string_trim(string_sub(cmd, 8, string_length(cmd) - 8))
         if (string_length(query) == 0) {
-            print("\e[33musage: /search QUERY\e[0m")
+            print(UI.warn_text("usage: /search QUERY"))
         } else {
             print(SessionSearch.search_render(query, 10))
         }
@@ -902,14 +968,14 @@ fun slash_dispatch(cmd, history, opts) {
         rest = string_trim(string_sub(cmd, 10, string_length(cmd) - 10))
         parsed = parse_schedule_args(rest)
         if (parsed == nil) {
-            print("\e[33musage: /schedule \"EXPR\" \"PROMPT\"  " ++
-                  "(EXPR is 30s/5m/2h/1d or 'hourly'/'daily HH:MM')\e[0m")
+            print(UI.warn_text("usage: /schedule \"EXPR\" \"PROMPT\"  " ++
+                  "(EXPR is 30s/5m/2h/1d or 'hourly'/'daily HH:MM')"))
         } else {
             expr = hd(parsed)
             prompt = hd(tl(parsed))
             id = Scheduler.add(expr, prompt)
             if (id == nil) {
-                print("\e[33minvalid EXPR — try 30s, 5m, 2h, 1d, hourly, daily 09:00\e[0m")
+                print(UI.warn_text("invalid EXPR — try 30s, 5m, 2h, 1d, hourly, daily 09:00"))
             } else {
                 print(UI.brand_color() ++ "✓ scheduled job " ++ id ++
                       " (" ++ expr ++ "): " ++ prompt ++ UI.reset())
@@ -922,7 +988,7 @@ fun slash_dispatch(cmd, history, opts) {
         if (Scheduler.remove(id) == 'true') {
             print("\e[2m✓ unscheduled " ++ id ++ "\e[0m")
         } else {
-            print("\e[33mno job with id " ++ id ++ "\e[0m")
+            print(UI.warn_text("no job with id " ++ id))
         }
         history
     }
@@ -958,7 +1024,7 @@ fun slash_dispatch(cmd, history, opts) {
         msg = if (string_length(prose) == 0) { "what's in this?" } else { prose }
         tmp = Vision.paste_from_clipboard(opts)
         if (tmp == nil) {
-            print("\e[33m(clipboard has no image — copy a screenshot first)\e[0m")
+            print(UI.warn_text("(clipboard has no image — copy a screenshot first)"))
             history
         } else {
             print(UI.grey_text() ++ "  📎 attached: " ++ tmp ++ UI.reset())
@@ -980,7 +1046,7 @@ fun slash_dispatch(cmd, history, opts) {
     else { if (cmd == "/resume") {
         restored = load_latest_session(opts)
         if (length(restored) == 0) {
-            print("\e[33mno session to resume\e[0m")
+            print(UI.warn_text("no session to resume"))
             history
         } else {
             print("\e[2m[resumed " ++ to_string(length(restored)) ++ " messages]\e[0m")
@@ -1053,7 +1119,7 @@ fun slash_dispatch(cmd, history, opts) {
     else { if (cmd == "/memory reindex") {
         ep = map_get(opts, 'embed_endpoint', nil)
         if (ep == nil) {
-            print("\e[33mreindex requires SWARM_CODE_EMBED_ENDPOINT to be configured\e[0m")
+            print(UI.warn_text("reindex requires SWARM_CODE_EMBED_ENDPOINT to be configured"))
         } else {
             print("\e[2mreindexing memories...\e[0m")
             result = Memory.embed_missing(opts)
@@ -1064,10 +1130,24 @@ fun slash_dispatch(cmd, history, opts) {
     else { if (cmd == "/debug") { show_debug(history, opts) ; history }
     else { if (cmd == "/debug llm") { show_debug_llm() ; history }
     else { if (cmd == "/debug tools") { show_debug_tools() ; history }
+    else { if (first_token(cmd) == "/bg") {
+        handle_bg_command(cmd, opts)
+        history
+    }
+    else { if (cmd == "/mode") {
+        nxt = cycle_mode(opts)
+        print(UI.brand_color() ++ "✓ mode: " ++ nxt ++ UI.reset())
+        print(UI.grey_text() ++ "  default → auto-accept-edits → plan  (/mode to cycle)" ++ UI.reset())
+        history
+    }
+    else { if (cmd == "/expand") {
+        show_expand(opts)
+        history
+    }
     else { if (first_token(cmd) == "/flows") {
         path = string_sub(cmd, 7, string_length(cmd) - 7)
         if (string_length(path) == 0) {
-            print("\e[33musage: /flows <workflow-definition.json>\e[0m")
+            print(UI.warn_text("usage: /flows <workflow-definition.json>"))
             history
         } else {
             Flows.run_flows(string_trim(path), opts)
@@ -1075,9 +1155,24 @@ fun slash_dispatch(cmd, history, opts) {
         }
     }
     else {
-        print("\e[33munknown command: " ++ cmd ++ "\e[0m  (type /help)")
+        print(UI.warn_text("unknown command: " ++ cmd) ++ "  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+}
+
+# /expand — reprint the most recent tool result in full (uncapped),
+# through the normal ⎿-gutter result renderer. The full output was
+# stashed in the expand_table ETS at render time (execute_all).
+fun show_expand(opts) {
+    et = map_get(opts, 'expand_table')
+    stored = if (et == nil) { nil } else { ets_get(et, 'last_tool_output') }
+    if (stored == nil) {
+        print(UI.grey_text() ++ "  (nothing to expand — no tool output yet)" ++ UI.reset())
+    } else {
+        print("")
+        UI.tool_result_full(to_string(stored))
+    }
+    'ok'
 }
 
 fun show_help() {
@@ -1108,6 +1203,9 @@ fun show_help() {
     print("  /telemetry            last 30 events (LLM, tools, errors)")
     print("  /stats                today's session summary")
     print("  /flows <workflow.json>  run a multi-agent workflow with live TUI")
+    print("  /bg [tail|kill] [id]  list / tail / kill background tasks")
+    print("  /expand               reprint the last tool result in full")
+    print("  /mode                 cycle permission mode (default → auto-accept-edits → plan)")
     print("  /clear                clear screen")
     print("  /reset                clear conversation history")
     print("  /compact              summarize history to save context")
@@ -1234,18 +1332,18 @@ fun profile_override_path() {
 
 fun apply_profile_override(name) {
     if (string_length(name) == 0) {
-        print("\e[33musage: /profile NAME  (try /profiles to list)\e[0m")
+        print(UI.warn_text("usage: /profile NAME  (try /profiles to list)"))
     }
     else {
         settings = Config.load()
         profiles = if (settings == nil) { nil } else { map_get(settings, 'profiles') }
         if (profiles == nil) {
-            print("\e[33mno 'profiles' map in ~/.swarm-code/settings.json\e[0m")
+            print(UI.warn_text("no 'profiles' map in ~/.swarm-code/settings.json"))
         }
         else {
             p = lookup_profile(profiles, name)
             if (p == nil) {
-                print("\e[33mno profile named '" ++ name ++ "' — try /profiles\e[0m")
+                print(UI.warn_text("no profile named '" ++ name ++ "' — try /profiles"))
             }
             else {
                 ov = profile_to_override(p)
@@ -1261,7 +1359,7 @@ fun apply_profile_override(name) {
 
 fun apply_model_override(model_name) {
     if (string_length(model_name) == 0) {
-        print("\e[33musage: /model NAME\e[0m")
+        print(UI.warn_text("usage: /model NAME"))
     }
     else {
         ov = %{ model: model_name }
@@ -1289,7 +1387,7 @@ fun show_active_profile() {
         raw = file_read(p)
         ov = if (raw == nil) { nil } else { json_decode(raw) }
         if (ov == nil) {
-            print("\e[33m(override file present but unreadable: " ++ p ++ ")\e[0m")
+            print(UI.warn_text("(override file present but unreadable: " ++ p ++ ")"))
         } else {
             print("\e[1mactive override\e[0m")
             show_override_field(ov, 'endpoint')
@@ -1391,7 +1489,7 @@ fun show_model_info(opts) {
           " (SWARM_CODE_MAX_TOKENS=" ++ to_string(max_tokens_env()) ++ ")")
     print("")
     if (resp == nil) {
-        print("\e[33m  server /v1/models: unreachable\e[0m")
+        print("  " ++ UI.warn_text("server /v1/models: unreachable"))
     } else {
         print("\e[1m  server /v1/models response:\e[0m")
         decoded = json_decode(resp)
@@ -1439,7 +1537,7 @@ fun print_msgs(msgs, i) {
         tcs = map_get(msg, 'tool_calls')
         tcs_suffix = if (tcs == nil) { "" }
                      else { if (length(tcs) == 0) { "" }
-                     else { " \e[38;5;240m[+" ++ to_string(length(tcs)) ++ " tool_calls]\e[0m" }}
+                     else { " " ++ UI.dim_text("[+" ++ to_string(length(tcs)) ++ " tool_calls]") }}
         print("\e[2m[" ++ to_string(i) ++ "] " ++ to_string(role) ++ ":\e[0m " ++
               truncated ++ tcs_suffix)
         print_msgs(tl(msgs), i + 1)
@@ -1789,7 +1887,7 @@ fun stub_if_large(m) {
 
 fun run_turn(history, opts, step) {
     if (step >= max_steps()) {
-        print("\e[33m[warn] max tool steps reached\e[0m")
+        turn_print(opts, UI.warn_text("[warn] max tool steps reached"))
         history
     } else {
         # Fatal guardrail halt — set by ToolGuardrails.observe_after
@@ -1800,7 +1898,7 @@ fun run_turn(history, opts, step) {
         halt = if (guard_table == nil) { nil }
                else { ets_get(guard_table, 'halt_reason') }
         if (halt != nil) {
-            print("\e[31m[guardrail halt] " ++ to_string(halt) ++ "\e[0m")
+            turn_print(opts, UI.err_text("[guardrail halt] " ++ to_string(halt)))
             ets_put(guard_table, 'halt_reason', nil)
             history
         } else {
@@ -1816,8 +1914,8 @@ fun run_turn(history, opts, step) {
                     else { est }
         over_budget = if (effective > budget_t) { 'true' } else { 'false' }
         working_hist = if (over_budget == 'true') {
-            print("  \e[38;5;240m(context at ~" ++ to_string(effective) ++ " / " ++
-                  to_string(budget_t) ++ " tokens, compacting)\e[0m")
+            turn_print(opts, "  " ++ UI.dim_text("(context at ~" ++ to_string(effective) ++ " / " ++
+                  to_string(budget_t) ++ " tokens, compacting)"))
             # F3b: pure-string mechanical trim tier FIRST — oldest-first, stub
             # oversized tool/user content. No LLM call (compaction itself needs
             # a working call, which fails in the same prefill regime). Only fall
@@ -1827,7 +1925,7 @@ fun run_turn(history, opts, step) {
             # without re-crossing the budget, so we don't trim on every step.
             trimmed = mechanical_trim(history, compact_target_tokens())
             if (approx_tokens(trimmed) > budget_t) {
-                print("  \e[38;5;240m(mechanical trim insufficient — summarizing)\e[0m")
+                turn_print(opts, "  " ++ UI.dim_text("(mechanical trim insufficient — summarizing)"))
                 compact_history(trimmed, opts)
             } else { trimmed }
         } else { history }
@@ -1852,7 +1950,7 @@ fun run_turn(history, opts, step) {
             # Headless stdout is the captured result — keep it clean; failure
             # is signalled by exit 1 / the --json status. (Transport detail is
             # on stderr via the runtime.) Interactive keeps the inline error.
-            if (map_get(opts, 'headless') != 'true') { print("\e[31m[error] llm call failed\e[0m") }
+            if (map_get(opts, 'headless') != 'true') { turn_print(opts, UI.err_text("[error] llm call failed")) }
             # F2/F1: distinguish a POISONED context from a TRANSIENT failure.
             #  - FATAL (a 4xx request rejection or an unparseable body — re-sending
             #    the identical bytes can't fix it): drop back to the last clean user
@@ -1905,9 +2003,9 @@ fun run_turn(history, opts, step) {
                 if (string_length(visible) == 0) {
                     last_pt2 = LLM.last_prompt_tokens(opts)
                     if (last_pt2 != nil && last_pt2 > context_budget_tokens() - 2000) {
-                        print("  \e[38;5;240m(empty response — context near budget at " ++
-                              to_string(last_pt2) ++ " tokens. Try /reset or a tighter query.)\e[0m")
-                        print("")
+                        turn_print(opts, "  " ++ UI.dim_text("(empty response — context near budget at " ++
+                              to_string(last_pt2) ++ " tokens. Try /reset or a tighter query.)"))
+                        turn_print(opts, "")
                         with_assistant
                     } else {
                         prior_reasoning = LLM.last_reasoning(opts)
@@ -1916,10 +2014,10 @@ fun run_turn(history, opts, step) {
                             # leave it — auto-retry risks burning a long chain
                             # of "think harder" requests for no real gain.
                             r_chars = string_length(to_string(prior_reasoning))
-                            print("  \e[38;5;240m(model reasoned " ++ to_string(r_chars) ++
+                            turn_print(opts, "  " ++ UI.dim_text("(model reasoned " ++ to_string(r_chars) ++
                                   " chars but emitted no spoken content. " ++
-                                  "Type 'continue' to nudge it, or rephrase.)\e[0m")
-                            print("")
+                                  "Type 'continue' to nudge it, or rephrase.)"))
+                            turn_print(opts, "")
                             with_assistant
                         } else {
                             # Truly empty (no content, no tools, no reasoning):
@@ -1928,11 +2026,11 @@ fun run_turn(history, opts, step) {
                             # loop more than a single nudge per turn.
                             already_retried = map_get(opts, 'empty_retry')
                             if (already_retried == 'true') {
-                                print("  \e[38;5;240m(still empty after nudge — try rephrasing)\e[0m")
-                                print("")
+                                turn_print(opts, "  " ++ UI.dim_text("(still empty after nudge — try rephrasing)"))
+                                turn_print(opts, "")
                                 with_assistant
                             } else {
-                                print("  \e[38;5;240m(empty response — nudging once…)\e[0m")
+                                turn_print(opts, "  " ++ UI.dim_text("(empty response — nudging once…)"))
                                 nudge = "Your previous turn was empty. Based on what you've " ++
                                         "read so far, please respond — either a short summary, " ++
                                         "a question, or your next tool call. Don't stay silent."
@@ -1943,7 +2041,7 @@ fun run_turn(history, opts, step) {
                         }
                     }
                 } else {
-                    print("")
+                    turn_print(opts, "")
                     with_assistant
                 }
             } else {
@@ -1983,8 +2081,8 @@ fun handle_truncation(with_assistant, tool_calls, opts, step) {
         # Stage 0: retry once with a raised per-turn max_tokens. Keep the partial
         # assistant output in history so the model can continue from it.
         raised = raised_max_tokens(opts)
-        print("  \e[38;5;240m(output hit the length limit — retrying once with " ++
-              "max_tokens=" ++ to_string(raised) ++ ")\e[0m")
+        turn_print(opts, "  " ++ UI.dim_text("(output hit the length limit — retrying once with " ++
+              "max_tokens=" ++ to_string(raised) ++ ")"))
         retry_opts0 = map_put(opts, 'max_tokens', raised)
         retry_opts = map_put(retry_opts0, 'trunc_retry', 1)
         cont = "Your previous response was cut off at the output token limit. " ++
@@ -1996,8 +2094,8 @@ fun handle_truncation(with_assistant, tool_calls, opts, step) {
     else { if (stage_n < trunc_retry_max()) {
         # Stage 1: still truncated after the raise. Inject the smaller-edits
         # recovery message; KEEP the partial assistant output.
-        print("  \e[38;5;240m(still hitting the output limit — switching to " ++
-              "smaller append-mode edits)\e[0m")
+        turn_print(opts, "  " ++ UI.dim_text("(still hitting the output limit — switching to " ++
+              "smaller append-mode edits)"))
         recovery = "Output token limit hit again. Stop trying to emit large " ++
                    "blocks in one turn. Continue in smaller, append-mode edits: " ++
                    "write a short stub first, then use `edit` with old_string=\"\" " ++
@@ -2009,9 +2107,9 @@ fun handle_truncation(with_assistant, tool_calls, opts, step) {
     }
     else {
         # Stage 2+: give up gracefully — keep the partial output, stop the loop.
-        print("  \e[38;5;240m(output still truncated after recovery attempts — " ++
-              "keeping the partial result; ask me to continue.)\e[0m")
-        print("")
+        turn_print(opts, "  " ++ UI.dim_text("(output still truncated after recovery attempts — " ++
+              "keeping the partial result; ask me to continue.)"))
+        turn_print(opts, "")
         with_assistant
     }}
 }
@@ -2455,8 +2553,33 @@ fun subagent_exec_all(tool_calls, history, opts) {
     }
 }
 
+# ------------------------------------------------------------
+# Wake-aware display sink. Wake turns (bg_done / bg_stalled / pulse
+# reactions) run while the Reader is pinned in read_line — a plain
+# print scribbles over the live input line (and _builtin_print's
+# \r\e[K wipes only ONE physical row of a wrapped input). print_above
+# does the full wipe/redraw dance. Multi-line strings are split: one
+# print_above call renders one physical line.
+# ------------------------------------------------------------
+fun turn_print(opts, s) {
+    if (map_get(opts, 'wake_turn') == 'true') {
+        turn_print_above(string_split(to_string(s), "\n"))
+    } else { print(s) }
+}
+
+fun turn_print_above(lines) {
+    if (length(lines) == 0) { 'ok' }
+    else {
+        print_above(hd(lines))
+        turn_print_above(tl(lines))
+    }
+}
+
 # Execute each structured tool_call in sequence, appending a
 # role:'tool' result message for each. opts carries session state.
+# ALL display output goes through turn_print so wake turns (which
+# inherit 'wake_turn' in opts) land above the pinned prompt instead of
+# over it — Wave-1A only covered the prose path; tools scribbled.
 fun execute_all(tool_calls, history, opts) {
     if (length(tool_calls) == 0) { history }
     else {
@@ -2472,12 +2595,14 @@ fun execute_all(tool_calls, history, opts) {
         args_trim = string_trim(args_raw)
         malformed = if (args_map == nil && args_trim != "" && args_trim != "{}" && args_trim != "null") { 'true' } else { 'false' }
         result = if (malformed == 'true') {
-            UI.tool_header(name_atom, "(malformed / truncated arguments)")
+            turn_print(opts, "")
+            turn_print(opts, UI.tool_header_str(name_atom, "(malformed / truncated arguments)"))
             Log.tool_call(name_atom, args_raw)
             "error: the arguments for '" ++ name_str ++ "' were not valid JSON (likely truncated mid-string). Reissue this single tool call with complete, valid JSON arguments. If the content is large, write it in smaller pieces (stub then append-edit)."
         } else {
             args_map_safe = if (args_map == nil) { map_new() } else { args_map }
-            UI.tool_header(name_atom, format_tool_args(name_atom, args_map_safe, args_raw))
+            turn_print(opts, "")
+            turn_print(opts, UI.tool_header_str(name_atom, format_tool_args(name_atom, args_map_safe, args_raw)))
             Log.tool_call(name_atom, args_raw)
             prepared = ToolExecutor.prepare(name_atom, args_map_safe, opts)
             if (map_get(prepared, 'ok') != 'true') {
@@ -2487,7 +2612,7 @@ fun execute_all(tool_calls, history, opts) {
                 decision = resolve_permission(name_atom, effective_args, opts)
                 if (decision == 'deny') {
                     denial = "error: permission denied for tool '" ++ name_str ++ "'"
-                    print("\e[31m" ++ denial ++ "\e[0m")
+                    turn_print(opts, UI.err_text(denial))
                     denial
                 } else {
                     dispatch_tool_prepared(name_atom, effective_args, opts)
@@ -2495,7 +2620,11 @@ fun execute_all(tool_calls, history, opts) {
             }
         }
 
-        UI.tool_result(result)
+        turn_print(opts, UI.tool_result_str(result))
+        # Stash the FULL, uncapped result so /expand can reprint it — the ⎿
+        # view caps at 8 lines. Interactive only; nil table is a no-op.
+        expand_tbl = map_get(opts, 'expand_table')
+        if (expand_tbl != nil) { ets_put(expand_tbl, 'last_tool_output', result) }
         # Colored ± preview for successful content edits — display-only,
         # never added to history, so it costs the model zero tokens.
         show_edit_diff(name_atom, args_map, result, opts)
@@ -2514,6 +2643,10 @@ fun execute_all(tool_calls, history, opts) {
 # ------------------------------------------------------------
 fun show_edit_diff(name, args, result, opts) {
     if (map_get(opts, 'headless') == 'true') { 'ok' }
+    # Wake turns: the diff renderer prints many plain lines that would land
+    # on the pinned input line (Reader is in read_line). The preview is
+    # display-only sugar — skip it, exactly like headless does.
+    else { if (map_get(opts, 'wake_turn') == 'true') { 'ok' }
     else { if (string_starts_with(to_string(result), "ok:") != 'true') { 'ok' }
     else { if (args == nil) { 'ok' }
     else {
@@ -2522,8 +2655,18 @@ fun show_edit_diff(name, args, result, opts) {
         } else { if (name == 'multi_edit') {
             edits = map_get(args, 'edits')
             if (edits == nil) { 'ok' } else { diff_edits_loop(edits, 0) }
-        } else { 'ok' }}
-    }}}
+        } else { if (name == 'write') {
+            # Overwrite diff: do_write stashed the file's prior bytes in
+            # write_diff_table (only when it existed and was <64KB). A
+            # fresh create leaves no prior → nothing to diff.
+            wd = map_get(opts, 'write_diff_table')
+            key = resolve_path_key(args)
+            prior = if (wd == nil || key == nil) { nil }
+                    else { ets_get(wd, to_string(key)) }
+            if (prior == nil) { 'ok' }
+            else { UI.edit_diff_render(prior, map_get(args, 'content')) }
+        } else { 'ok' }}}
+    }}}}
 }
 
 fun diff_edits_loop(edits, shown) {
@@ -2552,13 +2695,39 @@ fun resolve_permission(name, args, opts) {
         headless = map_get(opts, 'headless')
         if (headless == 'true') { 'allow' }
         else {
+            # Session answer cache FIRST: a user who explicitly said "No,
+            # always deny X this session" must stay denied even after
+            # cycling /mode into auto-accept-edits — the mode only skips
+            # the ASK, it never overrides an explicit session decision.
             table = map_get(opts, 'perms_table')
             cache_key = to_string(name)
             cached = if (table == nil) { nil } else { ets_get(table, cache_key) }
             if (cached == 'allow_session') { 'allow' }
             else { if (cached == 'deny_session') { 'deny' }
             else {
-                ask_via_reader(name, opts, table, cache_key)
+                # auto-accept-edits session mode (/mode): silently approve ONLY the
+                # three content-edit tools — same effect as the user picking "always
+                # allow this session". Every other tool still prompts. This runs
+                # AFTER Config.check_permission (so a hardline 'deny' already won
+                # above) and PathGuard is enforced in ToolExecutor.prepare, so the
+                # safety floor is untouched — this only skips the interactive ASK.
+                mode = get_session_mode(opts)
+                is_edit_tool = if (name == 'edit' || name == 'write' || name == 'multi_edit') { 'true' } else { 'false' }
+                if (mode == "auto-accept-edits" && is_edit_tool == 'true') { 'allow' }
+                else { if (map_get(opts, 'wake_turn') == 'true') {
+                    # Wake turns run while the Reader is pinned in read_line:
+                    # a picker_ask would sit unread in the reader's mailbox
+                    # for up to the 600s backstop (blocking the wake turn),
+                    # then deny anyway — and the prompt would fight the
+                    # pinned input line. Deny immediately with a visible
+                    # notice; the model is told not to start major work on
+                    # wake turns anyway.
+                    print_above("  " ++ UI.dim_text("(wake turn: '" ++ to_string(name) ++
+                        "' needs permission — denied; ask again interactively)"))
+                    'deny'
+                } else {
+                    ask_via_reader(name, opts, table, cache_key)
+                }}
             }}
         }
     }}
@@ -2568,8 +2737,9 @@ fun ask_via_reader(name, opts, table, cache_key) {
     reader_pid = map_get(opts, 'reader_pid')
     if (reader_pid == nil) { 'deny' }
     else {
-        header = "\n  \e[38;5;124m⏺\e[0m \e[1mPermission\e[0m \e[38;5;240m" ++
-                 "— run \e[0m\e[1m" ++ to_string(name) ++ "\e[0m\e[38;5;240m?\e[0m"
+        header = "\n  " ++ UI.brand_color() ++ "⏺" ++ UI.reset() ++ " \e[1mPermission\e[0m " ++
+                 UI.grey_text() ++ "— run " ++ UI.reset() ++ "\e[1m" ++ to_string(name) ++
+                 "\e[0m" ++ UI.grey_text() ++ "?" ++ UI.reset()
         options = [
             "Yes",
             "Yes, and always allow " ++ to_string(name) ++ " this session",
@@ -2697,6 +2867,298 @@ fun first_token(s) {
     if (length(parts) == 0) { s } else { hd(parts) }
 }
 
+# Does `token` LOOK like a slash command — a leading "/" followed only by
+# lowercase letters, "-", or "_"? This is the shape test that separates a
+# mistyped command (/halp, /statuss) from a pasted filesystem path
+# (/Users/sky/x, /tmp/a.png) or a bare "/". Command-shaped-but-unknown gets
+# a "did you mean /help" nudge; everything else falls through to chat.
+fun looks_like_slash_command(token) {
+    if (string_starts_with(token, "/") != 'true') { 'false' }
+    else {
+        rest = string_sub(token, 1, string_length(token) - 1)
+        if (string_length(rest) == 0) { 'false' }
+        else { all_cmd_chars(rest, 0) }
+    }
+}
+
+fun all_cmd_chars(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else {
+        if (is_cmd_char(string_sub(s, i, 1)) == 'true') { all_cmd_chars(s, i + 1) }
+        else { 'false' }
+    }
+}
+
+# a-z, '-', '_' only. ord() gives the codepoint; a-z is 97..122, '-'=45,
+# '_'=95. Uppercase, digits, "/", ".", "~" all fail — so real paths never
+# masquerade as commands.
+fun is_cmd_char(ch) {
+    c = ord(ch)
+    if (c == 45) { 'true' }
+    else { if (c == 95) { 'true' }
+    else { if (c >= 97 && c <= 122) { 'true' }
+    else { 'false' }}}
+}
+
+# ------------------------------------------------------------
+# /bg surface — user-facing view of the Background task table. The
+# model manages tasks with the bg_status / bg_result / bg_tail / bg_kill
+# TOOLS; the user drives the same table with these slash commands.
+#   /bg               list all tasks
+#   /bg tail <id> [n] tail a task's log (default 40 lines)
+#   /bg kill <id>     kill a task
+# id may be given bare ("3") or full ("bg-3").
+# ------------------------------------------------------------
+fun handle_bg_command(cmd, opts) {
+    bg_table = map_get(opts, 'bg_table')
+    if (bg_table == nil) {
+        print(UI.grey_text() ++ "  (background tasks unavailable in this context)" ++ UI.reset())
+    } else {
+        parts = string_split(string_trim(cmd), " ")
+        args = bg_nonempty(tl(parts), [])
+        if (length(args) == 0) {
+            # bare /bg — list all
+            print("")
+            print(UI.grey_text() ++ Background.list_all(bg_table) ++ UI.reset())
+            print(UI.grey_text() ++ "  /bg tail <id> [n]  ·  /bg kill <id>" ++ UI.reset())
+        } else {
+            sub = hd(args)
+            rest = tl(args)
+            if (sub == "tail") { bg_cmd_tail(bg_table, rest) }
+            else { if (sub == "kill") { bg_cmd_kill(bg_table, rest) }
+            else {
+                print(UI.warn_text("usage: /bg  |  /bg tail <id> [n]  |  /bg kill <id>"))
+            }}
+        }
+    }
+    'ok'
+}
+
+# Drop empty tokens (collapses runs of spaces from string_split).
+fun bg_nonempty(lst, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        next_acc = if (string_length(h) == 0) { acc } else { list_append(acc, h) }
+        bg_nonempty(tl(lst), next_acc)
+    }
+}
+
+# Normalize a task id: "3" -> "bg-3", "bg-3" -> "bg-3".
+fun bg_normalize_id(s) {
+    if (string_starts_with(s, "bg-") == 'true') { s } else { "bg-" ++ s }
+}
+
+fun bg_cmd_tail(bg_table, rest) {
+    if (length(rest) == 0) {
+        print(UI.warn_text("usage: /bg tail <id> [n]"))
+    } else {
+        id = bg_normalize_id(hd(rest))
+        n = if (length(tl(rest)) == 0) { 40 }
+            else {
+                parsed = parse_budget_env(hd(tl(rest)), 0, 0, 'false')
+                if (parsed <= 0) { 40 } else { parsed }
+            }
+        print("")
+        print(UI.grey_text() ++ Background.tail_log(bg_table, id, n) ++ UI.reset())
+    }
+    'ok'
+}
+
+fun bg_cmd_kill(bg_table, rest) {
+    if (length(rest) == 0) {
+        print(UI.warn_text("usage: /bg kill <id>"))
+    } else {
+        id = bg_normalize_id(hd(rest))
+        print(UI.grey_text() ++ "  " ++ Background.kill_task(bg_table, id) ++ UI.reset())
+    }
+    'ok'
+}
+
+# ------------------------------------------------------------
+# Session permission mode — default | auto-accept-edits | plan.
+# Cycled by /mode (CC's shift+tab). Stored in the perms_table ETS so
+# resolve_permission and the footer chip both read the same value.
+#   default            every ask-prompt is presented
+#   auto-accept-edits  edit/write/multi_edit auto-approved this session
+#   plan               plan-before-execute on (also flips the plan override)
+# ------------------------------------------------------------
+fun get_session_mode(opts) {
+    tbl = map_get(opts, 'perms_table')
+    v = if (tbl == nil) { nil } else { ets_get(tbl, 'session_mode') }
+    if (v == nil) { "default" } else { to_string(v) }
+}
+
+fun set_session_mode(opts, m) {
+    tbl = map_get(opts, 'perms_table')
+    if (tbl != nil) { ets_put(tbl, 'session_mode', m) }
+    'ok'
+}
+
+# Pure next-mode step: default → auto-accept-edits → plan → default.
+fun next_mode(cur) {
+    if (cur == "default") { "auto-accept-edits" }
+    else { if (cur == "auto-accept-edits") { "plan" }
+    else { "default" }}
+}
+
+fun cycle_mode(opts) {
+    cur = get_session_mode(opts)
+    nxt = next_mode(cur)
+    set_session_mode(opts, nxt)
+    # Plan-override file sync — touched ONLY on the plan-mode edges.
+    # Entering plan stashes the file's prior content so LEAVING plan
+    # restores it; the old force-write of "off" on every cycle
+    # persistently clobbered a user's "/plan auto" from one /mode press.
+    # A stashed "on"/absent is not restored (that would leave plan
+    # active while the chip reads default) — the file is deleted so the
+    # session falls back to env/auto defaults.
+    p = Plan.plan_mode_override_path()
+    if (p != nil) {
+        tbl = map_get(opts, 'perms_table')
+        if (nxt == "plan") {
+            prior = if (file_exists(p) == 'true') {
+                r = file_read(p)
+                if (r == nil) { "absent" } else { string_trim(r) }
+            } else { "absent" }
+            if (tbl != nil) { ets_put(tbl, 'plan_mode_prev', prior) }
+            file_write(p, "on")
+        } else { if (cur == "plan") {
+            prev = if (tbl == nil) { nil } else { ets_get(tbl, 'plan_mode_prev') }
+            if (prev == "auto" || prev == "off") { file_write(p, to_string(prev)) }
+            else { file_delete(p) }
+        } else { 'ok' }}
+    }
+    nxt
+}
+
+# A colored one-word chip for the footer. Blank for plain "default" so the
+# common case stays calm; the two active modes light up.
+fun mode_chip(mode) {
+    if (mode == "auto-accept-edits") {
+        UI.green() ++ "auto-edits" ++ UI.reset() ++ UI.grey_text() ++ "  ·  " ++ UI.reset()
+    } else { if (mode == "plan") {
+        UI.warn_color() ++ "plan" ++ UI.reset() ++ UI.grey_text() ++ "  ·  " ++ UI.reset()
+    } else { "" }}
+}
+
+# ------------------------------------------------------------
+# Footer — draw the enriched bottom line (model · cwd (branch) · [mode]
+# · tokens) just above the input prompt. Called before the first prompt
+# (run) and after each user turn (handle_user_input_msg).
+# ------------------------------------------------------------
+fun draw_footer(history, opts) {
+    cwd_base = path_basename(to_string(map_get(opts, 'cwd')))
+    branch = git_branch(opts)
+    mode = get_session_mode(opts)
+    UI.input_box_bottom_ctx(to_string(map_get(opts, 'model')),
+        display_tokens(history, opts), context_budget_tokens(),
+        cwd_base, branch, mode_chip(mode))
+    'ok'
+}
+
+# Last path segment of an absolute cwd. "/Users/sky/swarm-code" -> "swarm-code".
+fun path_basename(p) {
+    parts = string_split(p, "/")
+    tail_seg = last_nonempty(parts, "")
+    if (string_length(tail_seg) == 0) { p } else { tail_seg }
+}
+
+fun last_nonempty(lst, acc) {
+    if (length(lst) == 0) { acc }
+    else {
+        h = hd(lst)
+        next_acc = if (string_length(h) == 0) { acc } else { h }
+        last_nonempty(tl(lst), next_acc)
+    }
+}
+
+# Current git branch for the footer, via .git/HEAD (no subprocess — swarmrt's
+# shell() imposes a 1s poll that would stall every footer draw). Walks up from
+# cwd to find a .git/HEAD, reads "ref: refs/heads/<branch>". Detached HEAD or
+# no repo -> "". Result is cached per-turn in the stream_state_table ETS with a
+# short TTL so repeated footer redraws don't re-walk the tree.
+fun git_branch(opts) {
+    tbl = map_get(opts, 'stream_state_table')
+    now = timestamp()
+    cached_ms = if (tbl == nil) { nil } else { ets_get(tbl, 'git_branch_ms') }
+    fresh = if (cached_ms == nil) { 'false' }
+            else { if (now - cached_ms < 2000) { 'true' } else { 'false' }}
+    if (fresh == 'true') { to_string(ets_get(tbl, 'git_branch')) }
+    else {
+        b = git_branch_compute(to_string(map_get(opts, 'cwd')), 0)
+        if (tbl != nil) {
+            ets_put(tbl, 'git_branch', b)
+            ets_put(tbl, 'git_branch_ms', now)
+        }
+        b
+    }
+}
+
+fun git_branch_compute(dir, depth) {
+    if (depth > 40 || string_length(dir) == 0) { "" }
+    else {
+        head = dir ++ "/.git/HEAD"
+        if (file_exists(head) == 'true') { git_branch_from_head(head) }
+        else {
+            # Worktree / submodule: .git is a FILE containing
+            # "gitdir: <path>" — resolve HEAD there instead of walking up
+            # (which surfaced an ANCESTOR repo's branch in the footer).
+            gitfile = dir ++ "/.git"
+            if (file_exists(gitfile) == 'true') {
+                git_branch_from_gitfile(gitfile, dir)
+            } else {
+                parent = path_parent(dir)
+                if (parent == dir) { "" }
+                else { git_branch_compute(parent, depth + 1) }
+            }
+        }
+    }
+}
+
+# .git-file redirection: read "gitdir: <path>" (absolute or relative to
+# the containing dir) and pull the branch from <path>/HEAD. Anything
+# unreadable/odd -> "" (this IS the repo boundary; do not walk past it).
+fun git_branch_from_gitfile(gitfile, dir) {
+    c = file_read(gitfile)
+    if (c == nil) { "" }
+    else {
+        t = string_trim(c)
+        if (string_starts_with(t, "gitdir: ") == 'true') {
+            gd = string_trim(string_sub(t, 8, string_length(t) - 8))
+            gd_abs = if (string_starts_with(gd, "/") == 'true') { gd }
+                     else { dir ++ "/" ++ gd }
+            git_branch_from_head(gd_abs ++ "/HEAD")
+        } else { "" }
+    }
+}
+
+fun git_branch_from_head(head) {
+    content = file_read(head)
+    if (content == nil) { "" }
+    else {
+        t = string_trim(content)
+        if (string_starts_with(t, "ref: refs/heads/") == 'true') {
+            string_sub(t, 16, string_length(t) - 16)
+        } else { "" }
+    }
+}
+
+# Parent directory of an absolute path. "/a/b" -> "/a"; "/a" -> "/"; "/" -> "/".
+fun path_parent(dir) {
+    if (dir == "/") { "/" }
+    else {
+        idx = last_slash(dir, string_length(dir) - 1)
+        if (idx <= 0) { "/" }
+        else { string_sub(dir, 0, idx) }
+    }
+}
+
+fun last_slash(s, i) {
+    if (i < 0) { 0 - 1 }
+    else { if (string_sub(s, i, 1) == "/") { i } else { last_slash(s, i - 1) }}
+}
+
 # Is `cmd` (with leading slash) a recognised slash-command name?
 # Filesystem paths like `/Users/...` / `/tmp/...` / `/home/...` aren't
 # in this list, so they fall through route_input to the chat path
@@ -2740,7 +3202,10 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/reset") { 'true' }
     else { if (cmd == "/debug") { 'true' }
     else { if (cmd == "/flows") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { if (cmd == "/bg") { 'true' }
+    else { if (cmd == "/mode") { 'true' }
+    else { if (cmd == "/expand") { 'true' }
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # (preview_string and string_to_atom moved earlier — see below)

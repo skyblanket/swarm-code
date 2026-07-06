@@ -4,6 +4,8 @@ import Log
 import ToolSchemas
 import Markdown
 import Hooks
+import Config
+import UI
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -46,7 +48,8 @@ export [
     parse_inband_tool_calls, inband_assistant_text,
     api_tool_calls_to_internal,
     repair_history, apply_override,
-    inject_context_status, build_status_string
+    inject_context_status, build_status_string,
+    routed_collect
 ]
 
 # ============================================================
@@ -827,7 +830,7 @@ fun inband_tc_loop(tcs, acc) {
 fun chat_with_providers(messages, opts, providers, idx) {
     plen = length(providers)
     if (idx >= plen) {
-        diag(opts, "  \e[38;5;208m✗ all " ++ to_string(plen) ++ " providers failed\e[0m")
+        diag(opts, "  " ++ UI.warn_text("✗ all " ++ to_string(plen) ++ " providers failed"))
         nil
     } else {
         p = nth_safe(providers, idx)
@@ -846,7 +849,7 @@ fun chat_with_providers(messages, opts, providers, idx) {
         # Show which provider we are trying (1-based display)
         ep_display = if (p_ep != nil) { to_string(p_ep) } else { to_string(map_get(opts, 'endpoint')) }
         if (idx > 0) {
-            print("  \e[38;5;245m↳ provider " ++ to_string(idx + 1) ++ "/" ++ to_string(plen) ++ ": " ++ ep_display ++ "\e[0m")
+            print("  " ++ UI.dim_text("↳ provider " ++ to_string(idx + 1) ++ "/" ++ to_string(plen) ++ ": " ++ ep_display))
         }
         eff = apply_override(p_opts3)
         tf = map_get(eff, 'tool_format')
@@ -968,8 +971,8 @@ fun chat_native_retry(messages, opts, attempt) {
                 if (fb_format == 'inband') { chat_inband(messages, fb_opts4) }
                 else { chat_native(messages, fb_opts4) }
             } else {
-                diag(opts, "  \e[38;5;208m✗ llm call failed after " ++
-                      to_string(max_chat_retries() + 1) ++ " attempts\e[0m")
+                diag(opts, "  " ++ UI.err_text("✗ llm call failed after " ++
+                      to_string(max_chat_retries() + 1) ++ " attempts"))
                 nil
             }
         } else {
@@ -978,10 +981,10 @@ fun chat_native_retry(messages, opts, attempt) {
             ra = last_retry_after(opts)
             base_d = retry_delay_ms(attempt)
             d = if (ra > base_d) { ra } else { base_d }
-            diag(opts, "  \e[38;5;208m↻ llm call failed (transient) — retrying in " ++
+            diag(opts, "  " ++ UI.warn_text("↻ llm call failed (transient) — retrying in " ++
                   to_string(d / 1000) ++ "s (attempt " ++
                   to_string(attempt + 2) ++ "/" ++
-                  to_string(max_chat_retries() + 1) ++ ")\e[0m")
+                  to_string(max_chat_retries() + 1) ++ ")"))
             sleep(d)
             chat_native_retry(messages, opts, attempt + 1)
         }}
@@ -1021,10 +1024,10 @@ fun chat_inband_retry(messages, opts, attempt) {
         base_d = retry_delay_ms(attempt)
         d = if (ra > base_d) { ra } else { base_d }
         print("")
-        diag(opts, "  \e[38;5;208m↻ transport failure — retrying in " ++
+        diag(opts, "  " ++ UI.warn_text("↻ transport failure — retrying in " ++
               to_string(d / 1000) ++ "s (attempt " ++
               to_string(attempt + 2) ++ "/" ++
-              to_string(max_chat_retries() + 1) ++ ")\e[0m")
+              to_string(max_chat_retries() + 1) ++ ")"))
         sleep(d)
         chat_inband_retry(messages, opts, attempt + 1)
     } else {
@@ -1228,27 +1231,34 @@ fun last_retry_after(opts) {
 fun wait_hint(opts, body_chars, model) {
     table = map_get(opts, 'llm_stats_table')
     kb = body_chars / 1024
-    base = "  \e[38;5;240m↑ " ++ to_string(model) ++ " · " ++
+    base = "↑ " ++ to_string(model) ++ " · " ++
            to_string(kb) ++ " KB request"
-    line = if (table == nil) { base ++ " · waiting for first token…\e[0m" }
+    txt = if (table == nil) { base ++ " · waiting for first token…" }
            else {
         last_ms = ets_get(table, 'last_latency_ms')
         last_ct = ets_get(table, 'last_completion_tokens')
         if (last_ms == nil || last_ct == nil || last_ms == 0 || last_ct == 0) {
-            base ++ " · waiting for first token…\e[0m"
+            base ++ " · waiting for first token…"
         } else {
             # tok/s from the prior turn (latency is ms).
             tps = (last_ct * 1000) / last_ms
             if (tps == 0) {
                 # sub-1 tok/s turn — show the warning without a bogus "~0 tok/s".
-                base ++ " · slow model, this can take a while\e[0m"
+                base ++ " · slow model, this can take a while"
             } else {
                 slow = if (tps < 40) { " · slow model, this can take a while" } else { "" }
-                base ++ " · ~" ++ to_string(tps) ++ " tok/s last turn" ++ slow ++ "\e[0m"
+                base ++ " · ~" ++ to_string(tps) ++ " tok/s last turn" ++ slow
             }
         }
     }
-    line
+    # Clip to one terminal row: routed mode prints this via print_inline and
+    # overwrites it with \r\e[K — a WRAPPED hint would leave its first row as
+    # permanent residue above the response on narrow terminals.
+    max_txt = UI.term_width() - 4
+    clipped = if (max_txt < 12) { txt }
+              else { if (string_length(txt) <= max_txt) { txt }
+              else { string_sub(txt, 0, max_txt) ++ "…" }}
+    "  " ++ UI.dim_text(clipped)
 }
 
 # Persist this turn's observed speed so the NEXT wait_hint reflects real
@@ -1272,7 +1282,401 @@ fun record_turn_speed(opts, latency, ct) {
 fun diag(opts, msg) {
     if (map_get(opts, 'headless') == 'true') { 'ok' }
     else { if (map_get(opts, 'execution_context') == "mcp_server") { 'ok' }
-    else { print(msg) } }
+    # Wake turns run while the Reader is pinned in read_line — a plain
+    # print would scribble over the prompt. print_above wipes the input
+    # line, prints, and redraws the prompt below.
+    else { if (map_get(opts, 'wake_turn') == 'true') { print_above(msg) }
+    else { print(msg) } } }
+}
+
+# ============================================================
+# Wave-1A — worker-routed streaming (docs/TUI_UX_REVIEW_2026-07-06.md)
+# ============================================================
+# stream_call replaces the bare 3-arg http_post_stream at the two main
+# call sites (chat_native / chat_inband). Three modes:
+#
+#   routed — interactive main agent: spawn a worker that runs the
+#       5-arg http_post_stream (C paints nothing; every content chunk
+#       arrives as {'stream_chunk', name, text}, reasoning as
+#       {'stream_reason', name, text}, then {'stream_done', name} —
+#       tags/arity confirmed against swarmrt_builtins_studio.h
+#       _stream_out_send_tagged). THIS process sits in a selective
+#       receive and renders INCREMENTALLY (Wave-1B): chunks go through
+#       Markdown.stream_feed, which returns a fully-rendered block at
+#       each block boundary (blank line / fence toggle-close /
+#       heading); the loop clears the ticker line and prints it. A
+#       spawned ~1s UI.stream_ticker owns the transient status line
+#       (elapsed · tok · esc hint; "thinking · Nk" during
+#       pure-reasoning — reasoning chunks print NOTHING, they only
+#       bump the ETS counter). No post-stream repaint on this path:
+#       every block was already rendered by the same Markdown.render
+#       the repaint would use. ESC rides the reader watch handshake
+#       (mirrors exec_tool_isolated); an inactivity timeout closes
+#       prior #19 (hung connection blocked the turn forever). The
+#       ticker is stopped + the feed state flushed on EVERY exit path
+#       (done / result / interrupt / timeout). Env hatch:
+#       SW_STREAM_ROUTED=0 forces the old sync path.
+#
+#   wake — autonomous wake turns (bg_done / bg_stalled / pulse chains,
+#       opts 'wake_turn'='true'): SYNChronous 5-arg call routed to
+#       self(), so the C paints nothing while the Reader is pinned in
+#       read_line. The queued chunk messages are drained after the
+#       call returns; the final output is rendered via print_above by
+#       post_stream_render. No worker, no reader watch (the reader is
+#       busy in read_line and could not watch anyway).
+#
+#   sync — headless / subagent / mcp_server / SW_STREAM_ROUTED=0:
+#       the classic 3-arg call, byte-identical behaviour to before.
+#
+# The raw return shape is IDENTICAL in all three modes ({'ok', body} /
+# {'error', status, body}) so classify_stream and everything after it
+# is untouched.
+# ============================================================
+fun use_routed_stream(opts) {
+    if (getenv("SW_STREAM_ROUTED") == "0") { 'false' }
+    else { if (map_get(opts, 'headless') == 'true') { 'false' }
+    else { if (map_get(opts, 'is_subagent') == 'true') { 'false' }
+    # execution_context is a STRING ("main" / "mcp_server" / "subagent")
+    else { if (map_get(opts, 'execution_context') == "mcp_server") { 'false' }
+    # Piped/redirected stdout (swarm-code | tee): the ticker's \r\e[K frames
+    # and per-block clears would litter the captured bytes — fall back to the
+    # sync path, whose spinner is already tty-gated in the C. Wake turns stay
+    # routed regardless: they paint nothing mid-stream by design.
+    else { if (map_get(opts, 'wake_turn') != 'true' && stdout_is_tty() != 'true') { 'false' }
+    # The stream-mode bookkeeping lives on the stats table — without it
+    # post_stream_render could not dispatch, so stay sync.
+    else { if (map_get(opts, 'llm_stats_table') == nil) { 'false' }
+    # Part B renders through the stream_state_table (feed buffers +
+    # ticker counters) — without it, stay sync.
+    else { if (map_get(opts, 'stream_state_table') == nil) { 'false' }
+    else { 'true' }}}}}}}
+}
+
+fun stream_call(url, hdrs, body, opts) {
+    routed_ok = use_routed_stream(opts)
+    if (map_get(opts, 'wake_turn') == 'true' && routed_ok == 'true') {
+        wake_sync_stream(url, hdrs, body, opts)
+    } else { if (routed_ok == 'true') {
+        routed_stream(url, hdrs, body, opts)
+    } else {
+        record_stream_mode(opts, 'sync', "")
+        http_post_stream(url, hdrs, body)
+    }}
+}
+
+# Which mode the JUST-COMPLETED stream used + what it painted. Read by
+# post_stream_render in the same call frame, so the single-slot ETS
+# stash is safe (main's LLM calls never overlap in one process).
+fun record_stream_mode(opts, mode, printed) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'ok' }
+    else {
+        ets_put(table, 'stream_mode', mode)
+        ets_put(table, 'stream_printed', printed)
+        'ok'
+    }
+}
+
+fun last_stream_mode(opts) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'sync' }
+    else {
+        v = ets_get(table, 'stream_mode')
+        if (v == nil) { 'sync' } else { v }
+    }
+}
+
+# ------------------------------------------------------------
+# Routed mode — worker + selective receive in the caller.
+# ------------------------------------------------------------
+fun routed_stream(url, hdrs, body, opts) {
+    # Unique per-dispatch token, mirrored from exec_tool_isolated: it is
+    # both the stream NAME (so chunk messages self-identify) and the
+    # interrupt/result correlation token. A stale message from an earlier
+    # interrupted/timed-out call carries a different token and is dropped.
+    token = "llm-" ++ to_string(timestamp()) ++ "-" ++ to_string(random_int(1, 1000000000))
+    reader_pid = map_get(opts, 'reader_pid')
+    if (reader_pid != nil) { send(reader_pid, {'watch_interrupt', token}) }
+    # Wave-1B: incremental block rendering + live ticker. Discard-flush
+    # first — resets any feed state a crashed earlier turn left behind
+    # (normal exits leave it clean). Ticker start zeroes the tok/think
+    # counters and spawns the ~1s frame process.
+    tbl = map_get(opts, 'stream_state_table')
+    Markdown.stream_flush(tbl)
+    UI.stream_ticker_start(tbl)
+    w = spawn(routed_stream_worker(self(), token, url, hdrs, body))
+    idle_ms = Config.llm_timeout_ms(opts)
+    r = routed_collect(w, token, tbl, "", idle_ms, timestamp() + idle_ms)
+    if (reader_pid != nil) { send(reader_pid, {'stop_watch'}) }
+    record_stream_mode(opts, 'routed', elem(r, 1))
+    elem(r, 0)
+}
+
+fun routed_stream_worker(caller, token, url, hdrs, body) {
+    raw = http_post_stream(url, hdrs, body, caller, token)
+    send(caller, {'llm_result', token, raw})
+}
+
+# The receive loop. SELF-tail-recursive only (swarmrt TCO's nothing
+# else). Inactivity window: every arriving message FOR THIS STREAM
+# (token-matched) re-arms the deadline to now + idle_ms; stale messages
+# from an earlier killed/timed-out call recurse WITHOUT re-arming, so a
+# still-draining zombie can never keep a hung new stream alive. There is
+# deliberately NO separate total deadline: a healthy long generation
+# keeps producing matched chunks and runs to completion (the C-side
+# --max-time 1800s is the true backstop) — the old 3x cap killed
+# actively-streaming slow-model responses at 15 min and burned
+# full-length retries.
+# Returns {raw_result_or_error_tuple, printed_content_text} — `printed`
+# still accumulates the RAW content (interrupt result body + stream
+# bookkeeping); the terminal shows the RENDERED blocks instead.
+fun routed_collect(worker, token, tbl, printed, idle_ms, deadline) {
+    win = deadline - timestamp()
+    win2 = if (win < 1) { 1 } else { win }
+    step = receive {
+        {'stream_chunk', cn, chunk} ->
+            if (cn == token) {
+                c = to_string(chunk)
+                bump_stream_counter(tbl, 'stream_tok', 1)
+                rendered = Markdown.stream_feed(tbl, c)
+                if (rendered != nil) {
+                    # ONE write: clear the ticker/hint line + print the
+                    # rendered block(s) atomically, so a ticker frame
+                    # can't interleave between the clear and the text.
+                    print_inline("\r\e[K" ++ to_string(rendered) ++ "\n")
+                }
+                {'rearm', printed ++ c}
+            } else { {'more', printed} }
+        {'stream_reason', rn, rchunk} ->
+            if (rn == token) {
+                # Silent — the ticker's "thinking · Nk" is the feedback.
+                # NOT accumulated into `printed` (content region only).
+                bump_stream_counter(tbl, 'stream_think',
+                    string_length(to_string(rchunk)))
+                {'rearm', printed}
+            } else { {'more', printed} }
+        {'stream_err', en, etext} ->
+            if (en == token) {
+                # Transport/HTTP failure or truncation marker from the C —
+                # STATUS, not content: paint a gated ⚠ line (sync-path
+                # parity) instead of feeding the markdown/prose pipeline.
+                et = string_trim(to_string(etext))
+                if (string_length(et) > 0) {
+                    print_inline("\r\e[K")
+                    print("  " ++ UI.warn_text("⚠ " ++ et))
+                }
+                {'rearm', printed}
+            } else { {'more', printed} }
+        {'stream_done', dn} ->
+            if (dn == token) {
+                # Render the unterminated remainder, then drop the
+                # ticker — the llm_result follows within milliseconds.
+                flush_stream_render(tbl)
+                UI.stream_ticker_stop(tbl)
+                {'rearm', printed}
+            } else { {'more', printed} }
+        {'llm_result', rt, raw} ->
+            if (rt == token) { {'ok', raw} } else { {'more', printed} }
+        {'interrupt', itok} ->
+            if (itok == token) { {'interrupted', printed} }
+            else { {'more', printed} }
+        after win2 {
+            {'timeout', printed}
+        }
+    }
+    tag = elem(step, 0)
+    if (tag == 'rearm') {
+        routed_collect(worker, token, tbl, elem(step, 1), idle_ms,
+                       timestamp() + idle_ms)
+    } else { if (tag == 'more') {
+        routed_collect(worker, token, tbl, elem(step, 1), idle_ms, deadline)
+    } else { if (tag == 'ok') {
+        # Normally stream_done already flushed + stopped the ticker and
+        # these are no-ops. They matter when the C returns a result
+        # WITHOUT a stream_done (transport/HTTP error mid-stream).
+        flush_stream_render(tbl)
+        UI.stream_ticker_stop(tbl)
+        {elem(step, 1), printed}
+    } else { if (tag == 'interrupted') {
+        # Kill the worker. NOTE: the worker is blocked inside the C
+        # builtin, so the kill lands when the builtin returns — until the
+        # C-side stall guards / stream end fire, its late chunks keep
+        # arriving and are dropped by the token filter here and by
+        # main_loop's _other arm.
+        exit_proc(worker, 'kill')
+        UI.stream_ticker_stop(tbl)
+        # Show what had arrived of the in-flight block before the
+        # interrupt marker, so the screen matches the history entry.
+        flush_stream_render(tbl)
+        print("")
+        print("  " ++ UI.warn_text("⏸ interrupted by user"))
+        {interrupted_stream_result(elem(step, 1)), elem(step, 1)}
+    } else {
+        # timeout — the inactivity window expired with no matched message.
+        # exit_proc's kill_flag is honoured INSIDE the C stream loop now
+        # (swarmrt_builtins_studio.h), so the curl child dies within ~one
+        # tick instead of generating for up to --max-time.
+        exit_proc(worker, 'kill')
+        UI.stream_ticker_stop(tbl)
+        # Snapshot BEFORE the flush resets it: were rendered blocks already
+        # printed? The transient retry re-streams the whole response, so
+        # tell the user the text above will appear again (we can't unprint
+        # scrollback).
+        emitted = if (tbl == nil) { nil } else { ets_get(tbl, 'md_emitted') }
+        # Discard (don't print) the partial block — the transient retry
+        # re-streams the whole response — but ALWAYS reset feed state.
+        Markdown.stream_flush(tbl)
+        if (emitted == 'true') {
+            print("  " ++ UI.warn_text("⚠ stream went quiet mid-response — " ++
+                  "retrying (the partial output above will print again)"))
+        }
+        msg = "llm stream produced no activity for " ++ to_string(idle_ms) ++
+              "ms (hung connection?)"
+        # status 0 → classify_stream marks it 'transient → retry/backoff.
+        {{'error', 0, msg}, elem(step, 1)}
+    }}}}
+}
+
+# Flush the incremental renderer and print the remainder (if any) —
+# same atomic clear+print contract as the chunk arm.
+fun flush_stream_render(tbl) {
+    rem = Markdown.stream_flush(tbl)
+    if (rem != nil) { print_inline("\r\e[K" ++ to_string(rem) ++ "\n") }
+    'ok'
+}
+
+# Ticker counters (read by UI.stream_ticker_frame every ~1s).
+fun bump_stream_counter(tbl, key, delta) {
+    if (tbl != nil) {
+        v = ets_get(tbl, key)
+        n = if (v == nil) { 0 } else { v }
+        ets_put(tbl, key, n + delta)
+    }
+}
+
+# The C-side sync interrupt returns {'ok', body} whose content carries
+# the "[Request interrupted by user]" marker (studio.h trunc_marker) —
+# produce the IDENTICAL shape so the downstream flow (classify → decode
+# → history append, NO retry) is indistinguishable from the C path.
+fun interrupted_stream_result(printed) {
+    content = printed ++ "\n\n[Request interrupted by user]"
+    {'ok', json_encode(%{
+        choices: [%{message: %{role: "assistant", content: content}}]
+    })}
+}
+
+# ------------------------------------------------------------
+# Wake mode — silent, worker-routed, inactivity-bounded.
+#
+# Was a synchronous self-routed 5-arg call, which closed the paint
+# problem but re-opened prior #19 for wake turns: a hung connection
+# during a bg_done/pulse wake blocked main_loop for up to the C guards
+# (2-30 min) with queued user_input unprocessed. Now the same worker
+# shape as routed mode, with a silent collect loop: matched stream
+# messages only re-arm the inactivity deadline (nothing is painted —
+# post_stream_render emits the final text via print_above), and a
+# timeout kills the worker (the C stream loop honours kill_flag) and
+# returns the transient {'error', 0, ...} shape for the retry path.
+# ------------------------------------------------------------
+fun wake_sync_stream(url, hdrs, body, opts) {
+    record_stream_mode(opts, 'wake', "")
+    name = "wake-" ++ to_string(timestamp()) ++ "-" ++ to_string(random_int(1, 1000000000))
+    w = spawn(routed_stream_worker(self(), name, url, hdrs, body))
+    idle_ms = Config.llm_timeout_ms(opts)
+    raw = wake_collect(w, name, idle_ms, timestamp() + idle_ms)
+    # Drain any chunk messages still queued in OUR mailbox so they can't
+    # leak into main_loop's next receive.
+    drain_wake_stream(name)
+    raw
+}
+
+fun wake_collect(worker, name, idle_ms, deadline) {
+    win = deadline - timestamp()
+    win2 = if (win < 1) { 1 } else { win }
+    step = receive {
+        {'stream_chunk', cn, _cc} ->
+            if (cn == name) { 'rearm' } else { 'stale' }
+        {'stream_reason', rn, _rc} ->
+            if (rn == name) { 'rearm' } else { 'stale' }
+        {'stream_err', en, _ec} ->
+            if (en == name) { 'rearm' } else { 'stale' }
+        {'stream_done', dn} ->
+            if (dn == name) { 'rearm' } else { 'stale' }
+        {'llm_result', rt, raw} ->
+            if (rt == name) { {'done', raw} } else { 'stale' }
+        after win2 { 'timeout' }
+    }
+    if (step == 'rearm') { wake_collect(worker, name, idle_ms, timestamp() + idle_ms) }
+    else { if (step == 'stale') { wake_collect(worker, name, idle_ms, deadline) }
+    else { if (step == 'timeout') {
+        exit_proc(worker, 'kill')
+        # Reader is pinned in read_line during wake turns — print_above only.
+        print_above("  " ++ UI.warn_text("⚠ wake turn: llm stream idle for " ++
+            to_string(idle_ms) ++ "ms — aborted"))
+        {'error', 0, "wake llm stream produced no activity for " ++
+            to_string(idle_ms) ++ "ms (hung connection?)"}
+    } else { elem(step, 1) }}}
+}
+
+fun drain_wake_stream(name) {
+    step = receive {
+        {'stream_chunk', _cn, _cc} -> 'more'
+        {'stream_reason', _rn, _rc} -> 'more'
+        {'stream_err', _en, _ec} -> 'more'
+        {'stream_done', dn} ->
+            if (dn == name) { 'stop' } else { 'more' }
+        after 0 { 'stop' }
+    }
+    if (step == 'stop') { 'ok' } else { drain_wake_stream(name) }
+}
+
+# ------------------------------------------------------------
+# Post-stream re-render dispatch (replaces the direct
+# Markdown.repaint_streamed_prose calls in chat_native/chat_inband).
+#
+#   sync   — classic repaint (Markdown.repaint_streamed_prose); the C
+#            painted raw tokens and recorded the physical row count
+#            (stream_content_rows), so markdown.sw clears exactly it.
+#            Still the live path for headless / subagent / mcp_server /
+#            SW_STREAM_ROUTED=0.
+#   routed — NOTHING (Wave-1B repaint retirement). The receive loop
+#            already rendered every block through Markdown.render at
+#            its boundary and flushed the remainder at stream_done;
+#            a repaint would clear rendered output only to reprint the
+#            identical text.
+#   wake   — nothing was painted during the stream; ALWAYS emit the
+#            final render via print_above so it lands above the pinned
+#            prompt (even when tool calls follow — the sync path would
+#            have painted that prose live).
+# ------------------------------------------------------------
+fun post_stream_render(opts, prose, had_tools) {
+    mode = last_stream_mode(opts)
+    if (mode == 'wake') {
+        wake_render_above(prose)
+    } else { if (had_tools != 'false') { 'noop' }
+    else { if (mode == 'routed') {
+        'noop'
+    } else {
+        Markdown.repaint_streamed_prose(prose)
+    }}}
+}
+
+fun wake_render_above(prose) {
+    p = string_trim(to_string(prose))
+    if (string_length(p) == 0) { 'noop' }
+    else {
+        rendered = Markdown.render(to_string(prose), UI.term_width())
+        print_lines_above(string_split(rendered, "\n"))
+        print_above("")
+    }
+}
+
+fun print_lines_above(lines) {
+    if (length(lines) == 0) { 'ok' }
+    else {
+        print_above(hd(lines))
+        print_lines_above(tl(lines))
+    }
 }
 
 # ============================================================
@@ -1289,9 +1693,20 @@ fun chat_native(messages, opts) {
     file_mkdir(getenv("HOME") ++ "/.swarm-code")
     file_write(getenv("HOME") ++ "/.swarm-code/last-body.json", body)
     Log.llm_request(to_string(model), length(messages), body_chars)
-    # Substantive live-wait line shown for the whole TTFT window; the C
-    # spinner renders beneath it and tokens stream in after.
-    if (map_get(opts, 'headless') != 'true') { print(wait_hint(opts, body_chars, model)) }
+    # Substantive live-wait line shown for the whole TTFT window.
+    # Suppressed on wake turns — the Reader is pinned in read_line and
+    # a plain print would scribble over the prompt. Routed mode prints
+    # it WITHOUT a trailing newline so the ticker's first \r frame
+    # overwrites it in place (and the exit-path \r\e[K leaves no
+    # residue); sync mode keeps the newline — the C spinner renders on
+    # its own line beneath and tokens stream in after.
+    if (map_get(opts, 'headless') != 'true' && map_get(opts, 'wake_turn') != 'true') {
+        if (use_routed_stream(opts) == 'true') {
+            print_inline(wait_hint(opts, body_chars, model))
+        } else {
+            print(wait_hint(opts, body_chars, model))
+        }
+    }
     start_ms = timestamp()
 
     base_hdrs = [{"Content-Type", "application/json"}]
@@ -1300,7 +1715,7 @@ fun chat_native(messages, opts) {
 
     record_fail(opts, "fail")
     record_retry_after(opts, 0)
-    cls = classify_stream(http_post_stream(url, hdrs, body))
+    cls = classify_stream(stream_call(url, hdrs, body, opts))
     latency = timestamp() - start_ms
 
     cls_tag = elem(cls, 0)
@@ -1315,8 +1730,8 @@ fun chat_native(messages, opts) {
             f_status = elem(cls, 1)
             f_msg = elem(cls, 2)
             record_fail(opts, 'fatal')
-            diag(opts, "  \e[38;5;208m✗ request rejected (HTTP " ++
-                  to_string(f_status) ++ ") — not retrying: " ++ to_string(f_msg) ++ "\e[0m")
+            diag(opts, "  " ++ UI.err_text("✗ request rejected (HTTP " ++
+                  to_string(f_status) ++ ") — not retrying: " ++ to_string(f_msg)))
             Log.llm_error("fatal request error " ++ to_string(f_status), to_string(f_msg))
             nil
         } else {
@@ -1345,7 +1760,7 @@ fun chat_native(messages, opts) {
                 # identical body just re-fails. Mark fatal so the retry
                 # loop stops instead of hammering the same poisoned body.
                 record_fail(opts, 'fatal')
-                diag(opts, "  \e[38;5;208m[llm error] " ++ to_string(em) ++ "\e[0m")
+                diag(opts, "  " ++ UI.err_text("[llm error] " ++ to_string(em)))
                 Log.llm_error("server error", to_string(em))
                 nil
             } else {
@@ -1402,16 +1817,15 @@ fun chat_native(messages, opts) {
                     record_turn_speed(opts, latency,
                         if (usage == nil) { nil } else { map_get(usage, 'completion_tokens') })
 
-                    # Post-stream re-render: wipe the C-streamed prose
-                    # and reprint it formatted with the 2-col gutter.
-                    # Only fires when (a) there's prose, (b) it contains
-                    # markdown-y syntax, (c) SWARM_CODE_RAW_STREAM != 1.
+                    # Post-stream re-render: wipe the streamed prose and
+                    # reprint it formatted with the 2-col gutter. Mode-
+                    # dispatched (sync/routed/wake) — see post_stream_render.
                     # Skipped when tool_calls is non-empty because tool
                     # headers will render immediately after and a clean
-                    # re-render mid-turn would clobber them.
-                    if (had_tools == 'false') {
-                        Markdown.repaint_streamed_prose(prose)
-                    }
+                    # re-render mid-turn would clobber them (wake mode is
+                    # the exception: nothing was painted live, so its prose
+                    # is always emitted via print_above).
+                    post_stream_render(opts, to_string(prose), had_tools)
 
                     %{
                         content: prose,
@@ -1466,8 +1880,16 @@ fun chat_inband(messages, opts) {
 
     file_write("/tmp/swarm-code-last-body.json", body)
     Log.llm_request(to_string(model), length(messages), body_chars)
-    # Same live-wait line for the inband (Gemma-style) path.
-    if (map_get(opts, 'headless') != 'true') { print(wait_hint(opts, body_chars, model)) }
+    # Same live-wait line for the inband (Gemma-style) path. Suppressed
+    # on wake turns (Reader pinned in read_line); newline-less in
+    # routed mode so the ticker overwrites it — see chat_native.
+    if (map_get(opts, 'headless') != 'true' && map_get(opts, 'wake_turn') != 'true') {
+        if (use_routed_stream(opts) == 'true') {
+            print_inline(wait_hint(opts, body_chars, model))
+        } else {
+            print(wait_hint(opts, body_chars, model))
+        }
+    }
     start_ms = timestamp()
 
     base_hdrs = [{"Content-Type", "application/json"}]
@@ -1476,7 +1898,7 @@ fun chat_inband(messages, opts) {
 
     record_fail(opts, "fail")
     record_retry_after(opts, 0)
-    cls = classify_stream(http_post_stream(url, hdrs, body))
+    cls = classify_stream(stream_call(url, hdrs, body, opts))
     latency = timestamp() - start_ms
 
     cls_tag = elem(cls, 0)
@@ -1487,8 +1909,8 @@ fun chat_inband(messages, opts) {
         # retry loop (chat_inband_retry checks last_fail), transient ones retry.
         if (cls_tag == 'fatal') {
             record_fail(opts, 'fatal')
-            diag(opts, "  \e[38;5;208m✗ request rejected (HTTP " ++
-                  to_string(elem(cls, 1)) ++ ") — not retrying: " ++ to_string(elem(cls, 2)) ++ "\e[0m")
+            diag(opts, "  " ++ UI.err_text("✗ request rejected (HTTP " ++
+                  to_string(elem(cls, 1)) ++ ") — not retrying: " ++ to_string(elem(cls, 2))))
             Log.llm_error("fatal request error (inband, HTTP " ++ to_string(elem(cls, 1)) ++ ")", to_string(elem(cls, 2)))
         } else {
             record_fail(opts, 'transient')
@@ -1537,21 +1959,19 @@ fun chat_inband(messages, opts) {
                     && length(tool_calls) == 0
             if (empty == 'true' && latency < 500 && body_chars < 30000) {
                 print("")
-                diag(opts, "  \e[38;5;208m⚠ server at " ++ to_string(endpoint) ++
-                      " returned empty in " ++ to_string(latency) ++ "ms\e[0m")
-                print("  \e[38;5;240m(fingerprint of a wedged / OOM'd serving process. " ++
-                      "Try restarting vllm on the host.)\e[0m")
+                diag(opts, "  " ++ UI.warn_text("⚠ server at " ++ to_string(endpoint) ++
+                      " returned empty in " ++ to_string(latency) ++ "ms"))
+                print("  " ++ UI.dim_text("(fingerprint of a wedged / OOM'd serving process. " ++
+                      "Try restarting vllm on the host.)"))
                 print("")
             }
 
             # Post-stream re-render (same rationale as chat_native):
             # wipe the raw streamed prose and reprint via Markdown so
             # bold/headers/lists/code render properly with a 2-col
-            # gutter. Skipped when tool_calls present so tool headers
-            # render cleanly right after.
-            if (had_tools == 'false') {
-                Markdown.repaint_streamed_prose(to_string(prose))
-            }
+            # gutter. Mode-dispatched (sync/routed/wake) — see
+            # post_stream_render.
+            post_stream_render(opts, to_string(prose), had_tools)
 
             # F4: same length-truncation signal as chat_native.
             fin = extract_finish_reason(resp)
