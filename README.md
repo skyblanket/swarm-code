@@ -1,14 +1,16 @@
-<p align="center">
-  <img src="docs/assets/swarm.gif" alt="swarm-code — a swarm of agents in your terminal" width="100%">
-</p>
+<img src="docs/assets/banner.png" alt="swarm-code — an agent harness. Parallel workflows, any model, one 1.9 MB binary. MIT." width="100%"/>
 
 # swarm-code
 
 [![CI](https://github.com/skyblanket/swarm-code/actions/workflows/ci.yml/badge.svg)](https://github.com/skyblanket/swarm-code/actions/workflows/ci.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-C81E0F.svg)](LICENSE)
 [![release](https://img.shields.io/github/v/release/skyblanket/swarm-code?display_name=tag&sort=semver)](https://github.com/skyblanket/swarm-code/releases)
 
 A terminal coding agent written in [`sw`](https://github.com/skyblanket/swarmrt) on the swarmrt runtime. Bring your own OpenAI-compatible endpoint — local (llama.cpp / vLLM) or hosted — and get structured tool calls, real subagents, vision, session search, skills, cron, and MCP in one headless or interactive REPL. Single native binary, no Python or Node.
+
+https://github.com/skyblanket/swarm-code/raw/main/docs/assets/swarm-code-film.mp4
+
+> **58 seconds, sound on** — the whole idea: one 1.9 MB binary, workflows that fan out real agent processes, any model you point it at.
 
 - [Quickstart](#quickstart) · [Configuration](#configuration) · [Features](#features) · [Multi-agent](#multi-agent) · [Security](#security) · [Architecture](#architecture)
 
