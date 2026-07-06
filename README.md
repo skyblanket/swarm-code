@@ -1,4 +1,4 @@
-<img src="docs/assets/banner.png" alt="swarm-code — an agent harness. Parallel workflows, any model, one 1.9 MB binary. MIT." width="100%"/>
+<img src="docs/assets/banner.gif" alt="swarm-code — an agent harness. Parallel workflows, any model, one 1.9 MB binary. MIT." width="100%"/>
 
 # swarm-code
 
