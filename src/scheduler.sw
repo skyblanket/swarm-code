@@ -146,11 +146,16 @@ fun remove_loop(jobs, target, acc) {
 # actually fired (the dirty-flag gate). Previously this rewrote on
 # every tick because tick_loop always rebuilt a same-length list.
 # ------------------------------------------------------------
-fun tick(opts) {
+fun tick(opts, count) {
     jobs = list_all()
-    # Always prune output files, even when the job list is empty or corrupt,
-    # so .out files don't accumulate unbounded if schedule.json is wiped.
-    prune_old_out_files(jobs)
+    # Prune .out files on a ~15-minute cadence (tick 1, then every 450
+    # ticks at the 2s default), NEVER per-tick: prune shells out, and
+    # shell() runs on the CALLER's fiber — this is main's heartbeat
+    # handler. Running it every tick made each tick cost more than the
+    # tick interval and froze the UI behind a growing backlog
+    # (2026-07-09). Still prunes even when the job list is empty or
+    # corrupt, so .out files can't accumulate unbounded.
+    if (count % 450 == 1) { prune_old_out_files(jobs) } else { 'skip' }
     if (length(jobs) == 0) { 'noop' }
     else {
         now = timestamp()

@@ -695,23 +695,47 @@ fun plan_gate(line, history, opts) {
 fun pulse_interval() { 30 }
 
 fun on_heartbeat_tick(count, history, opts) {
-    # Every tick, give the scheduler a chance to dispatch any due
-    # recurring jobs. Cheap — it's a JSON read + a few timestamp
-    # comparisons unless something is due. Fire-and-forget, no
-    # blocking, output goes to telemetry/ files.
-    Scheduler.tick(opts)
+    # COALESCE any backlog of queued ticks into this one. During a long
+    # turn (or any main stall) the heartbeat keeps sending — dozens of
+    # {'heartbeat_tick'} messages can be queued AHEAD of the user's next
+    # input, and processing them one per main_loop iteration starves the
+    # UI (the 2026-07-09 freeze: each backlogged tick also paid a
+    # blocking shell() in the prune path, so the queue outgrew the drain
+    # rate and input never surfaced). Drain them all now; the newest
+    # count wins. Selective receive touches ONLY heartbeat_tick tuples.
+    latest = drain_tick_backlog(count)
+
+    # Give the scheduler a chance to dispatch any due recurring jobs.
+    # Cheap — a JSON read + timestamp comparisons unless something is
+    # due. Its shell()-based .out-file pruning is cadence-gated inside
+    # (see Scheduler.tick) and MUST never run per-tick on this fiber.
+    Scheduler.tick(opts, latest)
 
     daemon = map_get(opts, 'daemon')
     if (daemon != 'true') { history }
     else {
         interval = pulse_interval()
-        remainder = count - ((count / interval) * interval)
-        if (remainder != 0) { history }
+        # A pulse fires when the tick count crosses a multiple of the
+        # interval. With backlog coalescing the exact multiple may have
+        # been drained away, so fire if the [count..latest] range crossed
+        # one — not only on an exact remainder==0 hit.
+        crossed = (latest / interval) > ((count - 1) / interval)
+        if (crossed != 'true') { history }
         else {
             in_wake = map_get(opts, 'in_wake_chain')
             if (in_wake == 'true') { history }
-            else { cognitive_pulse(count, history, opts) }
+            else { cognitive_pulse(latest, history, opts) }
         }
+    }
+}
+
+# Drain every already-queued {'heartbeat_tick'} so a backlog collapses
+# into a single handler pass. `after 0` returns immediately once no more
+# tick messages are waiting; all other message kinds are untouched.
+fun drain_tick_backlog(latest) {
+    receive {
+        {'heartbeat_tick', c} -> drain_tick_backlog(c)
+        after 0 { latest }
     }
 }
 

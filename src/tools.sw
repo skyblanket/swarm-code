@@ -1377,10 +1377,10 @@ fun do_web_search(args) {
         cmd = "SWC_WSQ=" ++ Util.shell_q(to_string(q)) ++
               " SWC_WSN=" ++ Util.shell_q(to_string(max_n)) ++
               " python3 -c " ++ Util.shell_q(py_script)
-        # stderr → /dev/null (NOT 2>&1): the python script writes non-fatal
-        # diagnostics like "ddg failed: 403" to stderr while still printing
-        # valid JSON (the Wikipedia fallback) to stdout. Folding stderr would
-        # prepend that text and break json_decode of an otherwise-good result.
+        # stderr → /dev/null (NOT 2>&1): per-tier diagnostics now travel in
+        # the JSON "diag" field, but python itself can still emit warnings /
+        # SSL chatter on stderr. Folding stderr into stdout would prepend
+        # that text and break json_decode of an otherwise-good result.
         result = shell_managed(cmd ++ " 2>/dev/null", fetch_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
@@ -1393,27 +1393,55 @@ fun do_web_search(args) {
             decoded = json_decode(string_trim(out))
             if (decoded == nil) {
                 "error: web_search returned unparseable output:\n" ++ truncate_output(out, 300)
+            } else { if (is_map(decoded) == 'true') {
+                # New shape: {"results": [...], "diag": "per-tier one-liners"}.
+                # When every tier came up empty, surface the diag so the model
+                # can tell "bot-blocked" from "genuinely no hits" and pivot.
+                results = map_get(decoded, 'results')
+                diag = to_string(map_get(decoded, 'diag'))
+                rl = if (results == nil) { [] } else { results }
+                if (length(rl) == 0) {
+                    "(no results — " ++ diag ++ ")\n" ++
+                    "Hint: try web_fetch on a likely URL (github.com/<owner>/<repo>, docs site) instead."
+                } else {
+                    format_search_results(rl, 0, "")
+                }
             } else {
+                # Legacy shape: bare JSON list (older embedded script).
                 format_search_results(decoded, 0, "")
-            }
+            }}
         }}
     }
 }
 
-# The DDG HTML search script — embedded as a single sw string literal.
+# The web-search script — embedded as a single sw string literal.
 #
-# As of April 2026, DuckDuckGo rejects POSTs to html.duckduckgo.com/html/
-# without a session (they return the homepage shell). GET with query params
-# + a full set of browser headers + gzip handling works reliably. We also
-# fall back to the Wikipedia REST search API if DDG ever returns zero
-# blocks, so the tool never silently returns "(no results)".
+# As of July 2026, DuckDuckGo serves a bot-detection "anomaly-modal" CAPTCHA
+# page (0 result blocks) from many residential/consumer IPs, on BOTH
+# html.duckduckgo.com and lite.duckduckgo.com, and Bing often serves a
+# JS-challenge shell with no <li class="b_algo"> blocks. So the script walks
+# a tier list — DDG html → DDG lite → Bing → Startpage → Wikipedia — stopping
+# at the first tier with >0 results, and records a one-liner per tier tried
+# (e.g. "ddg-html: bot-blocked; ddg-lite: bot-blocked; startpage: 5 hits").
+# Output is a JSON OBJECT: {"results": [{title,url,snippet}...], "diag": "..."}
+# — do_web_search still accepts the legacy bare-list shape for compat.
+# Every tier fetch gets an 8s timeout so five tiers can never exceed the
+# 45s shell_managed kill budget in do_web_search.
 fun ddg_python_script() {
     "import os,sys,json,re,gzip\n" ++
     "import urllib.request,urllib.parse\n" ++
+    "from html import unescape as _unesc\n" ++
     "q=os.environ.get('SWC_WSQ','')\n" ++
     "n=int(os.environ.get('SWC_WSN','5'))\n" ++
     "if not q:\n" ++
-    "  print('[]'); sys.exit(0)\n" ++
+    "  print('{\"results\": [], \"diag\": \"empty query\"}'); sys.exit(0)\n" ++
+    "UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'\n" ++
+    "BH={'User-Agent':UA,\n" ++
+    "    'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',\n" ++
+    "    'Accept-Language':'en-US,en;q=0.5',\n" ++
+    "    'Accept-Encoding':'gzip, deflate',\n" ++
+    "    'Connection':'keep-alive',\n" ++
+    "    'Upgrade-Insecure-Requests':'1'}\n" ++
     "def fetch(url,headers=None,data=None,timeout=15):\n" ++
     "  req=urllib.request.Request(url,headers=headers or {},data=data)\n" ++
     "  resp=urllib.request.urlopen(req,timeout=timeout)\n" ++
@@ -1421,16 +1449,14 @@ fun ddg_python_script() {
     "  if resp.headers.get('Content-Encoding')=='gzip':\n" ++
     "    raw=gzip.decompress(raw)\n" ++
     "  return raw.decode('utf-8',errors='ignore')\n" ++
-    "def ddg_search(query):\n" ++
+    "def strip(s):\n" ++
+    "  return re.sub(r'\\s+',' ',_unesc(re.sub(r'<[^>]+>',' ',s))).strip()\n" ++
+    "def ddg_html_search(query):\n" ++
     "  url='https://html.duckduckgo.com/html/?'+urllib.parse.urlencode({'q':query,'kl':'us-en'})\n" ++
-    "  h={'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',\n" ++
-    "     'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',\n" ++
-    "     'Accept-Language':'en-US,en;q=0.5',\n" ++
-    "     'Accept-Encoding':'gzip, deflate',\n" ++
-    "     'Referer':'https://duckduckgo.com/',\n" ++
-    "     'Connection':'keep-alive',\n" ++
-    "     'Upgrade-Insecure-Requests':'1'}\n" ++
-    "  html=fetch(url,headers=h)\n" ++
+    "  h=dict(BH); h['Referer']='https://duckduckgo.com/'\n" ++
+    "  html=fetch(url,headers=h,timeout=8)\n" ++
+    "  if 'anomaly-modal' in html:\n" ++
+    "    return None,'ddg-html: bot-blocked'\n" ++
     "  blocks=re.split(r'class=\"[^\"]*result[^\"]*results_links[^\"]*\"',html)[1:]\n" ++
     "  if not blocks:\n" ++
     "    blocks=re.split(r'class=\"[^\"]*web-result[^\"]*\"',html)[1:]\n" ++
@@ -1441,38 +1467,98 @@ fun ddg_python_script() {
     "    url2=um.group(1)\n" ++
     "    if url2.startswith('//'): url2='https:'+url2\n" ++
     "    try:\n" ++
-    "      p=urllib.parse.urlparse(url2)\n" ++
-    "      qs=urllib.parse.parse_qs(p.query)\n" ++
+    "      p=urllib.parse.urlparse(url2); qs=urllib.parse.parse_qs(p.query)\n" ++
     "      if 'uddg' in qs: url2=qs['uddg'][0]\n" ++
     "    except: pass\n" ++
     "    tm=re.search(r'class=\"result__a\"[^>]*>(.*?)</a>',b,re.S)\n" ++
     "    sm=re.search(r'class=\"result__snippet\"[^>]*>(.*?)</a>',b,re.S)\n" ++
-    "    title=re.sub(r'<[^>]+>','',tm.group(1)).strip() if tm else 'No title'\n" ++
-    "    snip=re.sub(r'<[^>]+>','',sm.group(1)).strip()[:300] if sm else ''\n" ++
+    "    title=strip(tm.group(1)) if tm else 'No title'\n" ++
+    "    snip=strip(sm.group(1))[:300] if sm else ''\n" ++
     "    out.append({'title':title,'url':url2,'snippet':snip})\n" ++
-    "  return out\n" ++
+    "  if not out:\n" ++
+    "    return None,'ddg-html: 0 hits'\n" ++
+    "  return out,'ddg-html: '+str(len(out))+' hits'\n" ++
+    "def ddg_lite_search(query):\n" ++
+    "  url='https://lite.duckduckgo.com/lite/?'+urllib.parse.urlencode({'q':query})\n" ++
+    "  h=dict(BH); h['Referer']='https://lite.duckduckgo.com/'\n" ++
+    "  html=fetch(url,headers=h,timeout=8)\n" ++
+    "  if 'anomaly-modal' in html:\n" ++
+    "    return None,'ddg-lite: bot-blocked'\n" ++
+    "  out=[]\n" ++
+    "  for m in re.finditer(r'<a ([^>]*?)href=\"([^\"]+)\"([^>]*?)>(.*?)</a>',html,re.S):\n" ++
+    "    attrs=m.group(1)+m.group(3)\n" ++
+    "    if 'result-link' not in attrs: continue\n" ++
+    "    url2=m.group(2); title=strip(m.group(4))\n" ++
+    "    if url2.startswith('//'): url2='https:'+url2\n" ++
+    "    if not title: continue\n" ++
+    "    out.append({'title':title,'url':url2,'snippet':''})\n" ++
+    "    if len(out)>=n: break\n" ++
+    "  snips=re.findall(r'class=\"result-snippet\"[^>]*>(.*?)</td>',html,re.S)\n" ++
+    "  for i in range(len(out)):\n" ++
+    "    if i<len(snips): out[i]['snippet']=strip(snips[i])[:300]\n" ++
+    "  if not out:\n" ++
+    "    return None,'ddg-lite: 0 hits'\n" ++
+    "  return out,'ddg-lite: '+str(len(out))+' hits'\n" ++
+    "def bing_search(query):\n" ++
+    "  url='https://www.bing.com/search?'+urllib.parse.urlencode({'q':query})\n" ++
+    "  html=fetch(url,headers=BH,timeout=8)\n" ++
+    "  blocks=re.split(r'<li class=\"b_algo',html)[1:]\n" ++
+    "  out=[]\n" ++
+    "  for b in blocks[:n]:\n" ++
+    "    hm=re.search(r'<h2[^>]*>\\s*<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>',b,re.S)\n" ++
+    "    if not hm: continue\n" ++
+    "    url2=hm.group(1); title=strip(hm.group(2))\n" ++
+    "    sm=re.search(r'<p[^>]*>(.*?)</p>',b,re.S)\n" ++
+    "    snip=strip(sm.group(1))[:300] if sm else ''\n" ++
+    "    out.append({'title':title,'url':url2,'snippet':snip})\n" ++
+    "  if not out:\n" ++
+    "    if 'b_algo' not in html:\n" ++
+    "      return None,'bing: blocked/js-shell'\n" ++
+    "    return None,'bing: 0 hits'\n" ++
+    "  return out,'bing: '+str(len(out))+' hits'\n" ++
+    "def startpage_search(query):\n" ++
+    "  url='https://www.startpage.com/sp/search?'+urllib.parse.urlencode({'query':query})\n" ++
+    "  html=fetch(url,headers=BH,timeout=8)\n" ++
+    "  if 'captcha' in html.lower() or 'g-recaptcha' in html:\n" ++
+    "    return None,'startpage: captcha'\n" ++
+    "  out=[]; seen=set()\n" ++
+    "  for m in re.finditer(r'<a class=\"result-title[^\"]*\" href=\"([^\"]+)\"(.*?)</a>',html,re.S):\n" ++
+    "    url2=m.group(1)\n" ++
+    "    if url2 in seen: continue\n" ++
+    "    seen.add(url2)\n" ++
+    "    tm=re.search(r'<h2[^>]*>(.*?)</h2>',m.group(2),re.S)\n" ++
+    "    title=strip(tm.group(1)) if tm else strip(m.group(2))\n" ++
+    "    tail=html[m.end():m.end()+3000]\n" ++
+    "    sm=re.search(r'<p class=\"description[^\"]*\">(.*?)</p>',tail,re.S)\n" ++
+    "    snip=strip(sm.group(1))[:300] if sm else ''\n" ++
+    "    out.append({'title':title,'url':url2,'snippet':snip})\n" ++
+    "    if len(out)>=n: break\n" ++
+    "  if not out:\n" ++
+    "    return None,'startpage: 0 hits'\n" ++
+    "  return out,'startpage: '+str(len(out))+' hits'\n" ++
     "def wiki_search(query):\n" ++
     "  url='https://en.wikipedia.org/w/api.php?'+urllib.parse.urlencode({'action':'query','list':'search','srsearch':query,'format':'json','srlimit':n,'utf8':'1'})\n" ++
-    "  html=fetch(url,headers={'User-Agent':'swarm-code/0.1 (https://swarm-code.local)'})\n" ++
+    "  html=fetch(url,headers={'User-Agent':'swarm-code/0.1 (https://swarm-code.local)'},timeout=8)\n" ++
     "  data=json.loads(html)\n" ++
     "  out=[]\n" ++
     "  for r in data.get('query',{}).get('search',[])[:n]:\n" ++
     "    title=r.get('title','')\n" ++
-    "    snip=re.sub(r'<[^>]+>','',r.get('snippet','')).strip()[:300]\n" ++
+    "    snip=strip(r.get('snippet',''))[:300]\n" ++
     "    url2='https://en.wikipedia.org/wiki/'+urllib.parse.quote(title.replace(' ','_'))\n" ++
     "    out.append({'title':title,'url':url2,'snippet':snip})\n" ++
-    "  return out\n" ++
-    "try:\n" ++
-    "  results=ddg_search(q)\n" ++
-    "except Exception as e:\n" ++
-    "  results=[]\n" ++
-    "  sys.stderr.write('ddg failed: '+str(e)+'\\n')\n" ++
-    "if not results:\n" ++
+    "  if not out:\n" ++
+    "    return None,'wiki: 0 hits'\n" ++
+    "  return out,'wiki: '+str(len(out))+' hits'\n" ++
+    "results=[]; diags=[]\n" ++
+    "for fn in (ddg_html_search,ddg_lite_search,bing_search,startpage_search,wiki_search):\n" ++
     "  try:\n" ++
-    "    results=wiki_search(q)\n" ++
+    "    r,d=fn(q)\n" ++
     "  except Exception as e:\n" ++
-    "    sys.stderr.write('wiki failed: '+str(e)+'\\n')\n" ++
-    "print(json.dumps(results))\n"
+    "    diags.append(fn.__name__.replace('_search','').replace('_','-')+': err '+str(e)[:60]); continue\n" ++
+    "  diags.append(d)\n" ++
+    "  if r:\n" ++
+    "    results=r; break\n" ++
+    "print(json.dumps({'results':results,'diag':'; '.join(diags)}))\n"
 }
 
 # ------------------------------------------------------------
