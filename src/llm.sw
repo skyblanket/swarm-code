@@ -49,7 +49,7 @@ export [
     api_tool_calls_to_internal,
     repair_history, apply_override,
     inject_context_status, build_status_string,
-    routed_collect
+    routed_collect, maybe_large_context_hint
 ]
 
 # ============================================================
@@ -1306,8 +1306,9 @@ fun diag(opts, msg) {
 #       each block boundary (blank line / fence toggle-close /
 #       heading); the loop clears the ticker line and prints it. A
 #       spawned ~1s UI.stream_ticker owns the transient status line
-#       (elapsed · tok · esc hint; "thinking · Nk" during
-#       pure-reasoning — reasoning chunks print NOTHING, they only
+#       (phase-aware: "waiting for first token · N KB sent" before any
+#       chunk, "thinking · Nk" during pure-reasoning, "N tok" once
+#       content flows — reasoning chunks print NOTHING, they only
 #       bump the ETS counter). No post-stream repaint on this path:
 #       every block was already rendered by the same Markdown.render
 #       the repaint would use. ESC rides the reader watch handshake
@@ -1404,6 +1405,15 @@ fun routed_stream(url, hdrs, body, opts) {
     tbl = map_get(opts, 'stream_state_table')
     Markdown.stream_flush(tbl)
     UI.stream_ticker_start(tbl)
+    # Ticker context: the request size rides the stream table so the
+    # pre-first-token frames say what was uploaded ("waiting for first
+    # token · 361 KB sent") instead of a dead "0 tok", and the zero-chunk
+    # timeout diag below can name it. ticker_start just zeroed the slot.
+    if (tbl != nil) {
+        req_kb = string_length(body) / 1024
+        ets_put(tbl, 'stream_req_kb', req_kb)
+        maybe_large_context_hint(opts, tbl, req_kb)
+    }
     w = spawn(routed_stream_worker(self(), token, url, hdrs, body))
     idle_ms = Config.llm_timeout_ms(opts)
     r = routed_collect(w, token, tbl, "", idle_ms, timestamp() + idle_ms)
@@ -1415,6 +1425,30 @@ fun routed_stream(url, hdrs, body, opts) {
 fun routed_stream_worker(caller, token, url, hdrs, body) {
     raw = http_post_stream(url, hdrs, body, caller, token)
     send(caller, {'llm_result', token, raw})
+}
+
+# ONE-SHOT per session: the live stall pattern is payload-proportional
+# (Moonshot-class providers throttle-queue ~360KB requests), so the
+# FIRST time a turn's request crosses 300KB, name the fix. The latch
+# lives on the stream_state_table — stream_ticker_start never resets it,
+# so it survives every later turn of the session. Returns 'shown'/'skip'
+# so the once-latch is unit-testable without capturing stdout. Only
+# reachable from routed_stream, i.e. interactive main sessions (headless
+# / subagent / mcp_server never route) — and diag() re-gates + stays
+# print_above-safe on wake turns anyway.
+fun maybe_large_context_hint(opts, tbl, kb) {
+    if (tbl == nil || kb < 300) { 'skip' }
+    else { if (ets_get(tbl, 'large_ctx_hint_shown') == 'true') { 'skip' }
+    else {
+        ets_put(tbl, 'large_ctx_hint_shown', 'true')
+        # The wait_hint was just print_inline'd (no trailing newline) —
+        # clear that row so the hint doesn't concatenate onto it; the
+        # ticker repaints the cleared row (with the same KB) ~1s later.
+        print_inline("\r\e[K")
+        diag(opts, "  " ++ UI.dim_text("context is large (" ++ to_string(kb) ++
+             " KB/turn) — /compact will speed up turns and reduce provider stalls"))
+        'shown'
+    }}
 }
 
 # The receive loop. SELF-tail-recursive only (swarmrt TCO's nothing
@@ -1530,8 +1564,20 @@ fun routed_collect(worker, token, tbl, printed, idle_ms, deadline) {
             print("  " ++ UI.warn_text("⚠ stream went quiet mid-response — " ++
                   "retrying (the partial output above will print again)"))
         }
-        msg = "llm stream produced no activity for " ++ to_string(idle_ms) ++
-              "ms (hung connection?)"
+        # Phase-aware diag: zero chunks of ANY kind means the server never
+        # started answering — telemetry showed the same request normally
+        # answers in seconds, so name the stall (and the upload size)
+        # instead of the generic quiet-stream line.
+        tok0 = stream_counter(tbl, 'stream_tok')
+        think0 = stream_counter(tbl, 'stream_think')
+        msg = if (tok0 == 0 && think0 == 0) {
+            "no first token in " ++ to_string(idle_ms / 1000) ++
+                "s — server stalled/queued; retrying (large request: " ++
+                to_string(stream_counter(tbl, 'stream_req_kb')) ++ " KB)"
+        } else {
+            "llm stream produced no activity for " ++ to_string(idle_ms) ++
+                "ms (hung connection?)"
+        }
         # status 0 → classify_stream marks it 'transient → retry/backoff.
         {{'error', 0, msg}, elem(step, 1)}
     }}}}
@@ -1551,6 +1597,16 @@ fun bump_stream_counter(tbl, key, delta) {
         v = ets_get(tbl, key)
         n = if (v == nil) { 0 } else { v }
         ets_put(tbl, key, n + delta)
+    }
+}
+
+# Nil-safe counter read — sync-path calls run with tbl == nil, and a
+# never-bumped key reads back nil, so both degrade to 0.
+fun stream_counter(tbl, key) {
+    if (tbl == nil) { 0 }
+    else {
+        v = ets_get(tbl, key)
+        if (v == nil) { 0 } else { v }
     }
 }
 

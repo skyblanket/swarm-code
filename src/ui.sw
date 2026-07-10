@@ -35,6 +35,7 @@ export [
     set_title, set_title_cwd, set_title_turn,
     input_divider, footer_hint,
     status_line, stream_ticker_start, stream_ticker_stop,
+    ticker_phase_text,
     tool_progress, tool_progress_clear,
     enter_alt_screen, leave_alt_screen,
     term_width,
@@ -824,14 +825,21 @@ fun footer_hint(model_name, token_count) {
 # Live stream ticker (Wave-1B) — replaces the dead spinner_start/stop
 # ------------------------------------------------------------
 # One dim \r-rewritten status line owned by a spawned ~1s tick process
-# while the worker-routed LLM stream runs:
+# while the worker-routed LLM stream runs. Phase-aware (a stalled
+# connection must never read as "0 tok" — see ticker_phase_text):
 #
-#   ◐ 12s · 176 tok · esc to interrupt
+#   ◐ 12s · waiting for first token · 361 KB sent · esc to interrupt
+#   ◐ 34s · waiting for first token · 361 KB sent · slow/queued? · …
 #   ◓ 3s · thinking · 2.1k · esc to interrupt     (pure-reasoning)
+#   ◑ 12s · 176 tok · esc to interrupt
+#   ◒ 14s · 2.1k think · 176 tok · esc to interrupt
 #
 # Counters live in the stream_state_table ETS, written by llm.sw's
 # receive loop: 'stream_tok' = content chunks seen (≈ tokens),
-# 'stream_think' = reasoning chars seen. The RECEIVE LOOP owns the
+# 'stream_think' = reasoning chars seen, 'stream_req_kb' = request
+# body size (integer KB, put by routed_stream right after start so the
+# pre-first-token frames can show what was uploaded). The RECEIVE LOOP
+# owns the
 # terminal — it clears the line before printing each rendered block;
 # the ticker only ever does single-line \r rewrites, so the worst race
 # is one stale frame that the next clear wipes (accepted; no locks).
@@ -843,6 +851,10 @@ fun stream_ticker_start(tbl) {
     else {
         ets_put(tbl, 'stream_tok', 0)
         ets_put(tbl, 'stream_think', 0)
+        # Reset alongside the counters so a prior turn's request size
+        # can't leak into this stream's "waiting" frames; routed_stream
+        # overwrites it with the real KB immediately after start.
+        ets_put(tbl, 'stream_req_kb', 0)
         pid = spawn(stream_ticker_loop(tbl, timestamp(), 0))
         ets_put(tbl, 'ticker_pid', pid)
         'ok'
@@ -902,10 +914,36 @@ fun stream_ticker_frame(tbl, start_ms, tick) {
     elapsed = (timestamp() - start_ms) / 1000
     tok = ticker_count(tbl, 'stream_tok')
     think = ticker_count(tbl, 'stream_think')
-    mid = if (tok == 0 && think > 0) { "thinking · " ++ ticker_fmt_k(think) }
-          else { ticker_fmt_k(tok) ++ " tok" }
+    kb = ticker_count(tbl, 'stream_req_kb')
     "\r\e[K  " ++ dim() ++ ticker_glyph(tick) ++ " " ++ to_string(elapsed) ++
-        "s · " ++ mid ++ " · esc to interrupt" ++ reset()
+        "s · " ++ ticker_phase_text(tok, think, kb, elapsed) ++
+        " · esc to interrupt" ++ reset()
+}
+
+# Phase-aware mid-segment. PURE (unit-tested in test_runner) — the
+# frame supplies the glyph/elapsed/esc chrome around it. Three phases:
+#
+#   nothing yet    → "waiting for first token · 361 KB sent"
+#                    (+ " · slow/queued?" once elapsed > 30s). A stalled
+#                    connection must NEVER read as "0 tok" — that lie is
+#                    what let a user watch "233s · 0 tok" for 4 minutes.
+#   reasoning only → "thinking · 2.1k"
+#   content        → "176 tok" — plus the reasoning spend when there was
+#                    any: "2.1k think · 176 tok"
+#
+# The whole line is already wrapped in dim() by the frame, so the
+# slow/queued? suffix inherits the dim styling.
+fun ticker_phase_text(tok, think, kb, elapsed) {
+    if (tok == 0 && think == 0) {
+        base = "waiting for first token · " ++ to_string(kb) ++ " KB sent"
+        if (elapsed > 30) { base ++ " · slow/queued?" } else { base }
+    } else { if (tok == 0) {
+        "thinking · " ++ ticker_fmt_k(think)
+    } else { if (think > 0) {
+        ticker_fmt_k(think) ++ " think · " ++ ticker_fmt_k(tok) ++ " tok"
+    } else {
+        ticker_fmt_k(tok) ++ " tok"
+    }}}
 }
 
 fun ticker_count(tbl, key) {

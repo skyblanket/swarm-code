@@ -205,7 +205,15 @@ fun main() {
         t_deny_session_beats_auto_accept(),
         t_route_toplevel_path_not_command(),
         t_sf_blank_run_equiv(),
-        t_sf_four_backtick_fence()
+        t_sf_four_backtick_fence(),
+        # --- phase-aware stream ticker (6 added) ---
+        t_ticker_phase_waiting(),
+        t_ticker_phase_waiting_slow(),
+        t_ticker_phase_thinking(),
+        t_ticker_phase_content(),
+        t_ticker_phase_think_plus_tok(),
+        t_stream_timeout_no_first_token(),
+        t_large_ctx_hint_once()
     ]
 
     passed = sum_list(results, 0)
@@ -1901,10 +1909,12 @@ fun t_stream_timeout_transient() {
     w = spawn(hung_worker())
     r = LLM.routed_collect(w, "tok-timeout-test", nil, "", 60, timestamp() + 180)
     raw = elem(r, 0)
+    # Silent worker = zero chunks → the phase-aware "no first token" diag
+    # (the mid-stream "no activity" line needs prior matched activity).
     ok = bool_and3(
         if (elem(raw, 0) == 'error') { 'true' } else { 'false' },
         if (elem(raw, 1) == 0) { 'true' } else { 'false' },
-        string_contains(to_string(elem(raw, 2)), "no activity"))
+        string_contains(to_string(elem(raw, 2)), "no first token"))
     check("routed_collect: silent worker -> {'error',0,..} transient within tiny window", ok)
 }
 
@@ -2381,9 +2391,11 @@ fun t_stream_stale_chunks_dont_rearm() {
     took = timestamp() - t0
     exit_proc(chatter, 'kill')
     raw = elem(r, 0)
+    # Zero matched chunks → the timeout arm now emits the phase-aware
+    # "no first token" diag (not the mid-stream "no activity" line).
     ok = bool_and3(
         eqs(elem(raw, 0), 'error'),
-        string_contains(to_string(elem(raw, 2)), "no activity"),
+        string_contains(to_string(elem(raw, 2)), "no first token"),
         if (took < 1000) { 'true' } else { 'false' })
     check("routed_collect: stale-token chatter can't defer the live stream's idle timeout", ok)
 }
@@ -2409,6 +2421,74 @@ fun t_stream_err_not_content() {
         eqs(printed, "body text"),
         eqs(string_contains(printed, "truncated"), 'false'))
     check("routed_collect: stream_err stays out of the content region", ok)
+}
+
+# ------------------------------------------------------------
+# Phase-aware stream ticker — the mid-segment is a pure fn
+# (UI.ticker_phase_text) so the "stalled connection reads as 0 tok"
+# regression stays locked out. A user watched "◐ 233s · 0 tok" for
+# 4 minutes on a stream that had received NOTHING.
+# ------------------------------------------------------------
+fun t_ticker_phase_waiting() {
+    ok = eqs(UI.ticker_phase_text(0, 0, 361, 5),
+             "waiting for first token · 361 KB sent")
+    check("ticker: pre-first-token phase shows upload size, never 0 tok", ok)
+}
+
+fun t_ticker_phase_waiting_slow() {
+    ok = eqs(UI.ticker_phase_text(0, 0, 361, 31),
+             "waiting for first token · 361 KB sent · slow/queued?")
+    check("ticker: no chunks past 30s appends slow/queued?", ok)
+}
+
+fun t_ticker_phase_thinking() {
+    ok = eqs(UI.ticker_phase_text(0, 2137, 361, 5), "thinking · 2.1k")
+    check("ticker: pure-reasoning phase keeps thinking · Nk", ok)
+}
+
+fun t_ticker_phase_content() {
+    ok = eqs(UI.ticker_phase_text(176, 0, 361, 12), "176 tok")
+    check("ticker: content-only phase keeps N tok", ok)
+}
+
+fun t_ticker_phase_think_plus_tok() {
+    ok = eqs(UI.ticker_phase_text(176, 2137, 361, 12),
+             "2.1k think · 176 tok")
+    check("ticker: content after reasoning shows both spends", ok)
+}
+
+# Zero chunks of ANY kind at the inactivity timeout = the server never
+# started answering — the retry diag must name the stall and the upload
+# size, not the generic mid-stream quiet-stream line.
+fun t_stream_timeout_no_first_token() {
+    tbl = ets_new()
+    ets_put(tbl, 'stream_req_kb', 353)
+    w = spawn(hung_worker())
+    r = LLM.routed_collect(w, "tok-no-first", tbl, "", 80, timestamp() + 80)
+    raw = elem(r, 0)
+    m = to_string(elem(raw, 2))
+    ok = bool_and3(
+        eqs(elem(raw, 0), 'error'),
+        string_contains(m, "no first token"),
+        string_contains(m, "353 KB"))
+    check("routed_collect: zero-chunk timeout names the stall + request size", ok)
+}
+
+# The 300KB one-shot /compact hint latches per session: sub-threshold
+# never latches, the first crossing fires, every later large turn is
+# silent, and a nil table degrades to skip. headless opts make diag()
+# a no-op so we assert the latch, not stdout.
+fun t_large_ctx_hint_once() {
+    tbl = ets_new()
+    opts = %{headless: 'true'}
+    small = LLM.maybe_large_context_hint(opts, tbl, 250)
+    first = LLM.maybe_large_context_hint(opts, tbl, 361)
+    second = LLM.maybe_large_context_hint(opts, tbl, 420)
+    ok = bool_and(
+        bool_and(eqs(small, 'skip'), eqs(first, 'shown')),
+        bool_and(eqs(second, 'skip'),
+                 eqs(LLM.maybe_large_context_hint(opts, nil, 420), 'skip')))
+    check("llm: large-context /compact hint fires once per session", ok)
 }
 
 # Deny-session cache must beat auto-accept-edits: an explicit "always
