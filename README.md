@@ -52,6 +52,9 @@ Or grab a prebuilt binary (macOS / Linux, arm64 + x86_64):
 curl -fsSL https://raw.githubusercontent.com/skyblanket/swarm-code/main/scripts/install.sh | sh
 ```
 
+On Windows, run the same installer inside [WSL2](https://learn.microsoft.com/windows/wsl/install) —
+the Linux binaries work as-is. There is no native Windows build yet.
+
 Run a one-shot headless query (pipe-friendly for scripts and CI):
 
 ```bash
