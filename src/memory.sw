@@ -116,6 +116,12 @@ fun migrate_entries(keys, vals) {
 # content     — the body of the memory (markdown allowed)
 # opts        — agent opts map; used for best-effort embedding on save
 fun save(name, description, type_, content, opts) {
+    # Lazy mkdir: save must not assume load() ever ran. On a fresh
+    # machine (or a bare CI runner) ~/.swarm-code/memory doesn't exist
+    # and the file_write below fails silently — this broke `remember`
+    # before first startup AND made the two memory suite tests
+    # CI-red-only (they passed locally where the dir pre-exists).
+    file_mkdir(memory_dir())
     slug = slugify(to_string(name))
     file_path = memory_file_path(slug)
     body =
