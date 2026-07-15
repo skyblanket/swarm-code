@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-15
+
+The responsiveness release: the agent never blocks the terminal and the
+terminal never lies about what the agent is doing. Everything here was
+hardened against real field sessions — every headline fix below was
+found in live use and shipped with a regression test. Suite 105 → 160.
+
+### Added
+
+- **Bash auto-backgrounding.** Long-running commands no longer block the
+  agent: in interactive sessions a bash call still running after 15s
+  (`background_after_ms`, 0 disables) is handed off to a detached
+  process group with its log streamed to disk from t=0, and the agent
+  wakes on completion (`bg_done`). `run_in_background: true` detaches
+  immediately. ESC during the foreground wait kills the whole process
+  group. A one-shot `bg_stalled` wake fires when a task's log goes
+  silent for 45s and the tail looks like an interactive prompt.
+- **Incremental streamed markdown.** The LLM call runs off the main
+  loop and each markdown block renders once at its boundary — raw
+  markdown never appears on screen, and the old stream-then-repaint
+  flicker and tall-response scrollback duplication are gone entirely.
+- **Live, phase-aware stream ticker**: `◐ 12s · 176 tok · esc to
+  interrupt`, with honest phases — `waiting for first token · 361 KB
+  sent · slow/queued?` before the first byte, `thinking · 2.1k` during
+  reasoning, `2.1k think · 176 tok` once content flows.
+- **LLM request timeout** (`llm_timeout_ms`, default 300s inactivity):
+  a stalled connection is killed and retried transparently, with an
+  explicit "no first token in 300s — server stalled/queued" diagnostic,
+  and ESC now kills the underlying connection in milliseconds.
+- **Input that survives turns**: type-ahead during a running turn seeds
+  the next prompt (editable) instead of being eaten; mid-turn pastes
+  survive; prompt history persists to `~/.swarm-code/history`.
+- **Markdown engine completeness**: italic/`__bold__`/strikethrough/
+  escapes, `~~~` fences with language labels, bordered + keyword-
+  highlighted code blocks with wrap continuation, indented code blocks,
+  nested blockquotes, table cell wrapping with real alignment and
+  CJK/emoji-aware widths, OSC-8 hyperlinks.
+- **Real diffs**: line-level LCS diffs with context and hunk headers
+  for `edit`/`multi_edit` — and for `write` overwrites.
+- **New surfaces**: `/bg` (list/tail/kill background tasks), `/expand`
+  (full output of the last capped tool result), `/mode` cycling with
+  auto-accept-edits, unknown-slash feedback, plan-confirm ESC=cancel,
+  footer with cwd + git branch, terminal title, COLORTERM 256-color
+  fallback, once-per-session `/compact` hint on 300KB+ turns.
+- **web_search resilience**: five-tier engine cascade (DDG html → DDG
+  lite → Bing → Startpage → Wikipedia) with per-tier diagnostics — a
+  bot-walled engine now reports "(no results — ddg: bot-blocked; …)"
+  plus a `web_fetch` hint instead of silently returning nothing.
+
+### Fixed
+
+- **The 152-second crash**: self-tail-calls in `receive … after` bodies
+  are now TCO'd by the swarmrt compiler, so long tool waits no longer
+  overflow the fiber stack (SIGBUS). Stack overflow in general is now a
+  recoverable per-process panic — supervised restart instead of binary
+  death — and `SW_PROC_STACK` can raise the fiber stack per-binary.
+- **The heartbeat freeze**: `shell()` had a hidden 1-second minimum per
+  call (now 3–5ms) and scheduler housekeeping ran per-tick on the main
+  fiber — during long turns the tick backlog outgrew the drain rate and
+  input froze indefinitely. Ticks now coalesce and pruning is
+  cadence-gated.
+- **Line editor**: multi-line paste + continued typing no longer
+  overlaps stale rows (row-accurate repaint with a single render/measure
+  walk); sub-1KB pastes are no longer misparsed; the caret no longer
+  parks 15 columns right of the typing spot (prompt color codes were
+  counted as visible width).
+- Requires swarmrt ≥ 1.0.0 (ships the runtime side of all of the
+  above: `shell_detached`/`pid_kill_group`, the stdin pending-input
+  ring, `rl_history_*`, routed-stream kill, and the line-editor
+  rewrite).
+
 ## [1.0.0] - 2026-07-03
 
 First production release. The 1.0 cut hardens the TUI (markdown list
