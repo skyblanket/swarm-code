@@ -7,6 +7,7 @@
 | `main.sw` | CLI flags, env config, headless mode, the main loop |
 | `agent.sw` | Prompt assembly, tool-call parsing/serialising, turn loop |
 | `ToolExecutor.sw` | Shared context, hook, guardrail, and permission boundary |
+| `CommandGuard.sw` | Token-aware shell-command risk classifier (hardline / dangerous) used by the permission gate for every command-running tool |
 | `tools.sw` | Raw tool handlers (`do_bash`, `do_read`, …) and `exec_raw()` dispatch |
 | `ToolRegistry.sw` | Tool identity plus execution-context allow/block policy |
 | `ToolSchemas.sw` | OpenAI-compatible function schemas for native tool calling |

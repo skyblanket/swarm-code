@@ -31,7 +31,11 @@ backported.
   context is missing or unknown.
 - **Hardline command blocklist.** Destructive commands (`rm -rf /`, `mkfs`, `dd`
   to a device, fork bombs, and similar) are blocked and **cannot be bypassed by
-  environment overrides**.
+  environment overrides**. The check covers every tool that runs a shell
+  command (`bash`, `background`, `bg_server`, `run_tests`) and parses the
+  command like `sh` (quotes, separators, `$(…)`, `sh -c`, wrappers such as
+  `sudo`/`env`/`xargs`), so respellings are caught; it is a floor against
+  accidents, not a sandbox — a command assembled at runtime can't be judged.
 - **Restricted contexts.** Subagents, MCP-server, and council-panel contexts run
   under narrowed, often read-only, tool policies.
 - **Secret redaction.** Known secret patterns are redacted from session logs and
