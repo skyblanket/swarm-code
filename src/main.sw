@@ -84,6 +84,15 @@ fun main() {
     no_resume = if (has_flag(cli_args, "--no-resume") == 'true') { 'true' } else { 'false' }
     arg_prompt = get_print_arg(cli_args)
     headless = p_present
+    # Headless stdout carries only the result: the --json line, or the final
+    # answer when stdout is piped. The transcript (tool calls, streamed
+    # tokens, notices) moves to stderr, so `swarm -p ... | jq` and
+    # `x=$(swarm -p ...)` get clean output. A terminal stdout keeps the live
+    # transcript as before (-1 = not diverted).
+    result_fd = if (headless == 'true' &&
+                    (json_mode == 'true' || stdout_is_tty() == 'false')) {
+        stdout_to_stderr()
+    } else { -1 }
     headless_prompt = if (p_present == 'false') { nil }
                       else { if (arg_prompt != nil) { arg_prompt }
                       else { read_all_stdin("") }}
@@ -273,7 +282,7 @@ fun main() {
     }
 
     if (headless == 'true') {
-        Agent.run_headless(map_put(opts5, 'no_resume', no_resume),
+        Agent.run_headless(map_put(map_put(opts5, 'no_resume', no_resume), 'result_fd', result_fd),
                            system_prompt_text, headless_prompt, json_mode)
     } else {
         Agent.run(opts5, system_prompt_text)
@@ -756,12 +765,12 @@ fun resolve_cwd() {
                          " && pwd || echo " ++ Util.shell_q(to_string(cwd_env))), 1)
         string_trim(to_string(raw))
     } else {
-        pwd_env = getenv("PWD")
-        if (pwd_env != nil) {
-            to_string(pwd_env)
-        } else {
-            string_trim(elem(shell("pwd"), 1))
-        }
+        # Ask /bin/sh rather than trusting $PWD: a launcher that chdir()s
+        # without updating PWD (IDE integrations, subprocess(cwd=...), cron)
+        # leaves it naming another directory, and the system prompt would
+        # send the model's absolute paths there. sh keeps $PWD only when it
+        # really is the current directory, so symlinked paths survive.
+        string_trim(elem(shell("pwd"), 1))
     }
 }
 

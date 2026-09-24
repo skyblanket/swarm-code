@@ -522,25 +522,31 @@ fun read_file_capped(path, offset, limit) {
     # touching the path. Every probe below is also timeout-guarded as a
     # backstop (a path on a dead NFS mount can hang even `test`).
     rf_r = shell_managed(
-        "test -f " ++ pq ++ " && echo reg || echo nonreg 2>&1", read_probe_timeout_s() * 1000)
+        "if test -f " ++ pq ++ "; then echo reg; elif test -e " ++ pq ++
+        "; then echo nonreg; else echo missing; fi", read_probe_timeout_s() * 1000)
     rf = string_trim(elem(rf_r, 1))
     if (elem(rf_r, 2) == 'true') {
         # Probe was killed by timeout/ESC (e.g. a dead NFS mount) — say so
         # rather than misreporting the path as a non-regular file.
         "error: read of " ++ to_string(path) ++ " was interrupted (timeout or ESC) " ++
         "before the file could be classified — the path may be on an unresponsive filesystem."
+    } else { if (rf == "missing") {
+        "error: file not found — " ++ to_string(path) ++
+        "\n(Check the path; glob finds files by name.)"
     } else { if (rf != "reg") {
         "error: not a regular file — " ++ to_string(path) ++
         "\n(FIFOs, devices, sockets, and directories are refused to avoid a hang. " ++
         "Use bash with an explicit, bounded reader if you really need to.)"
     } else {
         # Check if file is binary before reading — binary content poisons the
-        # model's context and causes empty responses.
-        file_type = elem(shell_managed("file --brief --mime-type " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
-        is_text = string_starts_with(string_trim(file_type), "text") == 'true'
-        is_json = string_contains(file_type, "json") == 'true'
-        is_xml = string_contains(file_type, "xml") == 'true'
-        if (is_text == 'true' || is_json == 'true' || is_xml == 'true') {
+        # model's context and causes empty responses. Binary means a NUL byte
+        # in the first 8KB (git's heuristic). MIME types misclassify text —
+        # libmagic reports .js/.ts as application/javascript — and `file` is
+        # missing from many slim container images.
+        nul_r = shell_managed("head -c 8192 " ++ pq ++ " | tr -dc '\\000' | wc -c",
+                              read_probe_timeout_s() * 1000)
+        nul_count = parse_int_safe(string_trim(elem(nul_r, 1)), 0)
+        if (nul_count == 0) {
             # Size guard: file_read() pulls the WHOLE file into memory, so a
             # multi-GB file would OOM the VM before truncate_output ever runs.
             # Stat first; for anything large, read only a capped head via
@@ -548,24 +554,35 @@ fun read_file_capped(path, offset, limit) {
             size_str = string_trim(elem(shell_managed("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
             size = parse_int_safe(size_str, 0)
             read_ceiling = read_output_cap()
-            content = if (size > read_ceiling) {
+            content = if (size == 0) { "" } else { if (size > read_ceiling) {
                 head = elem(shell_managed("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
                 head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
                 to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
             } else {
                 file_read(path)
-            }
+            } }
             if (content == nil) {
                 "error: could not read " ++ path
+            } else { if (size == 0) {
+                "[empty file] " ++ to_string(path) ++ " exists but has no content."
             } else {
                 sliced = slice_lines(content, offset, limit)
                 truncate_output(sliced, read_output_cap())
-            }
+            } }
         } else {
-            "error: binary file (" ++ string_trim(file_type) ++ ") — " ++ to_string(path) ++
-            "\nUse bash with hexdump, xxd, strings, or file to inspect binary files."
+            # Best-effort label; `file` may not be installed.
+            ft_r = shell_managed("file --brief --mime-type " ++ pq ++ " 2>/dev/null",
+                                 read_probe_timeout_s() * 1000)
+            ft = string_trim(to_string(elem(ft_r, 1)))
+            label = if (string_length(ft) == 0) { "binary" } else { "binary, " ++ ft }
+            hint = if (string_starts_with(ft, "image/") == 'true') {
+                "\nUse read_image to look at an image."
+            } else {
+                "\nUse bash with hexdump, xxd, strings, or file to inspect binary files."
+            }
+            "error: " ++ label ++ " file — " ++ to_string(path) ++ hint
         }
-    } }
+    } } }
 }
 
 # Slice [offset, offset+limit) lines from content (1-based offset) and
@@ -577,7 +594,12 @@ fun read_file_capped(path, offset, limit) {
 # number is the ABSOLUTE file line (start + position-in-window + 1), so anchors
 # stay correct even when reading a windowed slice with offset > 1.
 fun slice_lines(content, offset, limit) {
-    lines = string_split(content, "\n")
+    parts = string_split(content, "\n")
+    # A final newline ends the last line; it doesn't start an empty one
+    # (a 6-line file used to read back as 7 lines).
+    lines = if (string_ends_with(content, "\n") == 'true' && length(parts) > 1) {
+        take_first_lines(parts, length(parts) - 1, [])
+    } else { parts }
     total = length(lines)
     start = if (offset < 1) { 0 } else { offset - 1 }
     if (start >= total) {
@@ -788,6 +810,9 @@ fun do_edit_impl_inner(path, old_s, new_s, replace_all) {
                 # Count occurrences in the ORIGINAL — checking the
                 # post-replace buffer would falsely fire whenever
                 # new_string contains old_string as a substring.
+                eol = crlf_adapt(original, old_s, new_s)
+                old_s = elem(eol, 0)
+                new_s = elem(eol, 1)
                 occ = count_substrings(original, old_s)
                 if (occ == 0) {
                     # Exact miss. Before failing, retry against normalized
@@ -821,6 +846,24 @@ fun do_edit_impl_inner(path, old_s, new_s, replace_all) {
             }
         }
     }
+}
+
+# Models send LF-only strings, so a multi-line old_string never matched a
+# CRLF file. When the file uses CRLF and the LF form isn't found, match and
+# write with CRLF instead ({old, new}); an exact match always wins, so files
+# with mixed line endings are left alone.
+fun crlf_adapt(buffer, old_s, new_s) {
+    if (string_contains(buffer, "\r\n") == 'true' &&
+        string_contains(old_s, "\n") == 'true' &&
+        string_contains(old_s, "\r") == 'false' &&
+        count_substrings(buffer, old_s) == 0) {
+        {to_crlf(old_s), to_crlf(new_s)}
+    } else { {old_s, new_s} }
+}
+
+fun to_crlf(s) {
+    if (string_contains(s, "\r") == 'true') { s }
+    else { replace_all_occ(s, "\n", "\r\n") }
 }
 
 # ------------------------------------------------------------
@@ -1971,6 +2014,9 @@ fun apply_edits(path, buffer, edits, count, total) {
                 # Count in the CURRENT buffer (pre-replace) — using
                 # the post-replace check produced false positives when
                 # new_string contained old_string as a substring.
+                eol = crlf_adapt(buffer, old_s, new_s)
+                old_s = elem(eol, 0)
+                new_s = elem(eol, 1)
                 occ = count_substrings(buffer, old_s)
                 if (occ == 0) {
                     # Exact miss — retry against normalized copies (quotes /

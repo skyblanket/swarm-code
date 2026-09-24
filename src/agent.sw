@@ -46,7 +46,8 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         drop_to_last_clean_user, trailing_turn_incomplete, trim_incomplete,
         looks_like_slash_command, is_known_slash_command, bg_normalize_id,
         get_session_mode, set_session_mode, next_mode, resolve_permission,
-        show_expand, handle_bg_command, route_input]
+        show_expand, handle_bg_command, route_input,
+        skip_remaining_tools, turn_interrupted]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -527,11 +528,24 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
 
     last_text = last_assistant_text(final_history)
     ok = if (string_length(last_text) > 0) { 'true' } else { 'false' }
+    result_fd = map_get(opts, 'result_fd')
     if (json_mode == 'true') {
         status = if (ok == 'true') { "ok" } else { "error" }
-        print(json_encode(%{status: status, summary: last_text}))
-    } else { "" }
+        emit_result(result_fd, json_encode(%{status: status, summary: last_text}))
+    } else {
+        # Diverted (piped) stdout gets the final answer; a terminal already
+        # showed it streamed.
+        if (ok == 'true' && result_fd != nil && result_fd >= 0) { emit_result(result_fd, last_text) }
+        else { "" }
+    }
     if (ok == 'true') { "" } else { sys_exit(1) }
+}
+
+# Write the headless result line to the real stdout (result_fd, set when
+# main diverted stdout to stderr), or plain print when nothing was diverted.
+fun emit_result(result_fd, s) {
+    if (result_fd != nil && result_fd >= 0) { fd_write(result_fd, s ++ "\n") }
+    else { print(s) }
 }
 
 fun last_assistant_text(history) {
@@ -2071,7 +2085,13 @@ fun run_turn(history, opts, step) {
             } else {
                 meter_opts = opts_with_history(opts, with_assistant)
                 post_exec = execute_all(tool_calls, with_assistant, meter_opts)
-                run_turn(post_exec, meter_opts, step + 1)
+                if (turn_interrupted(post_exec, length(tool_calls)) == 'true') {
+                    turn_print(opts, "  " ++ UI.dim_text("⎿ interrupted · tell the agent what to do instead"))
+                    turn_print(opts, "")
+                    post_exec
+                } else {
+                    run_turn(post_exec, meter_opts, step + 1)
+                }
             }
             }
         }
@@ -2656,7 +2676,50 @@ fun execute_all(tool_calls, history, opts) {
         Log.tool_result(name_atom, string_length(result), had_err)
         hist_done = list_append(history, LLM.new_message_tool(id, result))
         journal_sync(opts, hist_done)
-        execute_all(tl(tool_calls), hist_done, opts)
+        # ESC/Ctrl-C on a tool stops the whole turn: the rest of this batch
+        # is recorded as skipped (every tool_call still needs its result
+        # message) and run_turn hands control back instead of re-calling
+        # the model.
+        if (is_user_interrupt(result) == 'true' && map_get(opts, 'headless') != 'true') {
+            skip_remaining_tools(tl(tool_calls), hist_done, opts)
+        } else {
+            execute_all(tl(tool_calls), hist_done, opts)
+        }
+    }
+}
+
+fun INTERRUPT_SKIPPED() { "[skipped] the user interrupted this turn before this tool ran." }
+
+# Result markers for a tool the user stopped: shell_managed's ESC/Ctrl-C
+# kill, and collect_tool_result's interrupt of a non-shell tool.
+fun is_user_interrupt(result) {
+    s = to_string(result)
+    if (string_starts_with(s, "[stopped by user") == 'true') { 'true' }
+    else { if (string_starts_with(s, "[interrupted]") == 'true') { 'true' }
+    else { if (s == INTERRUPT_SKIPPED()) { 'true' } else { 'false' } } }
+}
+
+fun skip_remaining_tools(tool_calls, history, opts) {
+    if (length(tool_calls) == 0) { history }
+    else {
+        id = to_string(map_get(hd(tool_calls), 'id'))
+        h2 = list_append(history, LLM.new_message_tool(id, INTERRUPT_SKIPPED()))
+        journal_sync(opts, h2)
+        skip_remaining_tools(tl(tool_calls), h2, opts)
+    }
+}
+
+# Did the user interrupt any of the last `n` tool results?
+fun turn_interrupted(history, n) {
+    any_interrupted(take_last(history, n))
+}
+
+fun any_interrupted(msgs) {
+    if (length(msgs) == 0) { 'false' }
+    else {
+        m = hd(msgs)
+        if (map_get(m, 'role') == 'tool' && is_user_interrupt(map_get(m, 'content')) == 'true') { 'true' }
+        else { any_interrupted(tl(msgs)) }
     }
 }
 

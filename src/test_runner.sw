@@ -213,7 +213,15 @@ fun main() {
         t_ticker_phase_content(),
         t_ticker_phase_think_plus_tok(),
         t_stream_timeout_no_first_token(),
-        t_large_ctx_hint_once()
+        t_large_ctx_hint_once(),
+        # --- ESC ends the turn ---
+        t_interrupt_skips_rest_and_ends_turn(),
+        t_interrupt_not_on_normal_results(),
+        # --- read / edit correctness ---
+        t_read_js_is_text(),
+        t_read_line_count_and_empty(),
+        t_read_missing_and_binary(),
+        t_edit_crlf_file()
     ]
 
     passed = sum_list(results, 0)
@@ -1577,7 +1585,7 @@ fun t_bg_stdin_devnull_no_hang() {
 
 # bg_kill must SIGTERM the WHOLE process group, not just the /bin/sh wrapper.
 # Launch a wrapper that forks a backgrounded sleep plus a foreground sleep;
-# after kill_task + a short grace, pgrep -g <pgid> must find zero survivors.
+# after kill_task + a short grace, pgrep -g <pgid> must find zero live survivors.
 fun t_bg_kill_group() {
     table = Background.init()
     id = Background.launch(table, "sh -c 'sleep 60 & sleep 60; wait'", "kill probe")
@@ -1586,7 +1594,11 @@ fun t_bg_kill_group() {
     pid = ets_get(table, id ++ "/pid")
     Background.kill_task(table, id)
     sleep(600)
-    r = shell("pgrep -g " ++ to_string(pid) ++ " 2>/dev/null | wc -l | tr -d ' \n'")
+    # Count LIVE members only: a killed child whose parent is gone becomes a
+    # zombie until init reaps it, and container inits (Docker without
+    # --init, sandboxes) never do — zombies have already terminated.
+    r = shell("for p in $(pgrep -g " ++ to_string(pid) ++ " 2>/dev/null); do " ++
+              "ps -o stat= -p $p 2>/dev/null; done | grep -vc '^ *Z' | tr -d ' \n'")
     count = string_trim(to_string(elem(r, 1)))
     check("bg_kill terminates the whole process group (0 survivors)",
           if (count == "0") { 'true' } else { 'false' })
@@ -2542,4 +2554,86 @@ fun t_sf_four_backtick_fence() {
             string_contains(batch, "```"),
             eqs(Markdown.fence_info("````"), "")))
     check("fence: 4-backtick opener needs >=4 closer; fence_info('````') is empty", ok)
+}
+
+# ESC on a tool ends the turn: the remaining calls of the batch each get a
+# [skipped] result (so every tool_call id still has its tool message) and
+# turn_interrupted() tells run_turn not to call the model again.
+fun t_interrupt_skips_rest_and_ends_turn() {
+    base = [LLM.new_message_user("go"),
+            LLM.new_message_tool("a", "[stopped by user (ESC/Ctrl-C) — process group killed]")]
+    rest = [%{id: "b", name: "bash", arguments: "{}"}, %{id: "c", name: "read", arguments: "{}"}]
+    h = Agent.skip_remaining_tools(rest, base, %{})
+    last2 = tl(tl(h))
+    ids_ok = if (map_get(hd(last2), 'tool_call_id') == "b" &&
+                 map_get(hd(tl(last2)), 'tool_call_id') == "c") { 'true' } else { 'false' }
+    check("interrupt: remaining tool_calls get [skipped] results and the turn ends",
+          bool_and3(ids_ok,
+                    if (length(h) == 4) { 'true' } else { 'false' },
+                    Agent.turn_interrupted(h, 3)))
+}
+
+fun t_interrupt_not_on_normal_results() {
+    h = [LLM.new_message_tool("a", "[exit 0]\nok"),
+         LLM.new_message_tool("b", "[interrupted] tool 'web_fetch' was stopped by the user (ESC).")]
+    check("interrupt: detected for non-shell tools, not for normal results",
+          bool_and(if (Agent.turn_interrupted(take_first_n(h, 1), 1) == 'false') { 'true' } else { 'false' },
+                   Agent.turn_interrupted(h, 2)))
+}
+
+fun take_first_n(lst, n) {
+    if (n <= 0 || length(lst) == 0) { [] }
+    else { [hd(lst) | take_first_n(tl(lst), n - 1)] }
+}
+
+# libmagic calls .js/.ts "application/javascript"; read used to refuse them
+# as binary. Binary is now "a NUL byte in the first 8KB".
+fun t_read_js_is_text() {
+    p = "/tmp/swc_read_js.js"
+    file_write(p, "function f() {\n  return 1;\n}\n")
+    r = Tools.exec_raw('read', %{path: p}, %{})
+    file_delete(p)
+    check("read: a .js file is text (line-numbered, not 'binary')",
+          bool_and(string_starts_with(r, "1\tfunction f() {"),
+                   if (string_contains(r, "binary") == 'false') { 'true' } else { 'false' }))
+}
+
+# A trailing newline ends the last line (no phantom empty line); an empty
+# file is reported as empty, not as binary.
+fun t_read_line_count_and_empty() {
+    p = "/tmp/swc_read_lines.txt"
+    file_write(p, "a\nb\n")
+    r = Tools.exec_raw('read', %{path: p}, %{})
+    e = "/tmp/swc_read_empty.txt"
+    file_write(e, "")
+    re = Tools.exec_raw('read', %{path: e}, %{})
+    file_delete(p)
+    file_delete(e)
+    check("read: 2-line file reads as 2 lines; empty file says [empty file]",
+          bool_and(if (r == "1\ta\n2\tb") { 'true' } else { 'false' },
+                   string_starts_with(re, "[empty file]")))
+}
+
+fun t_read_missing_and_binary() {
+    m = Tools.exec_raw('read', %{path: "/tmp/swc_no_such_file_xyz.txt"}, %{})
+    b = "/tmp/swc_read_bin.dat"
+    file_write_bytes(b, bytes_from_ints([80, 75, 0, 3, 255]))
+    rb = Tools.exec_raw('read', %{path: b}, %{})
+    file_delete(b)
+    check("read: missing file says 'file not found'; NUL bytes mean binary",
+          bool_and(string_starts_with(m, "error: file not found"),
+                   string_starts_with(rb, "error: binary")))
+}
+
+# Models send LF-only old_strings; a CRLF file must still be editable and
+# keep its CRLF endings.
+fun t_edit_crlf_file() {
+    p = "/tmp/swc_edit_crlf.txt"
+    file_write(p, "one\r\ntwo\r\nthree\r\n")
+    r = Tools.exec_raw('edit', %{path: p, old_string: "one\ntwo", new_string: "ONE\nTWO"}, %{})
+    aft = file_read(p)
+    file_delete(p)
+    check("edit: LF old_string matches a CRLF file and writes CRLF",
+          bool_and(string_starts_with(r, "ok:"),
+                   if (aft == "ONE\r\nTWO\r\nthree\r\n") { 'true' } else { 'false' }))
 }

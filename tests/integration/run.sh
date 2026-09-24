@@ -18,6 +18,8 @@
 #   T6  MCP safety boundary — MCP server cannot bypass hardline policy
 #   T7  hook rewrite safety — rewritten args are checked before execution
 #   T8  council boundary    — read-only panel cannot execute shell commands
+#   T9  clean stdout        — headless stdout is only the JSON line / answer
+#   T10 stale PWD           — the real cwd, not $PWD, reaches the system prompt
 #
 # Exit code: 0 iff every test passes.
 
@@ -99,6 +101,7 @@ run_swarm() {
         SWARM_CODE_TOOL_FORMAT=native \
         SWARM_CODE_PLAN=off \
         SWARM_CODE_NO_RESUME=0 \
+        PWD="${RUN_PWD:-$PWD}" \
         "$BIN" "$@" </dev/null >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
     ) &
     local pid=$!
@@ -345,6 +348,58 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T9 — headless stdout carries only the result: with --json, exactly one
+#      JSON line even after a tool call; without it (stdout piped), exactly
+#      the final answer. The transcript goes to stderr.
+# ------------------------------------------------------------
+t9() {
+    new_case t9
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_t9", "name": "bash",
+     "arguments": {"command": "echo transcript-t9"}}]},
+  {"type": "text", "content": "RESULT_T9 **done**"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T9 "mock failed to start"; return; }
+    run_swarm -p "run it" --no-resume --json
+    cleanup
+    local lines; lines="$(wc -l <"$CASE/stdout.txt" | tr -d ' ')"
+    if [ "$RC" -ne 0 ]; then fail T9 "json: exit code $RC"
+    elif [ "$lines" -ne 1 ]; then fail T9 "json: stdout has $lines lines, want 1"
+    elif ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["summary"]=="RESULT_T9 **done**" else 1)' "$CASE/stdout.txt"
+    then fail T9 "json: stdout is not the result object: $(head -c 300 "$CASE/stdout.txt")"
+    elif ! grep -q "transcript-t9" "$CASE/stderr.txt"; then fail T9 "json: transcript missing from stderr"
+    else
+        start_mock "$CASE/scenario.json" || { fail T9 "mock failed to restart"; return; }
+        run_swarm -p "run it" --no-resume
+        cleanup
+        if [ "$RC" -ne 0 ]; then fail T9 "plain: exit code $RC"
+        elif [ "$(cat "$CASE/stdout.txt")" != "RESULT_T9 **done**" ]; then
+            fail T9 "plain: stdout is not just the answer: $(head -c 300 "$CASE/stdout.txt")"
+        else pass T9; fi
+    fi
+}
+
+# ------------------------------------------------------------
+# T10 — a stale $PWD (launcher chdir'd without updating it) must not
+#       become the working directory the model is told about.
+# ------------------------------------------------------------
+t10() {
+    new_case t10
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "CWD_OK_T10"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T10 "mock failed to start"; return; }
+    RUN_PWD=/ run_swarm -p "where am i" --no-resume --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T10 "exit code $RC"
+    elif ! req_has 0 "Working directory: $WORK"; then fail T10 "system prompt does not name the real cwd $WORK"
+    else pass T10; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
@@ -356,6 +411,8 @@ t5
 t6
 t7
 t8
+t9
+t10
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"
