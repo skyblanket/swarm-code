@@ -391,7 +391,7 @@ fun bash_launch_bg(bg_table, cmd_s) {
     # it directly instead of treating the error string as a task id.
     if (string_starts_with(to_string(id), "error") == 'true') { id }
     else {
-        "[backgrounded] task " ++ id ++ " — log: " ++ Background.log_path_for(id) ++
+        "[backgrounded] task " ++ id ++ " — log: " ++ Background.log_path_for(bg_table, id) ++
             "\n(bg_tail / bg_result / bg_kill to manage; you'll get a bg_done wake when it finishes)"
     }
 }
@@ -424,7 +424,7 @@ fun bash_auto_bg(bg_table, cmd_s, after_ms) {
                 # Budget exhausted → hand off to the heartbeat: release the claim
                 # so poll_loop can finalize it and fire bg_done on completion.
                 Background.fg_release(bg_table, id)
-                path = Background.log_path_for(id)
+                path = Background.log_path_for(bg_table, id)
                 "[backgrounded after " ++ to_string(after_ms / 1000) ++ "s] still running — task " ++
                     id ++ ", log: " ++ path ++ "\n\nlast output:\n" ++
                     Background.tail_log(bg_table, id, 20) ++
@@ -1379,8 +1379,9 @@ fun do_background(args, opts) {
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
             id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
-            "launched " ++ id ++ ": " ++ label_str ++
-                "\n(use bg_status and bg_result to check progress)"
+            if (string_starts_with(to_string(id), "error") == 'true') { id }
+            else { "launched " ++ id ++ ": " ++ label_str ++
+                "\n(use bg_status and bg_result to check progress)" }
         }}
     }
 }
@@ -1430,10 +1431,13 @@ fun do_bg_server(args, opts) {
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
             id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
-            log_file = Background.log_path_for(id)
-            "launched detached server " ++ id ++ ": " ++ label_str ++
-                "\nlog: " ++ log_file ++
-                "\n(use bg_tail to read log, bg_kill to stop)"
+            if (string_starts_with(to_string(id), "error") == 'true') { id }
+            else {
+                log_file = Background.log_path_for(bg_table, id)
+                "launched detached server " ++ id ++ ": " ++ label_str ++
+                    "\nlog: " ++ log_file ++
+                    "\n(use bg_tail to read log, bg_kill to stop)"
+            }
         }}
     }
 }
@@ -1870,11 +1874,16 @@ fun do_log_wait(args, opts) {
         path_arg = map_get(args, 'path')
         timeout_n = clamp_wait_timeout_s(map_get(args, 'timeout_sec'))
 
-        # Resolve log path: explicit path, or task_id's log file
+        # Resolve log path: explicit path, or task_id's log file (in this
+        # session's private background directory).
+        bg_table = map_get(opts, 'bg_table')
         log_path = if (path_arg != nil) { to_string(path_arg) }
                    else {
-                       if (task_id == nil) { "" }
-                       else { "/tmp/swarm-code-" ++ to_string(task_id) ++ ".log" }
+                       if (task_id == nil || bg_table == nil) { "" }
+                       else {
+                           lp = Background.log_path_for(bg_table, to_string(task_id))
+                           if (lp == nil) { "" } else { lp }
+                       }
                    }
         if (string_length(log_path) == 0) {
             "error: log_wait needs either 'task_id' or 'path'"

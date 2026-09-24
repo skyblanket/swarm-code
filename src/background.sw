@@ -35,10 +35,11 @@ import Util
 #   '{id}/log_grew_at' → ms timestamp the log size last changed
 #   '{id}/stalled_sent'→ 'true' once a bg_stalled msg has fired (at most once)
 #   'next_id'        → counter
+#   'dir'            → this session's private task directory (see session_dir)
 
 export [
     init, launch, launch_cmd, launch_server, status, result, list_all,
-    log_path_for, tail_log, kill_task,
+    log_path_for, pid_file_for, exit_file_for, session_dir, tail_log, kill_task,
     poll_and_notify, all_pending_ids,
     finalize_if_done, wait_for_task,
     fg_claim, fg_release
@@ -56,13 +57,46 @@ fun init() {
     table
 }
 
-# Path of the log file capturing stdout+stderr.
-fun log_path_for(task_id) {
-    "/tmp/swarm-code-" ++ task_id ++ ".log"
+# Private per-session directory for task files, created on first launch
+# with `mktemp -d` (mode 0700) and remembered in the table. Task ids restart
+# at bg-0 in every session, so the old fixed /tmp/swarm-code-bg-N.{log,pid,
+# exit} paths collided across concurrent sessions: B's launch deleted A's
+# files, B's pid overwrote A's (so `bg_kill bg-0` in A killed B's task), and
+# a stale exit file could mark a fresh task done. nil if it can't be made.
+fun session_dir(table) {
+    d = ets_get(table, 'dir')
+    if (d != nil) { d }
+    else {
+        tmp = getenv("TMPDIR")
+        base = if (tmp == nil || string_length(to_string(tmp)) == 0) { "/tmp" } else { to_string(tmp) }
+        r = shell("mktemp -d " ++ Util.shell_q(base ++ "/swarm-code-bg.XXXXXX") ++ " 2>/dev/null")
+        made = string_trim(to_string(elem(r, 1)))
+        if (elem(r, 0) == 0 && string_length(made) > 0 && file_exists(made) == 'true') {
+            ets_put(table, 'dir', made)
+            made
+        } else { nil }
+    }
 }
 
-fun pid_file_for(task_id) {
-    "/tmp/swarm-code-" ++ task_id ++ ".pid"
+fun task_file(table, task_id, ext) {
+    d = session_dir(table)
+    if (d == nil) { nil } else { d ++ "/" ++ task_id ++ "." ++ ext }
+}
+
+# Path of the log file capturing stdout+stderr.
+fun log_path_for(table, task_id) {
+    known = ets_get(table, task_id ++ "/log_file")
+    if (known != nil) { known } else { task_file(table, task_id, "log") }
+}
+
+fun pid_file_for(table, task_id) {
+    known = ets_get(table, task_id ++ "/pid_file")
+    if (known != nil) { known } else { task_file(table, task_id, "pid") }
+}
+
+fun exit_file_for(table, task_id) {
+    known = ets_get(table, task_id ++ "/exit_file")
+    if (known != nil) { known } else { task_file(table, task_id, "exit") }
 }
 
 # Launch a command detached. Returns the task id string.
@@ -75,21 +109,28 @@ fun launch(table, command, label) {
 # run_cmd and the model's raw command as display_cmd, so /bg listings show
 # what the model asked for, not the wrapper.
 fun launch_cmd(table, run_cmd, display_cmd, label) {
+    if (session_dir(table) == nil) {
+        "error: failed to start background task (could not create a private task directory under $TMPDIR or /tmp)"
+    } else { launch_in_dir(table, run_cmd, display_cmd, label) }
+}
+
+fun launch_in_dir(table, run_cmd, display_cmd, label) {
     command = display_cmd
     raw_id = ets_get(table, 'next_id')
     next_id = if (raw_id == nil) { 0 } else { raw_id }
     task_id = "bg-" ++ to_string(next_id)
     ets_put(table, 'next_id', next_id + 1)
 
-    log_file = log_path_for(task_id)
-    pid_file = pid_file_for(task_id)
-    exit_file = "/tmp/swarm-code-" ++ task_id ++ ".exit"
+    log_file = task_file(table, task_id, "log")
+    pid_file = task_file(table, task_id, "pid")
+    exit_file = task_file(table, task_id, "exit")
 
-    # The rm -f first is load-bearing: bg-N ids restart at 0 every
-    # session and /tmp/swarm-code-bg-N.* files are never cleaned, so a
-    # stale exit file from a previous session would instantly mark this
-    # fresh task done (poll_and_notify and Flows both file_exists it).
-    shell("rm -f " ++ exit_file ++ " " ++ pid_file ++ " " ++ log_file)
+    # Ids are unique within this table and the directory is private to
+    # it, so nothing stale can be here — the deletes are belt-and-braces
+    # (a stale exit file would instantly mark the task done).
+    file_delete(exit_file)
+    file_delete(pid_file)
+    file_delete(log_file)
 
     # shell_detached double-forks + setsid()s a worker that runs
     # `( command ); echo $? > exit_file` under /bin/sh with stdin=/dev/null
@@ -155,7 +196,7 @@ fun result(table, task_id) {
 
 # Tail a task's log (N lines).
 # n_lines is validated upstream (Tools.do_bg_tail) to be a clean integer.
-# Log path is internal (/tmp/swarm-code-bg-N.log) but quote anyway as
+# Log path is internal (<session_dir>/bg-N.log) but quote anyway as
 # belt-and-braces.
 fun tail_log(table, task_id, n_lines) {
     log_file = ets_get(table, task_id ++ "/log_file")
@@ -171,8 +212,8 @@ fun tail_log(table, task_id, n_lines) {
 }
 
 # Kill a task by its OS pid. Validates pid as digits-only before
-# using it — pid_file lives in shared /tmp so a stray writer could
-# otherwise feed junk here. pid_kill_group SIGTERMs the whole process
+# using it — belt-and-braces now that the pid file lives in this
+# session's private directory. pid_kill_group SIGTERMs the whole process
 # group (the worker leads its own pgroup), so child processes the task
 # forked die too, not just the /bin/sh wrapper.
 fun kill_task(table, task_id) {

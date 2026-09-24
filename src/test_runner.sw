@@ -236,7 +236,8 @@ fun main() {
         t_classifier_no_false_positives(),
         t_command_tools_gated(),
         t_denial_names_reason(),
-        t_sudo_tab_blocked()
+        t_sudo_tab_blocked(),
+        t_bg_sessions_isolated()
     ]
 
     passed = sum_list(results, 0)
@@ -1550,7 +1551,7 @@ fun t_bg_auto_after_ms_no_double_finalize() {
     backgrounded = bool_and3(
         string_contains(s, "[backgrounded"),
         string_contains(s, id),
-        string_contains(s, Background.log_path_for(id)))
+        string_contains(s, Background.log_path_for(table, id)))
 
     st = Background.wait_for_task(table, id, 6000)
     done_ok = if (st == 'done') { 'true' } else { 'false' }
@@ -2865,4 +2866,37 @@ fun t_sudo_tab_blocked() {
     check("sudo refusal is token-aware (sudo<TAB>ls) and covers the background tool",
           bool_and(string_starts_with(out, "error: sudo is disabled"),
                    string_starts_with(out2, "error: sudo is disabled")))
+}
+
+# Background ids restart at bg-0 per session and the files lived at fixed
+# /tmp/swarm-code-bg-N.{log,pid,exit}: session B's launch deleted session A's
+# files and `bg_kill bg-0` in A killed B's task. Two tables = two sessions.
+fun t_bg_sessions_isolated() {
+    ta = Background.init()
+    tb = Background.init()
+    ida = Background.launch(ta, "sleep 30", "session A")
+    idb = Background.launch(tb, "sleep 30", "session B")
+    sleep(300)
+    pid_a = to_int_or_zero(ets_get(ta, ida ++ "/pid"))
+    pid_b = to_int_or_zero(ets_get(tb, idb ++ "/pid"))
+    Background.kill_task(ta, ida)
+    sleep(500)
+    a_dead = if (proc_live(pid_a) == 'false') { 'true' } else { 'false' }
+    b_alive = proc_live(pid_b)
+    Background.kill_task(tb, idb)
+    la = Background.log_path_for(ta, ida)
+    lb = Background.log_path_for(tb, idb)
+    dir_mode = string_trim(elem(shell("stat -c %a \"$(dirname " ++ la ++ ")\" 2>/dev/null || stat -f %Lp \"$(dirname " ++ la ++ ")\""), 1))
+    check("background: same task id in two sessions → separate private dirs; bg_kill hits only its own",
+          bool_and3(bool_and(if (ida == idb) { 'true' } else { 'false' }, if (la != lb) { 'true' } else { 'false' }),
+                    bool_and(a_dead, b_alive),
+                    if (dir_mode == "700") { 'true' } else { 'false' }))
+}
+
+fun to_int_or_zero(v) { if (v == nil) { 0 } else { Tools.to_int(v) } }
+
+# Running and not a zombie (container inits often never reap killed workers).
+fun proc_live(pid) {
+    st = string_trim(to_string(elem(shell("ps -o stat= -p " ++ to_string(pid) ++ " 2>/dev/null"), 1)))
+    if (string_length(st) > 0 && string_starts_with(st, "Z") == 'false') { 'true' } else { 'false' }
 }

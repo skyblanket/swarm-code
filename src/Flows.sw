@@ -92,10 +92,10 @@ fun run_from_json_file(path, opts) {
 }
 
 fun run_json_workflow(workflow_map, opts) {
-    # Reuse the agent's Background table (carried in opts): a private
-    # table restarts the bg-N id counter at bg-0 and collides with the
-    # agent's own (never-cleaned) /tmp/swarm-code-bg-N.* files, so a
-    # stale exit file could instantly mark a fresh task as done.
+    # Reuse the agent's Background table (carried in opts) so flow tasks
+    # share the session's bg-N id space and private task directory (a
+    # fresh table would get its own directory — safe, but the tasks would
+    # be invisible to /bg).
     existing = map_get(opts, 'bg_table')
     bg_table = if (existing == nil) { Background.init() } else { existing }
     state = init_state(workflow_map)
@@ -329,14 +329,14 @@ fun refresh_tasks_loop(tasks, bg_table, acc) {
         bg_id = map_get(t, 'bg_task_id')
         new_t = if (bg_id == nil) { t }
                 else {
-                    s = task_file_status(to_string(bg_id))
+                    s = task_file_status(bg_table, to_string(bg_id))
                     t2 = map_put(t, 'status', s)
                     if (s == 'done' || s == 'error') {
                         ended = map_get(t2, 'ended_ms')
                         t3 = if (ended == nil) { map_put(t2, 'ended_ms', timestamp()) }
                              else { t2 }
-                        exit_file = "/tmp/swarm-code-" ++ to_string(bg_id) ++ ".exit"
-                        exit_content = file_read(exit_file)
+                        exit_file = Background.exit_file_for(bg_table, to_string(bg_id))
+                        exit_content = if (exit_file == nil) { nil } else { file_read(exit_file) }
                         ec = if (exit_content == nil) { 0 }
                              else { parse_exit_code(string_trim(exit_content)) }
                         map_put(t3, 'exit_code', ec)
@@ -348,15 +348,15 @@ fun refresh_tasks_loop(tasks, bg_table, acc) {
 
 # task_file_status — check bg task status via exit/pid files directly,
 # bypassing Background ETS (which requires poll_and_notify to update).
-fun task_file_status(bg_id) {
-    exit_file = "/tmp/swarm-code-" ++ bg_id ++ ".exit"
+fun task_file_status(bg_table, bg_id) {
+    exit_file = to_string(Background.exit_file_for(bg_table, bg_id))
     if (file_exists(exit_file) == 'true') {
         exit_content = file_read(exit_file)
         ec = if (exit_content == nil) { 0 }
              else { parse_exit_code(string_trim(exit_content)) }
         if (ec == 0) { 'done' } else { 'error' }
     } else {
-        pid_file = "/tmp/swarm-code-" ++ bg_id ++ ".pid"
+        pid_file = to_string(Background.pid_file_for(bg_table, bg_id))
         if (file_exists(pid_file) == 'true') { 'running' } else { 'pending' }
     }
 }
@@ -364,35 +364,35 @@ fun task_file_status(bg_id) {
 # refresh_log_stats — read token/tool counts from log files
 fun refresh_log_stats(state) {
     phases = map_get(state, 'phases')
-    new_phases = refresh_log_phases(phases, [])
+    new_phases = refresh_log_phases(phases, map_get(state, 'bg_table'), [])
     map_put(state, 'phases', new_phases)
 }
 
-fun refresh_log_phases(phases, acc) {
+fun refresh_log_phases(phases, bg_table, acc) {
     if (length(phases) == 0) { acc }
     else {
         p = hd(phases)
         tasks = map_get(p, 'tasks')
-        new_tasks = refresh_log_tasks(tasks, [])
+        new_tasks = refresh_log_tasks(tasks, bg_table, [])
         new_p = map_put(p, 'tasks', new_tasks)
-        refresh_log_phases(tl(phases), list_append(acc, new_p))
+        refresh_log_phases(tl(phases), bg_table, list_append(acc, new_p))
     }
 }
 
-fun refresh_log_tasks(tasks, acc) {
+fun refresh_log_tasks(tasks, bg_table, acc) {
     if (length(tasks) == 0) { acc }
     else {
         t = hd(tasks)
         bg_id = map_get(t, 'bg_task_id')
-        new_t = if (bg_id == nil) { t }
+        new_t = if (bg_id == nil || bg_table == nil) { t }
                 else {
-                    log_file = "/tmp/swarm-code-" ++ to_string(bg_id) ++ ".log"
+                    log_file = to_string(Background.log_path_for(bg_table, to_string(bg_id)))
                     stats = parse_log_stats(log_file)
                     t2 = map_put(t, 'tokens_in', map_get(stats, 'tokens_in'))
                     t3 = map_put(t2, 'tokens_out', map_get(stats, 'tokens_out'))
                     map_put(t3, 'tool_calls', map_get(stats, 'tools'))
                 }
-        refresh_log_tasks(tl(tasks), list_append(acc, new_t))
+        refresh_log_tasks(tl(tasks), bg_table, list_append(acc, new_t))
     }
 }
 
