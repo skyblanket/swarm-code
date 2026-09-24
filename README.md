@@ -80,6 +80,18 @@ Point it at any OpenAI-compatible endpoint via `~/.swarm-code/settings.json`. Pr
 
 Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default). Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
 
+### Hooks
+
+`settings.json` can run shell commands around tool calls; a `PreToolUse` hook that exits non-zero (or times out after 60s, or cannot be started) blocks the call, and the hook's output is shown to the model:
+
+```json
+{ "hooks": {
+    "PreToolUse":  [ { "matcher": "bash",       "command": "./scripts/check-cmd.sh" } ],
+    "PostToolUse": [ { "matcher": "edit|write", "command": "make fmt" } ] } }
+```
+
+A matcher is `*` or `|`-separated, case-insensitive alternatives, each matching a tool whose name contains it — plus tool families: `bash` also fires for every other tool that runs a shell command (`background`, `bg_server`, `run_tests`, `file_watch`, `log_wait`), and `edit` also for `multi_edit`. The tool arguments arrive as JSON on the hook's **stdin** and in the private file `$SWARM_CODE_ARGS_FILE`; `$SWARM_CODE_ARGS` carries them inline only when under 100KB (else `$SWARM_CODE_ARGS_OMITTED=1`), so a hook that must see every call should read stdin. `$SWARM_CODE_EVENT` / `$SWARM_CODE_TOOL` name the event and tool. Executable scripts in `~/.swarm-code/hooks/` (`pre_tool.sh`, `post_tool.sh`, `pre_llm.sh`, `post_llm.sh`) get the same treatment via stdin / `$SWARM_HOOK_DATA_FILE` — see `src/Hooks.sw`.
+
 ## Features
 
 | Capability | Support |

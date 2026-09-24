@@ -274,13 +274,16 @@ fun is_hardline_bash(args) {
 #
 # Settings shape:
 #   "hooks": {
-#     "PreToolUse":  [ {"matcher": "bash", "command": "..."} ],
-#     "PostToolUse": [ {"matcher": "edit|write", "command": "..."} ],
+#     "PreToolUse":  [ {"matcher": "bash", "command": "..."} ],       (+ background, bg_server, run_tests, …)
+#     "PostToolUse": [ {"matcher": "edit|write", "command": "..."} ], (+ multi_edit)
 #     "UserPromptSubmit": [ {"command": "..."} ],
 #     "Stop":            [ {"command": "..."} ]
 #   }
 #
-# Matcher is a literal substring of the tool name, or "*" for all.
+# Matcher: "*" (or none) for all tools, else "|"-separated alternatives,
+# each a case-insensitive substring of the tool name or a tool FAMILY —
+# "bash" also fires for background/bg_server/run_tests/file_watch/log_wait,
+# "edit" also for multi_edit. See matches() for the exact rules.
 # Hooks receive context through the environment and stdin:
 #   SWARM_CODE_EVENT, SWARM_CODE_TOOL — event and tool name
 #   stdin, and the private 0600 file $SWARM_CODE_ARGS_FILE — the args JSON
@@ -371,26 +374,59 @@ fun run_matching_hooks(hooks_list, tool_name, args_json, event) {
     }
 }
 
+# Matcher semantics (PreToolUse / PostToolUse):
+#   nil, "", "*"   → every tool
+#   "a|b" / "a,b"  → any alternative matches
+#   an alternative matches a tool — case-insensitively, so Claude-Code-style
+#   "Bash" / "Edit|Write" / "MultiEdit" work — when it is a substring of the
+#   tool name (so "browser" covers every browser_* tool and "mcp__github"
+#   every tool of that server; underscores are ignored, "WebFetch" ≈
+#   "web_fetch"), or when it names a FAMILY the tool belongs to:
+#     bash (or shell) → bash, background, bg_server, run_tests, file_watch,
+#                       log_wait — every tool that runs a shell command or
+#                       shell poll loop, so a "bash" guard hook can't be
+#                       sidestepped by calling `background` instead
+#     edit            → edit, multi_edit
+#     multiedit       → multi_edit
+# (The old check was "matcher ⊂ tool or tool ⊂ matcher" on the raw string:
+# "edit|write" never fired for multi_edit, "bash" never for background.)
 fun matches(matcher, tool_name) {
     if (matcher == nil) { 'true' }
     else {
-        if (matcher == "*") { 'true' }
+        m = string_lower(string_trim(to_string(matcher)))
+        if (m == "" || m == "*") { 'true' }
         else {
-            # Two semantics, both supported via "either direction"
-            # check:
-            #   1. Pipe-alternation: matcher "bash|edit" matches tool
-            #      "bash" because tool_name is a substring of matcher.
-            #   2. Substring: matcher "ed" matches tool "edit" because
-            #      matcher is a substring of tool_name.
-            # The original code only did (1); the audit miscalled this
-            # as a bug. Doing both makes the obvious matchers work
-            # whichever way the user expected.
-            m = to_string(matcher)
-            t = to_string(tool_name)
-            if (string_contains(m, t) == 'true') { 'true' }
-            else { string_contains(t, m) }
+            alts = string_split(string_replace(m, ",", "|"), "|")
+            any_alt_matches(alts, string_lower(to_string(tool_name)))
         }
     }
+}
+
+fun any_alt_matches(alts, t) {
+    if (length(alts) == 0) { 'false' }
+    else { if (alt_matches(string_trim(hd(alts)), t) == 'true') { 'true' }
+    else { any_alt_matches(tl(alts), t) }}
+}
+
+fun alt_matches(a, t) {
+    if (a == "") { 'false' }
+    else { if (a == "*") { 'true' }
+    else { if (hook_list_has(hook_family(a), t) == 'true') { 'true' }
+    else { if (string_contains(t, a) == 'true') { 'true' }
+    else { string_contains(string_replace(t, "_", ""), string_replace(a, "_", "")) }}}}
+}
+
+fun hook_family(a) {
+    if (a == "bash" || a == "shell") {
+        ["bash", "background", "bg_server", "run_tests", "file_watch", "log_wait"]
+    } else { if (a == "edit") { ["edit", "multi_edit"] }
+    else { if (a == "multiedit") { ["multi_edit"] }
+    else { [] }}}
+}
+
+fun hook_list_has(lst, item) {
+    if (length(lst) == 0) { 'false' }
+    else { if (hd(lst) == item) { 'true' } else { hook_list_has(tl(lst), item) } }
 }
 
 # Run a single hook command with the context described above run_hooks.

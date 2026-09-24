@@ -241,7 +241,8 @@ fun main() {
         t_bg_sessions_isolated(),
         t_pre_tool_hook_big_payload(),
         t_configured_hook_big_payload(),
-        t_pre_tool_hook_fails_closed()
+        t_pre_tool_hook_fails_closed(),
+        t_hook_matcher_families()
     ]
 
     passed = sum_list(results, 0)
@@ -2953,4 +2954,29 @@ fun t_pre_tool_hook_fails_closed() {
     check("pre_tool.sh that can't be run (no payload file) vetoes with a reason",
           bool_and(if (map_get(v, 'veto') == 'true') { 'true' } else { 'false' },
                    string_contains(to_string(map_get(v, 'reason')), "could not run")))
+}
+
+# Hook matchers were bare substring checks: "edit|write" never fired for
+# multi_edit, and a "bash" hook never saw background/bg_server/run_tests —
+# the other tools that run shell commands. Claude-Code-style "Bash" /
+# "Edit|Write" never matched at all (case).
+fun matcher_blocks(matcher, tool) {
+    opts = %{settings: %{hooks: %{PreToolUse: [%{matcher: matcher, command: "exit 7"}]}}}
+    if (Config.run_hooks("PreToolUse", tool, "{}", opts) == 'block') { 'true' } else { 'false' }
+}
+
+fun t_hook_matcher_families() {
+    fires = bool_and3(
+        bool_and3(matcher_blocks("edit|write", 'multi_edit'), matcher_blocks("edit|write", 'write'),
+                  matcher_blocks("Edit", 'edit')),
+        bool_and3(matcher_blocks("bash", 'background'), matcher_blocks("bash", 'bg_server'),
+                  matcher_blocks("bash", 'run_tests')),
+        bool_and3(matcher_blocks("Bash", 'bash'), matcher_blocks("bash", 'file_watch'),
+                  matcher_blocks("*", 'read')))
+    quiet = bool_and3(
+        if (matcher_blocks("bash", 'read') == 'false') { 'true' } else { 'false' },
+        if (matcher_blocks("edit|write", 'bash') == 'false') { 'true' } else { 'false' },
+        if (matcher_blocks("write", 'multi_edit') == 'false') { 'true' } else { 'false' })
+    check("hook matchers: edit covers multi_edit, bash covers every shell tool, case-insensitive",
+          bool_and(fires, quiet))
 }
