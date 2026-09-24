@@ -468,7 +468,17 @@ fun mcp_owner_loop(name, handle, next_id) {
     }
 }
 
-# Issue one tools/call and return the result as a tool-result string.
+# Issue one tools/call. Returns a STRUCTURED outcome, never a bare
+# string, so health bookkeeping (mcp_note_result) keys on what actually
+# happened on the wire — not on the tool's output text, which is
+# arbitrary data (a log line reading "db connection lost" is a
+# SUCCESSFUL result and must not mark the server failed):
+#   {'ok', text}       server answered with a result
+#   {'error', text}    server answered, but with a JSON-RPC error /
+#                      isError result / malformed response — alive
+#   {'timeout', text}  no answer within mcp_call_timeout_ms (strike)
+#   {'lost', text}     write failed or the pipe hit EOF — process gone
+# `text` is the tool-result string handed to the model in every case.
 fun mcp_do_call(handle, id, tool_name, args) {
     args_obj = if (args == nil) { %{} } else { args }
     req = %{
@@ -479,61 +489,141 @@ fun mcp_do_call(handle, id, tool_name, args) {
     }
     sent = subprocess_send_line(handle, json_encode(req))
     if (sent != 'ok') {
-        "error: MCP server connection lost (write failed)"
+        {'lost', "error: MCP server connection lost (write failed)"}
     } else {
-        resp = mcp_read_response(handle, id, timestamp() + mcp_call_timeout_ms())
-        if (resp == nil) {
-            "error: MCP server did not respond (timed out or connection closed)"
+        r = mcp_read_reply(handle, id, timestamp() + mcp_call_timeout_ms())
+        tag = elem(r, 0)
+        if (tag == 'ok') { mcp_format_result(elem(r, 1)) }
+        else { if (tag == 'lost') {
+            {'lost', "error: MCP server connection lost (the server exited or closed its output)"}
         } else {
-            mcp_format_result(resp)
-        }
+            {'timeout', "error: MCP server did not respond within " ++
+                        to_string(mcp_call_timeout_ms() / 1000) ++ "s"}
+        }}
     }
 }
 
-# Drain JSON-RPC lines off the pipe until the response with `want_id`
-# arrives, skipping notifications and server→client requests (whose
-# id won't match). Bounded by `deadline` (a timestamp() value).
-fun mcp_read_response(handle, want_id, deadline) {
+# How early (ms before the deadline) a nil from subprocess_recv_line
+# must arrive to count as EOF rather than a timeout. recv_line returns
+# nil EARLY only on EOF / read error; a real timeout waits out the full
+# window (then up to one 100ms select tick more), so anything clearly
+# before the deadline is the server's stdout closing.
+fun mcp_eof_slack_ms() { 50 }
+
+# Drain JSON-RPC lines off the pipe until the RESPONSE to `want_id`
+# arrives. Tagged outcome, bounded by `deadline` (a timestamp() value):
+#   {'ok', msg}   our response (result, error, or a malformed reply)
+#   {'timeout'}   deadline passed with the pipe still open
+#   {'lost'}      EOF / read error — the server process is gone
+# JSON-RPC ids are per-direction: a server numbering its OWN requests
+# can reuse the id of ours (e.g. {"id":100,"method":"roots/list"} while
+# our call 100 is in flight), so id alone never identifies our reply —
+# a message carrying `method` is a server→client request (id present)
+# or notification (no id) and is never a response. Requests get an
+# answer so the server is not left blocked waiting on us; then we keep
+# reading for the real response.
+fun mcp_read_reply(handle, want_id, deadline) {
     now = timestamp()
-    if (now >= deadline) { nil }
+    if (now >= deadline) { {'timeout'} }
     else {
         line = subprocess_recv_line(handle, deadline - now)
         if (line == nil) {
-            nil
+            if (timestamp() < deadline - mcp_eof_slack_ms()) { {'lost'} }
+            else { {'timeout'} }
         } else {
             decoded = json_decode(string_trim(line))
-            if (decoded == nil) {
-                # Non-JSON line on stdout (a stray banner) — skip it.
-                mcp_read_response(handle, want_id, deadline)
-            } else {
-                rid = map_get(decoded, 'id')
-                # Compare ids as strings — some servers echo numeric ids
-                # back as strings, which would otherwise never match.
-                if (rid != nil && to_string(rid) == to_string(want_id)) { decoded }
-                else { mcp_read_response(handle, want_id, deadline) }
+            kind = mcp_msg_kind(decoded, want_id)
+            if (kind == 'response') { {'ok', decoded} }
+            else {
+                if (kind == 'request') { mcp_answer_server_request(handle, decoded) }
+                # 'notification' / 'other' (stray banner, stale reply
+                # to an earlier timed-out call) — skip and keep reading.
+                mcp_read_reply(handle, want_id, deadline)
             }
         }
     }
 }
 
-# Turn a JSON-RPC tools/call response into a string for the model.
+# Handshake-path wrapper: the decoded response, or nil on timeout/EOF
+# (mcp_handshake_one / mcp_list_tools report either as a boot failure).
+fun mcp_read_response(handle, want_id, deadline) {
+    r = mcp_read_reply(handle, want_id, deadline)
+    if (elem(r, 0) == 'ok') { elem(r, 1) } else { nil }
+}
+
+# Classify one decoded line relative to the request we are waiting on:
+#   'request'       server→client request (method + non-null id)
+#   'notification'  server→client notification (method, no id)
+#   'response'      no method, id matches ours (compared as strings —
+#                   some servers echo numeric ids back as strings)
+#   'other'         junk / non-object / a reply to some other id
+# A matching-id message with neither result nor error is still
+# returned as 'response' so the call fails fast ("carried no result")
+# instead of waiting out the whole call timeout.
+fun mcp_msg_kind(msg, want_id) {
+    if (msg == nil) { 'other' }
+    else { if (is_map(msg) == 'false') { 'other' }
+    else {
+        rid = map_get(msg, 'id')
+        if (mcp_has_key(msg, "method") == 'true') {
+            if (rid == nil) { 'notification' } else { 'request' }
+        } else {
+            if (rid != nil && to_string(rid) == to_string(want_id)) { 'response' }
+            else { 'other' }
+        }
+    }}
+}
+
+# Key presence by name. map_has_key reports 'false' for a key whose
+# value is JSON null, and json_decode keys are atoms — scan map_keys.
+fun mcp_has_key(m, k) { mcp_key_scan(map_keys(m), k) }
+
+fun mcp_key_scan(keys, k) {
+    if (length(keys) == 0) { 'false' }
+    else { if (to_string(hd(keys)) == k) { 'true' }
+    else { mcp_key_scan(tl(keys), k) } }
+}
+
+# Answer a server→client request. `ping` MUST get an empty result (MCP
+# spec, basic/utilities/ping); we advertise no client capabilities
+# (roots / sampling / elicitation), so everything else gets -32601 —
+# an explicit error the server can act on, rather than silence that
+# leaves it blocked on a reply that never comes.
+fun mcp_server_request_reply(msg) {
+    id = map_get(msg, 'id')
+    method = to_string(map_get(msg, 'method'))
+    if (method == "ping") {
+        %{jsonrpc: "2.0", id: id, result: %{}}
+    } else {
+        %{jsonrpc: "2.0", id: id,
+          error: %{code: -32601, message: "method not found: " ++ method}}
+    }
+}
+
+fun mcp_answer_server_request(handle, msg) {
+    subprocess_send_line(handle, json_encode(mcp_server_request_reply(msg)))
+}
+
+# Turn a JSON-RPC tools/call response into {'ok'|'error', text}.
 fun mcp_format_result(resp) {
     err = map_get(resp, 'error')
     if (err != nil) {
-        em = map_get(err, 'message')
-        "error: MCP — " ++ (if (em == nil) { "call failed" } else { to_string(em) })
+        em = if (is_map(err) == 'true') { map_get(err, 'message') } else { err }
+        {'error', "error: MCP — " ++ (if (em == nil) { "call failed" } else { to_string(em) })}
     } else {
         result = map_get(resp, 'result')
         if (result == nil) {
-            "error: MCP response carried no result"
+            {'error', "error: MCP response carried no result"}
+        } else { if (is_map(result) == 'false') {
+            {'error', "error: MCP response result is not an object"}
         } else {
             content = map_get(result, 'content')
             text = if (content == nil) { "" } else { mcp_extract_text(content, "") }
             body = if (string_length(string_trim(text)) == 0) { "(tool returned no text content)" }
                    else { text }
             is_err = map_get(result, 'isError')
-            if (is_err == 'true') { "error: " ++ body } else { body }
-        }
+            if (is_err == 'true') { {'error', "error: " ++ body} } else { {'ok', body} }
+        }}
     }
 }
 
@@ -579,32 +669,21 @@ fun mcp_reply_deadline_ms() { 260000 }
 # Wait for the owner's reply carrying our exact correlation token. A
 # reply with any other token is a stale result from an earlier call
 # that already timed out — drop it and keep waiting until the deadline.
+# Returns the owner's {status, text} outcome (see mcp_do_call); an owner
+# that never replies counts as a timeout strike against the server.
 fun mcp_await_result(server, token, deadline) {
     wait = deadline - timestamp()
-    if (wait <= 0) {
-        "error: MCP call to '" ++ server ++ "' got no reply (owner stalled or server hung)"
-    } else {
+    stalled = {'timeout', "error: MCP call to '" ++ server ++
+                          "' got no reply (owner stalled or server hung)"}
+    if (wait <= 0) { stalled }
+    else {
         receive {
             {'mcp_result', t, r} ->
                 if (t == token) { r }
                 else { mcp_await_result(server, token, deadline) }
-            after wait {
-                "error: MCP call to '" ++ server ++ "' got no reply (owner stalled or server hung)"
-            }
+            after wait { stalled }
         }
     }
-}
-
-# A write failure means the pipe (and so the server process) is gone.
-fun mcp_is_conn_lost(r) {
-    if (string_contains(to_string(r), "connection lost") == 'true') { 'true' }
-    else { 'false' }
-}
-
-# A read timeout — the server may just have been slow on this one call.
-fun mcp_is_timeout_result(r) {
-    if (string_contains(to_string(r), "did not respond") == 'true') { 'true' }
-    else { 'false' }
 }
 
 # A failed server gets one automatic reconnect attempt when a call next
@@ -627,15 +706,18 @@ fun mcp_maybe_lazy_reconnect(table, server, opts) {
     ets_get(table, server ++ "/status")
 }
 
-# Record a call outcome against the server's health. A lost connection
-# marks it failed at once; a timeout only after two in a row (one slow
-# call shouldn't kill the server); anything else resets the strikes.
-fun mcp_note_result(table, server, r) {
-    if (mcp_is_conn_lost(r) == 'true') {
+# Record a call outcome against the server's health, keyed on the
+# STRUCTURED status from mcp_do_call — never on result text. A lost
+# connection (EOF / write failure) marks it failed at once so the next
+# call takes the lazy-reconnect path; a timeout only after two in a row
+# (one slow call shouldn't kill the server); 'ok' and 'error' (the
+# server answered, even if with an error) reset the strikes.
+fun mcp_note_result(table, server, status) {
+    if (status == 'lost') {
         ets_put(table, server ++ "/status", "failed")
-        ets_put(table, server ++ "/error", "stopped responding mid-session")
+        ets_put(table, server ++ "/error", "connection lost mid-session (server exited)")
     } else {
-        if (mcp_is_timeout_result(r) == 'true') {
+        if (status == 'timeout') {
             prev = ets_get(table, server ++ "/fail_count")
             n = if (prev == nil) { 1 } else { prev + 1 }
             ets_put(table, server ++ "/fail_count", n)
@@ -680,8 +762,8 @@ fun call_tool(prefixed, args, opts) {
                     token = to_string(self()) ++ "/" ++ to_string(timestamp())
                     send(owner, {'mcp_call', tool, args, self(), token})
                     r = mcp_await_result(server, token, timestamp() + mcp_reply_deadline_ms())
-                    mcp_note_result(table, server, r)
-                    r
+                    mcp_note_result(table, server, elem(r, 0))
+                    elem(r, 1)
                 }
             }
         }

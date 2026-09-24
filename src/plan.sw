@@ -35,6 +35,7 @@ module Plan
 #        then continue to list_append + run_turn as normal.
 
 import UI
+import Config
 
 export [
     init, generate, display, confirm,
@@ -377,7 +378,8 @@ fun generate(user_msg, history, opts) {
     show_wait = if (map_get(opts, 'headless') == 'true') { 'false' }
                 else { if (map_get(opts, 'is_subagent') == 'true') { 'false' } else { 'true' } }
     if (show_wait == 'true') { print_inline("\r\e[K  \e[38;5;240m⋯ generating plan…\e[0m") }
-    resp = http_post(url, hdrs, body)
+    # Same network-isolation gate as every LLM dial (llm.sw dial_refusal).
+    resp = if (Config.endpoint_refusal(url) != nil) { nil } else { http_post(url, hdrs, body) }
     if (show_wait == 'true') { UI.tool_progress_clear() }
     if (resp == nil) { nil }
     else { plan_extract_content(resp) }

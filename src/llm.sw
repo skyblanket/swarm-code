@@ -6,6 +6,7 @@ import Markdown
 import Hooks
 import Config
 import UI
+import Prompts
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -43,13 +44,17 @@ export [
     last_prompt_tokens, last_reasoning, last_fail,
     record_usage, record_reasoning, extract_usage, extract_reasoning,
     extract_content, extract_finish_reason,
+    last_fail_detail, last_fail_context_overflow, is_context_overflow_msg,
     new_message_system, new_message_user,
     new_message_assistant, new_message_tool,
     parse_inband_tool_calls, inband_assistant_text,
     api_tool_calls_to_internal,
     repair_history, apply_override,
+    read_override, apply_override_map, override_applies, effective_override,
+    retarget_system_prompt,
     inject_context_status, build_status_string,
-    routed_collect, maybe_large_context_hint
+    routed_collect, maybe_large_context_hint,
+    context_window_tokens, context_budget_tokens, budget_for_window
 ]
 
 # ============================================================
@@ -85,60 +90,118 @@ fun new_message_tool(tool_call_id, content) {
 # URL ending in `/chat/completions` and we'll use it verbatim.
 # ------------------------------------------------------------
 # ------------------------------------------------------------
-# In-session profile override. Slash command /profile NAME writes
-# ~/.swarm-code/.profile_override with {endpoint, model, api_key,
-# tool_format}; every LLM call consults this file and applies the
-# overrides before serialising the request. File-based (rather than
-# threading opts through main_loop) so it's a 5-line touch instead of
-# a deep refactor — `rm ~/.swarm-code/.profile_override` reverts.
+# Profile override. /profile NAME and /model NAME write
+# ~/.swarm-code/.profile_override ({endpoint, model, api_key, tool_format,
+# vision, chat_template_kwargs, profile, session_id}); every LLM call
+# consults it before serialising the request. File-based (rather than
+# threading opts through main_loop); /profile-clear or deleting the file
+# reverts.
+#
+# Precedence: the file is global and outlives the session that wrote it.
+# An override written by THIS session (its session_id is opts.session_id,
+# minted per launch in main.sw) is the user's explicit in-session choice and
+# beats everything. One left over from an EARLIER session is only a default:
+# an env var that is set (SWARM_CODE_MODEL, …) wins over it, per field — a
+# stale `/profile qwen3-b` used to silently replace SWARM_CODE_MODEL=test.
 # ------------------------------------------------------------
 fun apply_override(opts) {
+    ov = read_override()
+    if (ov == nil) { opts } else { apply_override_map(opts, ov, fn(name) { getenv(name) }) }
+}
+
+fun read_override() {
     home = getenv("HOME")
-    if (home == nil) { opts }
+    if (home == nil) { nil }
     else {
         path = home ++ "/.swarm-code/.profile_override"
-        if (file_exists(path) == 'false') { opts }
+        if (file_exists(path) == 'false') { nil }
         else {
             raw = file_read(path)
-            if (raw == nil) { opts }
-            else {
-                ov = json_decode(raw)
-                if (ov == nil) { opts }
-                else {
-                    a = override_field(opts, ov, 'endpoint')
-                    b = override_field(a, ov, 'model')
-                    c = override_field(b, ov, 'api_key')
-                    d = override_field(c, ov, 'tool_format')
-                    d = override_field(d, ov, 'vision')
-                    # chat_template_kwargs is a map (not a string), so it
-                    # bypasses override_field's to_string coercion. Always
-                    # replace, even with nil, so switching to a profile that
-                    # doesn't set thinking-off actually clears it.
-                    ct_v = map_get(ov, 'chat_template_kwargs')
-                    d = map_put(d, 'chat_template_kwargs', ct_v)
-                    # Re-derive temperature when model changes — Kimi K2.x
-                    # rejects any temperature other than 1.0.
-                    if (map_get(ov, 'model') != nil) {
-                        new_model = to_string(map_get(d, 'model'))
-                        new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
-                                   else { 0.2 }
-                        map_put(d, 'temperature', new_temp)
-                    } else { d }
-                }
-            }
+            if (raw == nil) { nil } else { json_decode(raw) }
         }
     }
 }
 
-fun override_field(opts, ov, key) {
-    v = map_get(ov, key)
-    if (v == nil) { opts }
+# The env var that pins each overridable field (nil: none).
+fun override_env_var(key) {
+    if (key == 'endpoint') { "SWARM_CODE_ENDPOINT" }
+    else { if (key == 'model') { "SWARM_CODE_MODEL" }
+    else { if (key == 'api_key') { "SWARM_CODE_API_KEY" }
+    else { if (key == 'tool_format') { "SWARM_CODE_TOOL_FORMAT" }
+    else { nil }}}}
+}
+
+# Does the override's `key` take effect? It is in the file AND (this session
+# wrote it, or no env var pins the field). env_fn: name -> value | nil (the
+# real getenv, or a stub in tests).
+fun override_applies(opts, ov, key, env_fn) {
+    if (map_get(ov, key) == nil) { 'false' }
     else {
+        sid = map_get(ov, 'session_id')
+        mine = if (sid != nil && to_string(sid) == to_string(map_get(opts, 'session_id'))) { 'true' } else { 'false' }
+        var = override_env_var(key)
+        if (mine == 'true' || var == nil) { 'true' }
+        else { if (env_fn(var) == nil) { 'true' } else { 'false' } }
+    }
+}
+
+fun apply_override_map(opts, ov, env_fn) {
+    a = override_field(opts, ov, 'endpoint', env_fn)
+    b = override_field(a, ov, 'model', env_fn)
+    c = override_field(b, ov, 'api_key', env_fn)
+    d = override_field(c, ov, 'tool_format', env_fn)
+    e = override_field(d, ov, 'vision', env_fn)
+    # chat_template_kwargs is a map (not a string), so it bypasses
+    # override_field's to_string coercion. A /profile swap (the file names its
+    # profile) REPLACES it — even with nil, so switching to a profile without
+    # thinking-off really clears the launch profile's; the profile's own
+    # kwargs are now written to the file (they used to be dropped, so
+    # `/profile qwen2` lost enable_thinking:false). A /model-only override
+    # leaves it alone.
+    ct = map_get(ov, 'chat_template_kwargs')
+    f = if (map_get(ov, 'profile') != nil || ct != nil) { map_put(e, 'chat_template_kwargs', ct) } else { e }
+    # Re-derive temperature when the model changes — Kimi K2.x rejects any
+    # temperature other than 1.0.
+    if (override_applies(opts, ov, 'model', env_fn) == 'true') {
+        new_model = to_string(map_get(f, 'model'))
+        new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
+                   else { 0.2 }
+        map_put(f, 'temperature', new_temp)
+    } else { f }
+}
+
+fun override_field(opts, ov, key, env_fn) {
+    if (override_applies(opts, ov, key, env_fn) == 'false') { opts }
+    else {
+        v = map_get(ov, key)
         val = if (key == 'tool_format') {
             s = to_string(v)
             if (s == "native") { 'native' } else { 'inband' }
         } else { to_string(v) }
         map_put(opts, key, val)
+    }
+}
+
+# The part of an override that takes effect right now, for /model to carry
+# forward when it restamps the file as this session's: it changes ONLY the
+# model. Keeping env-shadowed fields would promote them over env; dropping the
+# active ones silently reverted a /profile's endpoint and api_key (while
+# printing "endpoint/api_key unchanged").
+fun effective_override(ov, opts) {
+    if (ov == nil) { map_new() }
+    else {
+        env_fn = fn(name) { getenv(name) }
+        keep_applying(ov, opts, ['endpoint', 'model', 'api_key', 'tool_format', 'vision',
+                                 'chat_template_kwargs', 'profile'], env_fn, map_new())
+    }
+}
+
+fun keep_applying(ov, opts, keys, env_fn, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        k = hd(keys)
+        next = if (override_applies(opts, ov, k, env_fn) == 'true') { map_put(acc, k, map_get(ov, k)) } else { acc }
+        keep_applying(ov, opts, tl(keys), env_fn, next)
     }
 }
 
@@ -367,7 +430,7 @@ fun build_request_body(messages, opts) {
     # trailing unmatched tool_calls, and collapses consecutive user
     # messages. Keeps the API from rejecting requests after a crash
     # mid-turn or a journal load that landed mid-conversation.
-    repaired = repair_history(messages)
+    repaired = repair_history(retarget_system_prompt(messages, tool_format))
 
     # Drain any pending image attachments (from read_image) and inject
     # them into the LAST user message as OpenAI multimodal content
@@ -414,6 +477,36 @@ fun build_request_body(messages, opts) {
         inband_req(base_with_ct)
     }
     json_encode(final_req)
+}
+
+# ------------------------------------------------------------
+# System prompt ↔ wire format
+# ------------------------------------------------------------
+# main.sw builds the system prompt ONCE, for the launch tool_format. A
+# /profile override, a fallback endpoint or a provider chain can send a
+# request in the OTHER format — and a native prompt ("your tools are in this
+# request's `tools` array") on an inband request, which carries no tools
+# array, left the model with no usable tools at all. Swap the prompt's
+# tool-use sections (Prompts.tool_sections — pure text, so an exact replace)
+# to match the format this request is actually sent in. The history's system
+# message is untouched; only the outbound copy changes.
+fun retarget_system_prompt(messages, tool_format) {
+    if (length(messages) == 0) { messages }
+    else {
+        first = hd(messages)
+        if (map_get(first, 'role') != 'system') { messages }
+        else {
+            want = if (tool_format == 'native') { "native" } else { "inband" }
+            other = if (want == "native") { "inband" } else { "native" }
+            content = to_string(map_get(first, 'content'))
+            from = Prompts.tool_sections(other)
+            if (string_contains(content, from) == 'false') { messages }
+            else {
+                fixed = map_put(first, 'content', string_replace(content, from, Prompts.tool_sections(want)))
+                [fixed | tl(messages)]
+            }
+        }
+    }
 }
 
 # ------------------------------------------------------------
@@ -504,7 +597,7 @@ fun inject_context_status(messages, opts) {
                 else {
                     # Bracketed marker (not XML) — avoids any future
                     # JSON-escape weirdness on `<`/`>` and reads cleaner
-                    # to humans glancing at /tmp/swarm-code-last-body.json.
+                    # to humans glancing at the SWARM_CODE_DEBUG body dump.
                     new_content = to_string(content) ++ "\n\n[" ++ status ++ "]"
                     new_msg = map_put(last_msg, 'content', new_content)
                     replace_at(messages, last_idx, new_msg, 0, [])
@@ -515,14 +608,9 @@ fun inject_context_status(messages, opts) {
 }
 
 fun build_status_string(messages, opts) {
-    max_tok = parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144)
-    out_res = parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384)
-    buf = parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000)
-    # Clamp to a floor of 1 — a degenerate env (reserve + buffer >= max_tokens)
-    # would otherwise make this 0 or negative and the division below PANICS
-    # (swarmrt traps integer divide-by-zero) on the very first turn.
-    raw_budget = max_tok - out_res - buf
-    tok_budget = if (raw_budget < 1) { 1 } else { raw_budget }
+    # The same budget the compactor triggers on (always >= 1, so the
+    # division below can't trap on a degenerate env).
+    tok_budget = context_budget_tokens()
 
     # Use the server's real prompt-token count once we have it; fall back to a
     # char/4 estimate before the first response.
@@ -541,6 +629,34 @@ fun build_status_string(messages, opts) {
 
     "ctx " ++ to_string(pct) ++ "% used · " ++
     fmt_k(tok_used) ++ "/" ++ fmt_k(tok_budget) ++ " tok"
+}
+
+# ------------------------------------------------------------
+# Context budget — the ONE definition (Agent's compaction trigger and the
+# context meter above both use it; agent.sw imports llm.sw, not the reverse).
+# ------------------------------------------------------------
+# budget = window − output reserve − compaction buffer. The reserve (16384,
+# Kimi's max output) and buffer (52000) defaults are sized for a 262K window;
+# subtracted from a small one they drove the budget NEGATIVE — at
+# SWARM_CODE_MAX_TOKENS=32768 it was −35,616, so every step read "context at
+# ~1197 / -35616 tokens, compacting" and paid a summarizer call. Each is now
+# capped at a quarter of the window (explicit env values too), so the budget
+# is always at least half the window: 8K→4096, 32K→16384, 128K→81920,
+# 262K→193760 (unchanged). Floor of 1 for a degenerate window.
+fun context_window_tokens() { parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144) }
+
+fun context_budget_tokens() {
+    budget_for_window(context_window_tokens(),
+                      parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384),
+                      parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000))
+}
+
+fun budget_for_window(window, reserve_cfg, buffer_cfg) {
+    quarter = window / 4
+    reserve = if (reserve_cfg < quarter) { reserve_cfg } else { quarter }
+    buffer = if (buffer_cfg < quarter) { buffer_cfg } else { quarter }
+    b = window - reserve - buffer
+    if (b < 1) { 1 } else { b }
 }
 
 # Estimate token count from char count (≈4 chars/token) for use on
@@ -594,28 +710,6 @@ fun parse_positive_int_local(s, i, acc, saw_digit) {
     }
 }
 
-# inband mode fallback: pull the text block out of a multimodal
-# content list. Images are dropped silently — inband protocol
-# (Gemma 4 in-band tool calls) is text-only.
-# Workaround for a swarmrt-side bug: http_post_stream's content
-# accumulator doesn't decode \uXXXX JSON escapes for ASCII-range
-# characters, so prose like `df -h / && free` comes through as
-# `df -h / u0026u0026 free` (the backslash is gone, but the `uXXXX`
-# stays). Until swarmrt's stream emitter is fixed, replace the most
-# common offenders on the prose we extracted. Limited to chars that
-# almost never appear as a literal `uXXXX` in real prose, so the
-# false-positive risk is negligible.
-fun fix_json_unicode_escapes(s) {
-    s1 = string_replace(s,  "u0026", "&")
-    s2 = string_replace(s1, "u003c", "<")
-    s3 = string_replace(s2, "u003e", ">")
-    s4 = string_replace(s3, "u0027", "'")
-    s5 = string_replace(s4, "u0022", "\"")
-    s6 = string_replace(s5, "u002f", "/")
-    s7 = string_replace(s6, "u003d", "=")
-    string_replace(s7,      "u005c", "\\")
-}
-
 # True when the only content the model produced is the C-side truncation
 # marker — a reasoning-only turn that hit max_tokens. Lets the recovery
 # surface the reasoning instead of showing a near-blank turn.
@@ -629,6 +723,9 @@ fun is_truncation_marker_only(prose) {
     }
 }
 
+# inband mode fallback: pull the text block out of a multimodal
+# content list. Images are dropped silently — inband protocol
+# (Gemma 4 in-band tool calls) is text-only.
 fun extract_text_block(content_list) {
     if (length(content_list) == 0) { "" }
     else {
@@ -907,6 +1004,42 @@ fun record_fail(opts, reason) {
 fun last_fail(opts) {
     table = map_get(opts, 'llm_stats_table')
     if (table == nil) { nil } else { ets_get(table, 'fail_reason') }
+}
+
+# The server's message for the last FATAL rejection ("" when none) — lets the
+# agent tell "the context is too long" (recoverable: compact and retry) from
+# any other 4xx.
+fun record_fail_detail(opts, msg) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'ok' }
+    else { ets_put(table, 'fail_detail', to_string(msg)) }
+}
+
+fun last_fail_detail(opts) {
+    table = map_get(opts, 'llm_stats_table')
+    v = if (table == nil) { nil } else { ets_get(table, 'fail_detail') }
+    if (v == nil) { "" } else { v }
+}
+
+# Did the last fatal rejection say the prompt exceeds the model's context?
+fun last_fail_context_overflow(opts) {
+    if (last_fail(opts) != 'fatal') { 'false' }
+    else { is_context_overflow_msg(last_fail_detail(opts)) }
+}
+
+# Wording used by OpenAI-compatible servers (OpenAI / vLLM "maximum context
+# length", "context_length_exceeded"), Anthropic ("prompt is too long"),
+# llama.cpp ("exceeds the available context size") and others.
+fun is_context_overflow_msg(msg) {
+    low = string_lower(to_string(msg))
+    if (string_contains(low, "maximum context length") == 'true') { 'true' }
+    else { if (string_contains(low, "context_length_exceeded") == 'true') { 'true' }
+    else { if (string_contains(low, "too many tokens") == 'true') { 'true' }
+    else { if (string_contains(low, "prompt is too long") == 'true') { 'true' }
+    else { if (string_contains(low, "exceeds the available context size") == 'true') { 'true' }
+    else { if (string_contains(low, "context window") == 'true' &&
+               string_contains(low, "exceed") == 'true') { 'true' }
+    else { 'false' }}}}}}
 }
 
 fun retry_delay_ms(attempt) {
@@ -1353,16 +1486,32 @@ fun use_routed_stream(opts) {
     else { 'true' }}}}}}}
 }
 
+# Network-isolation gate at the point of dial. main.sw's startup check
+# only sees the primary endpoint; the fallback, providers[] and
+# .profile_override endpoints are chosen later, so every URL the LLM
+# layer contacts is re-checked here (Config.endpoint_refusal). Returns
+# nil when the URL may be dialed; otherwise prints the reason (diag() is
+# silent in headless) and returns it.
+fun dial_refusal(url) {
+    reason = Config.endpoint_refusal(url)
+    if (reason != nil) { eprint("  " ++ UI.warn_text("⚠ " ++ reason)) }
+    reason
+}
+
 fun stream_call(url, hdrs, body, opts) {
     routed_ok = use_routed_stream(opts)
-    if (map_get(opts, 'wake_turn') == 'true' && routed_ok == 'true') {
+    # A refused URL surfaces as a FATAL (4xx) failure: never retried; the
+    # fallback / next provider still gets its own (gated) attempt.
+    if (dial_refusal(url) != nil) {
+        {'error', 403, "blocked by network isolation (see above)"}
+    } else { if (map_get(opts, 'wake_turn') == 'true' && routed_ok == 'true') {
         wake_sync_stream(url, hdrs, body, opts)
     } else { if (routed_ok == 'true') {
         routed_stream(url, hdrs, body, opts)
     } else {
         record_stream_mode(opts, 'sync', "")
         http_post_stream(url, hdrs, body)
-    }}
+    }}}
 }
 
 # Which mode the JUST-COMPLETED stream used + what it painted. Read by
@@ -1747,7 +1896,7 @@ fun chat_native(messages, opts) {
     body_chars = string_length(body)
 
     file_mkdir(getenv("HOME") ++ "/.swarm-code")
-    file_write(getenv("HOME") ++ "/.swarm-code/last-body.json", body)
+    dump_last_body(body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     # Substantive live-wait line shown for the whole TTFT window.
     # Suppressed on wake turns — the Reader is pinned in read_line and
@@ -1770,6 +1919,7 @@ fun chat_native(messages, opts) {
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     record_fail(opts, "fail")
+    record_fail_detail(opts, "")
     record_retry_after(opts, 0)
     cls = classify_stream(stream_call(url, hdrs, body, opts))
     latency = timestamp() - start_ms
@@ -1786,6 +1936,7 @@ fun chat_native(messages, opts) {
             f_status = elem(cls, 1)
             f_msg = elem(cls, 2)
             record_fail(opts, 'fatal')
+            record_fail_detail(opts, f_msg)
             diag(opts, "  " ++ UI.err_text("✗ request rejected (HTTP " ++
                   to_string(f_status) ++ ") — not retrying: " ++ to_string(f_msg)))
             Log.llm_error("fatal request error " ++ to_string(f_status), to_string(f_msg))
@@ -1816,6 +1967,7 @@ fun chat_native(messages, opts) {
                 # identical body just re-fails. Mark fatal so the retry
                 # loop stops instead of hammering the same poisoned body.
                 record_fail(opts, 'fatal')
+                record_fail_detail(opts, to_string(em) ++ " " ++ to_string(map_get(err, 'code')))
                 diag(opts, "  " ++ UI.err_text("[llm error] " ++ to_string(em)))
                 Log.llm_error("server error", to_string(em))
                 nil
@@ -1835,8 +1987,11 @@ fun chat_native(messages, opts) {
                     msg_obj = map_get(choice0, 'message')
                     raw_content = map_get(msg_obj, 'content')
                     raw_tool_calls = map_get(msg_obj, 'tool_calls')
-                    prose_raw = if (raw_content == nil) { "" }
-                                else { fix_json_unicode_escapes(to_string(raw_content)) }
+                    # Content is used verbatim: the runtime already decodes \uXXXX
+                    # escapes. (A u003c -> "<" "repair" pass left over from an old
+                    # runtime bug turned "\u003c" in code into "\<" and mangled
+                    # prose that mentions such escapes.)
+                    prose_raw = if (raw_content == nil) { "" } else { to_string(raw_content) }
                     # Length-truncation recovery: when the server stops on
                     # max_tokens with an empty content but populated
                     # reasoning_content (Kimi K2 thinking mid-stream), we'd
@@ -1866,6 +2021,10 @@ fun chat_native(messages, opts) {
                                 else { if (string_contains(to_string(prose_raw),
                                           "[Response truncated at max_tokens") == 'true') { 'true' }
                                 else { 'false' }}
+                    # ESC landed mid-stream (the runtime appends the marker; the
+                    # sync path still hands back the tool calls streamed so far,
+                    # arguments possibly cut mid-string). run_turn must not run them.
+                    interrupted = stream_interrupted(prose_raw)
 
                     had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
@@ -1887,12 +2046,22 @@ fun chat_native(messages, opts) {
                         content: prose,
                         tool_calls: tool_calls,
                         reasoning: reason_text,
-                        truncated: truncated
+                        truncated: truncated,
+                        interrupted: interrupted
                     }
                 }
             }
         }
     }
+}
+
+# The user stopped this stream (ESC/Ctrl-C): the runtime — and routed mode's
+# interrupted_stream_result — append "[Request interrupted by user]" to the
+# content. Checked on the RAW content: inband parsing cuts the prose at the
+# first call marker, which would drop the marker along with it.
+fun stream_interrupted(raw) {
+    if (string_ends_with(string_trim(to_string(raw)), "[Request interrupted by user]") == 'true') { 'true' }
+    else { 'false' }
 }
 
 # Convert OpenAI tool_calls → internal flat shape.
@@ -1923,6 +2092,26 @@ fun api_tool_calls_to_internal(raw, acc) {
     }}
 }
 
+# Debug-only copy of the outbound request body — it carries the whole
+# conversation (prompts, tool output, any secrets in them), so it is
+# written only with SWARM_CODE_DEBUG=1 and never world-readable: mkstemp
+# (file_temp) creates the file 0600 and the rename keeps that mode.
+# Nothing reads it back; it is for a human debugging a request.
+fun dump_last_body(body) {
+    home = getenv("HOME")
+    if (getenv("SWARM_CODE_DEBUG") != "1" || home == nil) { 'skip' }
+    else {
+        dir = home ++ "/.swarm-code"
+        file_mkdir(dir)
+        tmp = file_temp(dir ++ "/.last-body.")
+        if (tmp == nil) { 'skip' }
+        else {
+            file_write(tmp, body)
+            file_rename(tmp, dir ++ "/last-body.json")
+        }
+    }
+}
+
 # ============================================================
 # Inband streaming path — parse markers ONCE into structured form
 # ============================================================
@@ -1934,7 +2123,7 @@ fun chat_inband(messages, opts) {
     body = build_request_body(messages, opts)
     body_chars = string_length(body)
 
-    file_write("/tmp/swarm-code-last-body.json", body)
+    dump_last_body(body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     # Same live-wait line for the inband (Gemma-style) path. Suppressed
     # on wake turns (Reader pinned in read_line); newline-less in
@@ -1953,6 +2142,7 @@ fun chat_inband(messages, opts) {
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     record_fail(opts, "fail")
+    record_fail_detail(opts, "")
     record_retry_after(opts, 0)
     cls = classify_stream(stream_call(url, hdrs, body, opts))
     latency = timestamp() - start_ms
@@ -1965,6 +2155,7 @@ fun chat_inband(messages, opts) {
         # retry loop (chat_inband_retry checks last_fail), transient ones retry.
         if (cls_tag == 'fatal') {
             record_fail(opts, 'fatal')
+            record_fail_detail(opts, elem(cls, 2))
             diag(opts, "  " ++ UI.err_text("✗ request rejected (HTTP " ++
                   to_string(elem(cls, 1)) ++ ") — not retrying: " ++ to_string(elem(cls, 2))))
             Log.llm_error("fatal request error (inband, HTTP " ++ to_string(elem(cls, 1)) ++ ")", to_string(elem(cls, 2)))
@@ -1985,7 +2176,10 @@ fun chat_inband(messages, opts) {
             reason_text = extract_reasoning(resp)
             record_reasoning(opts, reason_text)
 
-            parsed = parse_inband_tool_calls(fix_json_unicode_escapes(to_string(raw_content)))
+            # Verbatim, like chat_native — the runtime already decoded \uXXXX, so
+            # a JSON escape the model put INSIDE call:NAME{...} arguments
+            # (\u003c for "<") is decoded once, by the arguments' own parse.
+            parsed = parse_inband_tool_calls(to_string(raw_content))
             prose_raw = map_get(parsed, 'content')
             tool_calls = map_get(parsed, 'tool_calls')
 
@@ -2029,10 +2223,13 @@ fun chat_inband(messages, opts) {
             # post_stream_render.
             post_stream_render(opts, to_string(prose), had_tools)
 
-            # F4: same length-truncation signal as chat_native.
+            # F4: same length-truncation signal as chat_native. Tested on the RAW
+            # content: when calls were parsed, prose_raw ends at the first call
+            # marker and the runtime's truncation/interrupt marker (appended at
+            # the very end) is no longer in it.
             fin = extract_finish_reason(resp)
             truncated = if (fin == "length") { 'true' }
-                        else { if (string_contains(to_string(prose_raw),
+                        else { if (string_contains(to_string(raw_content),
                                   "[Response truncated at max_tokens") == 'true') { 'true' }
                         else { 'false' }}
 
@@ -2040,7 +2237,8 @@ fun chat_inband(messages, opts) {
                 content: prose,
                 tool_calls: tool_calls,
                 reasoning: reason_text,
-                truncated: truncated
+                truncated: truncated,
+                interrupted: stream_interrupted(raw_content)
             }
         }
     }
@@ -2151,7 +2349,7 @@ fun chat_silent(messages, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = http_post(url, hdrs, body)
+    resp = if (dial_refusal(url) != nil) { nil } else { http_post(url, hdrs, body) }
     if (resp == nil) { nil }
     else {
         usage = extract_usage(resp)
@@ -2200,7 +2398,8 @@ fun chat_for_subagent(messages, opts, target_pid, name) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = unwrap_stream(http_post_stream(url, hdrs, body, target_pid, name))
+    resp = if (dial_refusal(url) != nil) { nil }
+           else { unwrap_stream(http_post_stream(url, hdrs, body, target_pid, name)) }
     latency = timestamp() - start_ms
 
     if (resp == nil) {
@@ -2223,8 +2422,7 @@ fun chat_for_subagent(messages, opts, target_pid, name) {
                 choice0 = hd(choices)
                 msg_obj = map_get(choice0, 'message')
                 raw_content = map_get(msg_obj, 'content')
-                prose_raw = if (raw_content == nil) { "" }
-                            else { fix_json_unicode_escapes(to_string(raw_content)) }
+                prose_raw = if (raw_content == nil) { "" } else { to_string(raw_content) }
                 tool_format = map_get(opts, 'tool_format')
                 result_map = if (tool_format == 'native') {
                     %{

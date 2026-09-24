@@ -11,6 +11,7 @@ module ToolGuardrails
 # exploration:
 #   1. identical-call:  5  consecutive calls with the same name+args
 #   2. same-tool-fail:  8  consecutive failing results from the same tool
+#                          ("error: …", a non-zero "[exit N]", "[timed out …")
 #
 # The earlier "no-progress" check (5 consecutive idempotent reads
 # without a mutation) was removed after it kept firing on legitimate
@@ -71,7 +72,7 @@ fun observe_after(opts, name_str, result_str) {
     table = map_get(opts, 'guardrails_table')
     if (table == nil) { 'ok' }
     else {
-        is_err = string_starts_with(to_string(result_str), "error:")
+        is_err = is_failure(to_string(result_str))
         last_tool = ets_get(table, 'last_tool')
         fail_count = ets_get(table, 'fail_count')
         if (is_err == 'true') {
@@ -92,6 +93,15 @@ fun observe_after(opts, name_str, result_str) {
             'ok'
         }
     }
+}
+
+# A failing tool result: the "error:" sentinel most tools use, a non-zero
+# "[exit N]" banner (how bash / the auto-background path report failure —
+# the brake never fired for bash before), or a "[timed out" banner.
+fun is_failure(s) {
+    if (string_starts_with(s, "error:") == 'true') { 'true' }
+    else { if (string_starts_with(s, "[exit ") == 'true' && string_starts_with(s, "[exit 0]") == 'false') { 'true' }
+    else { string_starts_with(s, "[timed out") }}
 }
 
 # Clear all per-turn counters. Called at the start of each user

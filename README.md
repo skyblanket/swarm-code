@@ -30,8 +30,8 @@ search: docker compose  (3 hits)
 > recall_skill deploy-mally-otp   # pull full playbook from ~/.swarm-code/skills/
 SKILL.md loaded. Building burrito binary …
 
-> /schedule add 1h "review open PRs"   # heartbeat-driven cron
-job 3 added (every 1h)
+> /schedule "1h" "review open PRs"   # heartbeat-driven cron (or "hourly", "daily 09:00")
+✓ scheduled job 3 (1h): review open PRs
 ```
 
 ## Quickstart
@@ -78,7 +78,21 @@ Point it at any OpenAI-compatible endpoint via `~/.swarm-code/settings.json`. Pr
 }
 ```
 
-Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default). Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
+Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default; an API key alone is not an opt-in). The check applies to every URL the LLM layer dials — primary, fallback, `providers`, and `/profile` switches. Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
+
+A repo-local `./.swarm-code.json` is **untrusted** (it ships with whatever you cloned): it may set `model`, `max_tokens`, `vision`, `chat_template_kwargs` and `llm_timeout_ms`, and may only *tighten* `permissions`. Its hooks, MCP servers, endpoints, API keys, providers and profiles are ignored, with a one-line notice. To let a repo you trust apply its file in full, run `swarm-code trust` in it (or `/trust` in the REPL; `swarm-code untrust` reverses it, `swarm-code trust --list` shows the list). That adds the directory to `"trusted_projects"` in `~/.swarm-code/settings.json`, which you can also edit by hand.
+
+### Hooks
+
+`settings.json` can run shell commands around tool calls; a `PreToolUse` hook that exits non-zero (or times out after 60s, or cannot be started) blocks the call, and the hook's output is shown to the model:
+
+```json
+{ "hooks": {
+    "PreToolUse":  [ { "matcher": "bash",       "command": "./scripts/check-cmd.sh" } ],
+    "PostToolUse": [ { "matcher": "edit|write", "command": "make fmt" } ] } }
+```
+
+A matcher is `*` or `|`-separated, case-insensitive alternatives, each matching a tool whose name contains it — plus tool families: `bash` also fires for every other tool that runs a shell command (`background`, `bg_server`, `run_tests`, `file_watch`, `log_wait`), and `edit` also for `multi_edit`. The tool arguments arrive as JSON on the hook's **stdin** and in the private file `$SWARM_CODE_ARGS_FILE`; `$SWARM_CODE_ARGS` carries them inline only when under 100KB (else `$SWARM_CODE_ARGS_OMITTED=1`), so a hook that must see every call should read stdin. `$SWARM_CODE_EVENT` / `$SWARM_CODE_TOOL` name the event and tool. Executable scripts in `~/.swarm-code/hooks/` (`pre_tool.sh`, `post_tool.sh`, `pre_llm.sh`, `post_llm.sh`) get the same treatment via stdin / `$SWARM_HOOK_DATA_FILE` — see `src/Hooks.sw`.
 
 ## Features
 
@@ -119,8 +133,11 @@ Panel agents run under the fail-closed `council_panel` context: they may inspect
 swarm-code runs shell commands, reads and writes files, and can reach the network — so it is built fail-closed:
 
 - **Local-network-only by default**; remote endpoints require an explicit `SWARM_CODE_ALLOW_REMOTE=1`.
+- A cloned repo's `./.swarm-code.json` cannot run hooks, start MCP servers, redirect the endpoint/key, or loosen permissions unless you trust the directory (`swarm-code trust`).
+- The `write`/`edit` tools refuse swarm-code's own control files (`~/.swarm-code/` hooks, schedule, settings, sessions, profile override; `.swarm-code.json`) — only `~/.swarm-code/memory/` and `skills/` are writable — and credential dirs (`.ssh`, `.aws`, `.gnupg`, …) case-insensitively.
 - Every tool runs through one **`ToolExecutor` policy boundary** — context allow-lists, argument-rewriting hooks, guardrails, and permissions — *before* any raw handler executes, and **fails closed** on a missing or unknown execution context.
-- A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd`, fork bombs, …) cannot be bypassed by environment overrides.
+- Headless runs (`-p`, cron jobs, `/flows` children) never auto-approve a call that needs permission — a dangerous command, an explicit `"ask"` setting, or an MCP tool — unless you set `SWARM_CODE_HEADLESS_APPROVE=1`.
+- A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd` to a disk, halt/reboot, fork bombs, …) cannot be bypassed by environment overrides. It covers every tool that runs a shell command (`bash`, `background`, `bg_server`, `run_tests`), and commands are parsed like `sh` does — respellings such as `rm -fr /`, `dd of=/dev/sda if=…` or `sh -c '…'` are caught, while words inside quotes, `echo`/`grep` arguments or heredoc bodies are not flagged. Denials name the matched pattern.
 - Subagents, MCP, and council contexts run under restricted (often read-only) policies.
 - Secrets are redacted from session logs and trajectory exports.
 

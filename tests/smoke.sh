@@ -54,6 +54,14 @@ case "$MCP_OUT" in
     *"$ESC"*) FAIL "--mcp-server leaked ANSI onto stdout (execution_context feedback gate broken)" ;;
 esac
 
+# 6. --mcp-server answers MCP ping with an EMPTY result (spec), not -32601.
+PING_OUT=$(printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"ping"}' \
+  | $BIN --mcp-server 2>/dev/null) || true
+case "$PING_OUT" in
+    *'"id":9,"result":{}'*) ;;
+    *) FAIL "--mcp-server ping did not return an empty result: $PING_OUT" ;;
+esac
+
 rm -rf "$EMPTY_HOME"
 trap - EXIT INT TERM
 echo "smoke ok"

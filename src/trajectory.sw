@@ -36,11 +36,15 @@ import Log
 #     journal (which already excludes the runtime system prompt by
 #     design — see Agent.encode_journal).
 #
-# Privacy: every exported line passes through Log.redact, which masks
-# common secret shapes (sk-/AKIA/ghp_-style tokens, Bearer headers,
-# *_key / *_token / *_secret fields, long letter+digit blobs). The
-# heuristics are not exhaustive — still review exports manually before
-# publishing them anywhere.
+# Privacy: every string VALUE of an exported example passes through
+# Log.redact_value BEFORE json_encode, which masks common secret shapes
+# (sk-/AKIA/ghp_-style tokens, Bearer headers, PEM blocks, URL
+# passwords, PASSWORD= / "password": / password: / *_key / *_token /
+# *_secret fields, long letter+digit blobs). Redacting the encoded line
+# instead produced invalid JSONL (a masked run could eat the letter of a
+# \n escape) and missed secrets hidden behind escapes. The heuristics
+# are not exhaustive — still review exports manually before publishing
+# them anywhere.
 
 export [
     export_all, export_current,
@@ -105,7 +109,7 @@ fun export_one(journal_path, out_path) {
         else {
             wire = clean_messages(messages, [])
             example = %{messages: wire}
-            file_append(out_path, Log.redact(json_encode(example)) ++ "\n")
+            file_append(out_path, json_encode(Log.redact_value(example)) ++ "\n")
             'true'
         }
     }
@@ -122,7 +126,7 @@ fun export_current(out_path, history) {
     if (length(wire) < 2) {
         %{path: out_path, kept: 0, reason: "session too short"}
     } else {
-        file_write(out_path, Log.redact(json_encode(%{messages: wire})) ++ "\n")
+        file_write(out_path, json_encode(Log.redact_value(%{messages: wire})) ++ "\n")
         %{path: out_path, kept: 1}
     }
 }

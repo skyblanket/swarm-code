@@ -15,7 +15,7 @@ module Prompts
 # own. When we eventually serve Claude-backed models too, we can
 # branch on model name and emit a matching shape.
 
-export [system_prompt]
+export [system_prompt, tool_sections]
 
 # system_prompt now takes a second arg: tool_format ('native' | 'inband').
 # In native mode we skip the in-band protocol section (model gets the
@@ -23,6 +23,25 @@ export [system_prompt]
 # native-mode instruction. Tool descriptions stay — they add context for
 # the long-tail tools that don't have JSON schemas yet.
 fun system_prompt(cwd, tool_format) {
+    # The sw idiom guide is ~3k tokens and only useful when the project is a
+    # sw/swarmrt codebase. Gate it on a cheap cwd probe so non-sw projects
+    # don't pay the prefill every turn (every extra token brings the
+    # prefill/compaction deadlock closer).
+    sw_section = if (is_sw_project(cwd) == 'true') {
+        "\n\n=== WRITING SW CODE ===\n" ++ sw_guide()
+    } else { "" }
+    preamble() ++
+    "\n\n=== ENVIRONMENT ===\n" ++ environment_section(cwd) ++
+    tool_sections(tool_format) ++
+    sw_section ++
+    "\n\n=== RULES ===\n" ++ rules()
+}
+
+# The tool-use part of the system prompt for one wire format ("native" /
+# "inband") — a pure function of the format, so llm.sw can swap it by exact
+# text when a request goes out in the OTHER format than the prompt was built
+# for (/profile switching tool_format, a fallback endpoint, a provider chain).
+fun tool_sections(tool_format) {
     protocol_section = if (tool_format == "native") {
         "\n\n=== TOOL USE ===\n" ++
         "Function tools are provided via this request's `tools` array. When " ++
@@ -43,19 +62,7 @@ fun system_prompt(cwd, tool_format) {
     } else {
         "\n\n=== AVAILABLE TOOLS ===\n" ++ tool_descriptions()
     }
-    # The sw idiom guide is ~3k tokens and only useful when the project is a
-    # sw/swarmrt codebase. Gate it on a cheap cwd probe so non-sw projects
-    # don't pay the prefill every turn (every extra token brings the
-    # prefill/compaction deadlock closer).
-    sw_section = if (is_sw_project(cwd) == 'true') {
-        "\n\n=== WRITING SW CODE ===\n" ++ sw_guide()
-    } else { "" }
-    preamble() ++
-    "\n\n=== ENVIRONMENT ===\n" ++ environment_section(cwd) ++
-    protocol_section ++
-    tools_section ++
-    sw_section ++
-    "\n\n=== RULES ===\n" ++ rules()
+    protocol_section ++ tools_section
 }
 
 # Does cwd look like a sw / swarmrt project? True when cwd OR cwd/src holds
