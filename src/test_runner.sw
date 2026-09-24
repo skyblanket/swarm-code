@@ -226,7 +226,9 @@ fun main() {
         t_bash_trailing_comment(),
         t_bash_heredoc_last(),
         t_bash_syntax_error_reaches_model(),
-        t_bg_trailing_comment()
+        t_bg_trailing_comment(),
+        t_grep_invalid_regex_surfaces(),
+        t_grep_glob_default_path()
     ]
 
     passed = sum_list(results, 0)
@@ -2694,4 +2696,23 @@ fun t_bg_trailing_comment() {
           bool_and3(bool_and(string_starts_with(r, "[exit 0]"), string_contains(r, "bg-comment-ok")),
                     if (st2 == 'done') { 'true' } else { 'false' },
                     string_contains(tail2, "bgtool-ok")))
+}
+
+# grep with an invalid regex returned "(no matches)": rg's error went to the
+# terminal (the `2>&1` sat after `| head`) and its exit code was dropped.
+fun t_grep_invalid_regex_surfaces() {
+    r = Tools.exec_raw('grep', %{pattern: "foo(", path: "src"}, %{})
+    check("grep: an invalid regex is reported to the model, not '(no matches)'",
+          bool_and(string_starts_with(r, "error:"), string_contains(string_lower(r), "regex")))
+}
+
+# grep/glob with no path search the cwd explicitly (never stdin) and still
+# print clean relative paths (no `./` prefix).
+fun t_grep_glob_default_path() {
+    g = Tools.exec_raw('grep', %{pattern: "^module Tools$"}, %{})
+    f = Tools.exec_raw('glob', %{pattern: "src/Tool*.sw"}, %{})
+    check("grep/glob without a path search cwd and print clean relative paths",
+          bool_and3(string_contains(g, "src/tools.sw:1:module Tools"),
+                    string_contains(f, "src/ToolExecutor.sw"),
+                    if (string_contains(g ++ f, "./src") == 'false') { 'true' } else { 'false' }))
 }

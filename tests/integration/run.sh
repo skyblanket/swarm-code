@@ -20,6 +20,10 @@
 #   T8  council boundary    — read-only panel cannot execute shell commands
 #   T9  clean stdout        — headless stdout is only the JSON line / answer
 #   T10 stale PWD           — the real cwd, not $PWD, reaches the system prompt
+#   T11 grep without a path — MCP server's stdin (the JSON-RPC stream) is never
+#                             read by a tool subprocess; the next request survives
+#
+# INTEG_ONLY="t4 t11" runs just those tests (default: all).
 #
 # Exit code: 0 iff every test passes.
 
@@ -400,19 +404,38 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T11 — grep with no `path` in MCP server mode: rg used to be run with no
+#       path and inherited stdin, so it searched the JSON-RPC stream —
+#       blocking until the client closed it and swallowing the NEXT request.
+# ------------------------------------------------------------
+t11() {
+    new_case t11
+    printf 'needle-t11 here\n' >"$WORK/a.txt"
+    local req1 req2
+    req1='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grep","arguments":{"pattern":"needle-t11"}}}'
+    req2="{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"path\":\"$WORK/a.txt\"}}}"
+    (
+        cd "$WORK" || exit 97
+        { printf '%s\n' "$req1"; sleep 1; printf '%s\n' "$req2"; sleep 2; } |
+            HOME="$CASE_HOME" perl -e 'alarm 40; exec @ARGV' "$BIN" --mcp-server \
+            >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
+    )
+    RC=$?
+    if [ "$RC" -ne 0 ]; then fail T11 "MCP server exit code $RC"
+    elif ! grep -q '"id":1' "$CASE/stdout.txt"; then fail T11 "no response to the grep request"
+    elif ! grep '"id":1' "$CASE/stdout.txt" | grep -q 'a.txt:1:needle-t11'; then
+        fail T11 "grep searched the wrong input: $(grep '"id":1' "$CASE/stdout.txt" | head -c 300)"
+    elif ! grep -q '"id":2' "$CASE/stdout.txt"; then fail T11 "the second JSON-RPC request was swallowed"
+    else pass T11; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
-t1
-t2
-t3
-t4
-t5
-t6
-t7
-t8
-t9
-t10
+for t in ${INTEG_ONLY:-t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11}; do
+    "$t"
+done
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

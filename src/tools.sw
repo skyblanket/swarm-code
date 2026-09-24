@@ -143,7 +143,9 @@ fun all_tools() {
 # removed: it only SIGALRM'd the direct child (leaking grandchildren) and left
 # swarmrt's shell() polling for an exit file that never arrived → a multi-minute
 # wedge. These constants supply the per-tool budgets in SECONDS; callers pass
-# `* 1000` to shell_managed. Timeouts mirror Claude Code:
+# `* 1000` to shell_managed. Helper pipelines go through run_sh (stdin from
+# /dev/null — a child must never read the terminal or the MCP server's
+# JSON-RPC stream); bash runs Util.noninteractive_wrap. Timeouts mirror Claude Code:
 #   bash:       120s default, 600s max, overridable via timeout_ms arg
 #   git/search: 30s · web_fetch: 45s · read-probes: 5s
 # ------------------------------------------------------------
@@ -521,7 +523,7 @@ fun read_file_capped(path, offset, limit) {
     # and `head -c` would all hang, freezing the tool worker. Refuse before
     # touching the path. Every probe below is also timeout-guarded as a
     # backstop (a path on a dead NFS mount can hang even `test`).
-    rf_r = shell_managed(
+    rf_r = run_sh(
         "if test -f " ++ pq ++ "; then echo reg; elif test -e " ++ pq ++
         "; then echo nonreg; else echo missing; fi", read_probe_timeout_s() * 1000)
     rf = string_trim(elem(rf_r, 1))
@@ -543,7 +545,7 @@ fun read_file_capped(path, offset, limit) {
         # in the first 8KB (git's heuristic). MIME types misclassify text —
         # libmagic reports .js/.ts as application/javascript — and `file` is
         # missing from many slim container images.
-        nul_r = shell_managed("head -c 8192 " ++ pq ++ " | tr -dc '\\000' | wc -c",
+        nul_r = run_sh("head -c 8192 " ++ pq ++ " | tr -dc '\\000' | wc -c",
                               read_probe_timeout_s() * 1000)
         nul_count = parse_int_safe(string_trim(elem(nul_r, 1)), 0)
         if (nul_count == 0) {
@@ -551,11 +553,11 @@ fun read_file_capped(path, offset, limit) {
             # multi-GB file would OOM the VM before truncate_output ever runs.
             # Stat first; for anything large, read only a capped head via
             # `head -c` instead of slurping the whole thing.
-            size_str = string_trim(elem(shell_managed("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
+            size_str = string_trim(elem(run_sh("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
             size = parse_int_safe(size_str, 0)
             read_ceiling = read_output_cap()
             content = if (size == 0) { "" } else { if (size > read_ceiling) {
-                head = elem(shell_managed("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
+                head = elem(run_sh("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
                 head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
                 to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
             } else {
@@ -571,7 +573,7 @@ fun read_file_capped(path, offset, limit) {
             } }
         } else {
             # Best-effort label; `file` may not be installed.
-            ft_r = shell_managed("file --brief --mime-type " ++ pq ++ " 2>/dev/null",
+            ft_r = run_sh("file --brief --mime-type " ++ pq ++ " 2>/dev/null",
                                  read_probe_timeout_s() * 1000)
             ft = string_trim(to_string(elem(ft_r, 1)))
             label = if (string_length(ft) == 0) { "binary" } else { "binary, " ++ ft }
@@ -954,16 +956,10 @@ fun do_glob(args) {
     if (pattern == nil) {
         "error: missing 'pattern'"
     } else {
-        base = if (path == nil) { "." } else { to_string(path) }
+        base = if (path == nil || string_length(string_trim(to_string(path))) == 0) { "." }
+               else { to_string(path) }
         pat = to_string(pattern)
         pat_q = Util.shell_q(pat)
-        # When base is ".", DON'T pass it to rg — `rg --files . ` emits
-        # `./`-prefixed paths, and an anchored glob like `src/**/*.sw`
-        # never matches `./src/...`. With no path arg rg emits clean
-        # relative paths and anchored globs work.
-        base_part = if (base == "." || string_length(string_trim(base)) == 0) {
-            ""
-        } else { " " ++ Util.shell_q(base) }
         base_q = Util.shell_q(base)
         # ripgrep `--files -g` gives real glob semantics, but rg is
         # often unavailable to a plain /bin/sh (e.g. when it's only a
@@ -985,20 +981,29 @@ fun do_glob(args) {
         } else {
             "-name " ++ Util.shell_q(pat_find)
         }
-        # Pipe through `sed s|^\./||` to strip the `./` prefix `find`
-        # adds when invoked with `.` — matches ripgrep's clean output
-        # so downstream tools (Read) get the same path either way.
+        # The search root is ALWAYS passed explicitly (`.` by default): rg
+        # with no path searches its STDIN whenever stdin isn't a tty. Both
+        # rg and find then print `./`-prefixed paths for `.`, so one
+        # `sed s|^\./||` gives clean relative paths either way (anchored
+        # globs like `src/**/*.sw` still match — rg globs are relative to
+        # the search root). stderr (a bad glob) goes to a private file and
+        # is reported, instead of leaking onto the user's terminal.
+        errf = search_errfile()
         cmd = "if command -v rg >/dev/null 2>&1; then " ++
-              "rg --files --hidden --no-messages -g " ++ pat_q ++ base_part ++ "; " ++
-              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null | sed 's|^\\./||'; fi | head -n 101"
-        result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
-        code = elem(result, 0)
+              "rg --files --hidden --no-messages -g " ++ pat_q ++ " " ++ base_q ++ "; " ++
+              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null; fi 2>" ++ errfile_redirect(errf) ++
+              " | sed 's|^\\./||' | head -n 101"
+        result = run_sh(cmd, search_timeout_s() * 1000)
         out = elem(result, 1)
         interrupted = elem(result, 2)
+        err = take_errfile(errf)
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            if (string_length(string_trim(out)) == 0) { "(no matches)" }
+            if (string_length(string_trim(out)) == 0) {
+                if (string_length(err) > 0) { "error: glob failed: " ++ err }
+                else { "(no matches)" }
+            }
             else { glob_cap_notice(out) }
         }
     }
@@ -1036,12 +1041,9 @@ fun do_grep(args) {
         glob_arg = map_get(args, 'glob')
         mode = map_get(args, 'output_mode')
         hl = map_get(args, 'head_limit')
-        base = if (path == nil) { "." } else { to_string(path) }
+        base = if (path == nil || string_length(string_trim(to_string(path))) == 0) { "." }
+               else { to_string(path) }
         pat_q = Util.shell_q(to_string(pattern))
-        # Omit a "." path so rg emits clean (non-`./`-prefixed) paths.
-        base_part = if (base == "." || string_length(string_trim(base)) == 0) {
-            ""
-        } else { " " ++ Util.shell_q(base) }
         base_q = Util.shell_q(base)
 
         # Optional glob filter (rg --glob / mirrors Claude Code's Grep).
@@ -1069,29 +1071,86 @@ fun do_grep(args) {
         # `if/then/else` (not `rg || grep`) so an rg run that finds
         # nothing doesn't fall through and re-run grep over the whole
         # tree. --hidden so dotfiles aren't skipped; -e so a pattern
-        # starting with `-` isn't read as a flag.
-        grep_base = if (base == "." || string_length(string_trim(base)) == 0) {
-            " ."
-        } else { " " ++ base_q }
-        # Strip leading `./` so grep's `path:line:text` matches rg's
-        # `path:line:text` exactly — the model often hands those paths
-        # back to Read, which doesn't need (and shouldn't see) a `./`.
+        # starting with `-` isn't read as a flag. The fallback uses -E so
+        # the regex dialect matches rg's (ERE-style groups/alternation).
+        #
+        # The search path is ALWAYS explicit (`.` by default): with no path
+        # rg searches its STDIN when stdin isn't a tty — in --mcp-server
+        # mode that is the JSON-RPC stream, so it blocked for 30s and
+        # swallowed the client's next request. `sed s|^\./||` strips the
+        # `./` prefix that `.` adds so `path:line:text` stays clean (the
+        # model hands those paths back to read).
+        #
+        # stderr goes to a private file, not through the pipe: that's where
+        # an invalid regex (`foo(`) is reported, and the old `… | head 2>&1`
+        # sent it to the user's terminal while the model saw "(no matches)".
+        # --no-messages / -s keep unreadable-file noise out of it.
+        errf = search_errfile()
         cmd = "if command -v rg >/dev/null 2>&1; then " ++
               "rg --color=never --hidden --no-messages" ++ rg_mode ++ glob_flag ++
-              " -e " ++ pat_q ++ base_part ++ "; " ++
-              "else grep" ++ grep_mode ++ " --color=never -e " ++ pat_q ++ grep_base ++ " 2>/dev/null | sed 's|^\\./||'; fi" ++
-              " | head -n " ++ to_string(head_n)
-        result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
-        code = elem(result, 0)
+              " -e " ++ pat_q ++ " " ++ base_q ++ "; " ++
+              "else grep -s -E" ++ grep_mode ++ " --color=never -e " ++ pat_q ++ " " ++ base_q ++ "; fi" ++
+              " 2>" ++ errfile_redirect(errf) ++
+              " | sed 's|^\\./||' | head -n " ++ to_string(head_n)
+        result = run_sh(cmd, search_timeout_s() * 1000)
         out = elem(result, 1)
         interrupted = elem(result, 2)
+        err = take_errfile(errf)
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
             trimmed = truncate_output(out, grep_output_cap())
-            if (string_length(string_trim(trimmed)) == 0) { "(no matches)" } else { trimmed }
+            if (string_length(string_trim(trimmed)) == 0) {
+                if (string_length(err) > 0) {
+                    "error: grep failed: " ++ err ++
+                    "\n(For an invalid regex, escape literal ( ) [ ] { } . * + ? | with a backslash.)"
+                } else { "(no matches)" }
+            } else {
+                if (string_length(err) > 0) { trimmed ++ "\n[grep stderr: " ++ err ++ "]" }
+                else { trimmed }
+            }
         }
     }
+}
+
+# Private temp file for a search pipeline's stderr (mkstemp → 0600, unique
+# per call). nil if the temp dir is unusable — the command then discards
+# stderr instead of leaking it onto the terminal.
+fun search_errfile() {
+    file_temp(tmp_dir() ++ "/swarm-code-search-")
+}
+
+fun errfile_redirect(errf) {
+    if (errf == nil) { "/dev/null" } else { Util.shell_q(errf) }
+}
+
+# Read (capped, trimmed) and delete a search_errfile. "" when there was none.
+fun take_errfile(errf) {
+    if (errf == nil) { "" }
+    else {
+        raw = file_read(errf)
+        file_delete(errf)
+        if (raw == nil) { "" }
+        else { string_trim(string_truncate(raw, 2000)) }
+    }
+}
+
+fun tmp_dir() {
+    t = getenv("TMPDIR")
+    if (t == nil || string_length(to_string(t)) == 0) { "/tmp" }
+    else {
+        ts = to_string(t)
+        if (string_ends_with(ts, "/") == 'true' && string_length(ts) > 1) {
+            string_sub(ts, 0, string_length(ts) - 1)
+        } else { ts }
+    }
+}
+
+# shell_managed for the harness's own helper pipelines: stdin is /dev/null
+# (Util.no_stdin). shell_managed children otherwise inherit swarm-code's
+# stdin — the terminal, or the MCP server's JSON-RPC pipe.
+fun run_sh(cmd, timeout_ms) {
+    shell_managed(Util.no_stdin(cmd), timeout_ms)
 }
 
 # ------------------------------------------------------------
@@ -1424,7 +1483,7 @@ fun do_web_search(args) {
         # the JSON "diag" field, but python itself can still emit warnings /
         # SSL chatter on stderr. Folding stderr into stdout would prepend
         # that text and break json_decode of an otherwise-good result.
-        result = shell_managed(cmd ++ " 2>/dev/null", fetch_timeout_s() * 1000)
+        result = run_sh(cmd ++ " 2>/dev/null", fetch_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
         interrupted = elem(result, 2)
@@ -1647,7 +1706,7 @@ fun do_git_status(args) {
     cwd_arg = map_get(args, 'cwd')
     cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     cmd = git_noninteractive_env() ++ "git " ++ cwd_part ++ "status --porcelain --branch 2>&1 | head -n 100"
-    r = shell_managed(cmd, git_timeout_s() * 1000)
+    r = run_sh(cmd, git_timeout_s() * 1000)
     code = elem(r, 0)
     out = elem(r, 1)
     interrupted = elem(r, 2)
@@ -1667,7 +1726,7 @@ fun do_git_diff(args) {
     cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     flag = if (staged == 'true') { "--staged " } else { "" }
     cmd = git_noninteractive_env() ++ "git " ++ cwd_part ++ "diff " ++ flag ++ "--no-color 2>&1"
-    r = shell_managed(cmd, git_timeout_s() * 1000)
+    r = run_sh(cmd, git_timeout_s() * 1000)
     code = elem(r, 0)
     out = elem(r, 1)
     interrupted = elem(r, 2)
@@ -1702,7 +1761,7 @@ fun do_git_commit(args) {
             "{ git " ++ cwd_part ++ "add " ++ stage_list ++
             " && git " ++ cwd_part ++ "commit -m " ++ Util.shell_q(to_string(msg)) ++
             " && git " ++ cwd_part ++ "rev-parse --short HEAD ; } 2>&1"
-        r = shell_managed(cmd, git_timeout_s() * 1000)
+        r = run_sh(cmd, git_timeout_s() * 1000)
         code = elem(r, 0)
         out = elem(r, 1)
         interrupted = elem(r, 2)
@@ -1772,7 +1831,7 @@ fun do_code_search(args) {
             Util.shell_q(rgx) ++ " " ++ base_q ++
             " || grep -rn --color=never -E " ++ Util.shell_q(rgx) ++ " " ++ base_q ++
             ") 2>&1 | head -n 80"
-        r = shell_managed(cmd, search_timeout_s() * 1000)
+        r = run_sh(cmd, search_timeout_s() * 1000)
         code = elem(r, 0)
         out = elem(r, 1)
         interrupted = elem(r, 2)
@@ -1820,7 +1879,7 @@ fun do_log_wait(args, opts) {
             # wait, and so the `sleep` poll-loop's whole process group dies on
             # timeout. Timeout/interrupt surface via the interrupted flag now,
             # not exit 142.
-            r = shell_managed(inner, timeout_n * 1000)
+            r = run_sh(inner, timeout_n * 1000)
             code = elem(r, 0)
             interrupted = elem(r, 2)
             if (interrupted == 'true') {
@@ -1858,7 +1917,7 @@ fun do_file_watch(args) {
             "  [ \"$current\" != \"$initial\" ] && echo \"changed: $initial -> $current\" && exit 0; " ++
             "  sleep 0.5; " ++
             "done"
-        r = shell_managed(inner, timeout_n * 1000)
+        r = run_sh(inner, timeout_n * 1000)
         code = elem(r, 0)
         out = string_trim(elem(r, 1))
         interrupted = elem(r, 2)
@@ -1909,7 +1968,7 @@ fun do_sw_check(args) {
                   " >/dev/null 2>" ++ Util.shell_q(errf) ++ "; S=$?; " ++
                   "grep -v 'auto-imported\\|cannot open' " ++ Util.shell_q(errf) ++
                   "; rm -f " ++ Util.shell_q(errf) ++ "; exit $S"
-            r = shell_managed(cmd, 60 * 1000)
+            r = run_sh(cmd, 60 * 1000)
             code = elem(r, 0)
             out = string_trim(elem(r, 1))
             interrupted = elem(r, 2)
@@ -1934,7 +1993,7 @@ fun resolve_swc() {
     override = getenv("SWARM_CODE_SWC")
     if (override != nil) { to_string(override) }
     else {
-        r = shell_managed("command -v swc 2>/dev/null", read_probe_timeout_s() * 1000)
+        r = run_sh("command -v swc 2>/dev/null", read_probe_timeout_s() * 1000)
         found = string_trim(elem(r, 1))
         if (string_length(found) > 0) { found }
         else { "../swarmrt/bin/swc" }
@@ -2130,7 +2189,7 @@ fun do_web_fetch(args, opts) {
                         " -e 's/&nbsp;/ /g' -e 's/&amp;/\\&/g'" ++
                         " -e 's/&lt;/</g' -e 's/&gt;/>/g'" ++
                         " -e 's/&quot;/\"/g' | tr -s ' \\n' | head -c 30000"
-            result = shell_managed(strip_cmd ++ " 2>&1", fetch_timeout_s() * 1000)
+            result = run_sh(strip_cmd ++ " 2>&1", fetch_timeout_s() * 1000)
             text = elem(result, 1)
             file_delete(tmp_path)
             "fetched " ++ url ++ " (" ++ to_string(string_length(text)) ++
