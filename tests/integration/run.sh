@@ -20,6 +20,7 @@
 #   T8  council boundary    — read-only panel cannot execute shell commands
 #   T9  clean stdout        — headless stdout is only the JSON line / answer
 #   T10 stale PWD           — the real cwd, not $PWD, reaches the system prompt
+#   A*  agents/MCP/scheduler — see tests/integration/agents_cases.sh
 #
 # Exit code: 0 iff every test passes.
 
@@ -401,6 +402,9 @@ EOF
 
 # ------------------------------------------------------------
 
+# Multi-agent / MCP / scheduler / persistence cases (A1..).
+. "$ROOT/tests/integration/agents_cases.sh"
+
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 t1
@@ -413,6 +417,7 @@ t7
 t8
 t9
 t10
+agents_cases
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

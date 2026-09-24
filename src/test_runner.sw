@@ -124,6 +124,9 @@ fun main() {
         t_scheduler_next_id_empty(),
         t_scheduler_next_id_nonempty(),
         t_scheduler_jobs_dir_suffix(),
+        # --- agents / MCP / scheduler / persistence regressions ---
+        t_mcp_msg_kind_collision(),
+        t_mcp_health_structured(),
         t_memory_embed_db_path(),
         t_memory_dir_suffix(),
         t_memory_slugify_spaces(),
@@ -613,6 +616,84 @@ fun t_mcp_unconfigured() {
         if (length(schemas) == 0) { 'true' } else { 'false' },
         if (section == "") { 'true' } else { 'false' })
     check("mcp: unconfigured -> no schemas, no prompt section", ok)
+}
+
+# 'true' iff every element of a list of 'true'/'false' atoms is 'true'.
+# (ag_ prefix: helpers for the agents/MCP/scheduler regression block.)
+fun ag_all(lst) {
+    if (length(lst) == 0) { 'true' }
+    else { if (hd(lst) != 'true') { 'false' } else { ag_all(tl(lst)) } }
+}
+
+fun ag_is(a, b) { if (a == b) { 'true' } else { 'false' } }
+
+# A server→client request whose id COLLIDES with our in-flight call id
+# (the reviewer's {"id":100,"method":"roots/list"}) used to be taken as
+# the response → "MCP response carried no result". Anything carrying
+# `method` is a request/notification, never our reply; ping is answered
+# with {} and other requests with -32601.
+fun t_mcp_msg_kind_collision() {
+    req = json_decode("{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"roots/list\"}")
+    ping = json_decode("{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"method\":\"ping\"}")
+    note = json_decode("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}")
+    resp = json_decode("{\"jsonrpc\":\"2.0\",\"id\":100,\"result\":{}}")
+    sresp = json_decode("{\"jsonrpc\":\"2.0\",\"id\":\"100\",\"error\":{\"code\":1}}")
+    stale = json_decode("{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}")
+    ping_reply = Mcp.mcp_server_request_reply(ping)
+    roots_reply = Mcp.mcp_server_request_reply(req)
+    rerr = map_get(roots_reply, 'error')
+    ok = ag_all([
+        ag_is(Mcp.mcp_msg_kind(req, 100), 'request'),
+        ag_is(Mcp.mcp_msg_kind(note, 100), 'notification'),
+        ag_is(Mcp.mcp_msg_kind(resp, 100), 'response'),
+        ag_is(Mcp.mcp_msg_kind(sresp, 100), 'response'),
+        ag_is(Mcp.mcp_msg_kind(stale, 100), 'other'),
+        ag_is(Mcp.mcp_msg_kind(json_decode("[1]"), 100), 'other'),
+        ag_is(Mcp.mcp_msg_kind(nil, 100), 'other'),
+        ag_is(json_encode(ping_reply), "{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"result\":{}}"),
+        ag_is(map_get(roots_reply, 'id'), 100),
+        ag_is(map_get(rerr, 'code'), -32601)])
+    check("mcp: colliding-id server request is not our response; ping -> {}, others -> -32601", ok)
+}
+
+# Health bookkeeping keys on the structured call status, never the text:
+# a SUCCESSFUL result mentioning "connection lost" used to mark the
+# server failed (forced reconnect, then "not running" for 60s), and
+# "did not respond" in output counted as a timeout strike. EOF / write
+# failure ('lost') must fail the server at once.
+fun t_mcp_health_structured() {
+    ok_text = Mcp.mcp_format_result(json_decode(
+        "{\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"db connection lost; peer did not respond\"}]}}"))
+    is_err = Mcp.mcp_format_result(json_decode(
+        "{\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"boom\"}],\"isError\":true}}"))
+    rpc_err = Mcp.mcp_format_result(json_decode("{\"id\":1,\"error\":{\"code\":-1,\"message\":\"bad\"}}"))
+    t = ets_new()
+    ets_put(t, "s/status", "ok")
+    Mcp.mcp_note_result(t, "s", elem(ok_text, 0))
+    Mcp.mcp_note_result(t, "s", elem(ok_text, 0))
+    after_ok = ets_get(t, "s/status")
+    Mcp.mcp_note_result(t, "s", 'timeout')
+    after_one_timeout = ets_get(t, "s/status")
+    Mcp.mcp_note_result(t, "s", 'error')
+    Mcp.mcp_note_result(t, "s", 'timeout')
+    after_reset_timeout = ets_get(t, "s/status")
+    Mcp.mcp_note_result(t, "s", 'timeout')
+    after_two_timeouts = ets_get(t, "s/status")
+    ets_put(t, "s/status", "ok")
+    Mcp.mcp_note_result(t, "s", 'lost')
+    after_lost = ets_get(t, "s/status")
+    ets_drop(t)
+    ok = ag_all([
+        ag_is(elem(ok_text, 0), 'ok'),
+        ag_is(elem(ok_text, 1), "db connection lost; peer did not respond"),
+        ag_is(elem(is_err, 0), 'error'),
+        ag_is(elem(rpc_err, 0), 'error'),
+        ag_is(after_ok, "ok"),
+        ag_is(after_one_timeout, "ok"),
+        ag_is(after_reset_timeout, "ok"),
+        ag_is(after_two_timeouts, "failed"),
+        ag_is(after_lost, "failed")])
+    check("mcp: health follows call status (ok/error/timeout/lost), never result text", ok)
 }
 
 # remember saved frontmatter but an empty body: the schema named the
