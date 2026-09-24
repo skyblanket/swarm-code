@@ -24,6 +24,16 @@
 #   A7  unattended jobs     — a scheduled job's child runs with
 #                             SWARM_CODE_DENY_DANGEROUS=1: `rm -rf ~/…`
 #                             requested by its model is denied
+#   A8  subagent guardrail  — a subagent's 8 failing reads stop the
+#                             SUBAGENT (partial result + reason), never
+#                             the parent's turn
+#   A9  explore is read-only — an explore subagent's bash / write calls
+#                             are refused (nothing executes)
+#   A10 subagent max steps  — hitting the step limit returns the work so
+#                             far, not just a notice
+#   A11 subagent big answer — a 320KB answer reaches the parent capped
+#   A12 subagent LLM hang   — a hung endpoint fails the subagent after
+#                             the configured LLM timeout, with a reason
 #
 # A5-A7 drive the binary INTERACTIVELY (the scheduler runs off main's
 # heartbeat) through tests/integration/pty_run.py.
@@ -290,6 +300,159 @@ EOF
     else pass A7; fi
 }
 
+# tool_msg_len <req#> <tool_call_id> — byte length of that tool result
+# in request #n (the parent's view of a task result).
+tool_msg_len() {
+    python3 - "$REQLOG" "$1" "$2" <<'PYEOF2'
+import json, sys
+path, n, tcid = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+for line in open(path):
+    r = json.loads(line)
+    if r["n"] == n:
+        for m in r["body"].get("messages", []):
+            if m.get("role") == "tool" and m.get("tool_call_id") == tcid:
+                print(len(m.get("content") or "")); sys.exit(0)
+print(-1)
+PYEOF2
+}
+
+# ------------------------------------------------------------
+# A8 — subagent failure streak halts the subagent, not the parent
+# ------------------------------------------------------------
+a8() {
+    new_case a8
+    python3 - "$CASE/scenario.json" <<'PYEOF2'
+import json, sys
+reads = [{"id": "r%d" % i, "name": "read", "arguments": {"path": "missing_%d.txt" % i}} for i in range(8)]
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "m1", "name": "task", "arguments": {
+        "description": "find config", "prompt": "locate the config file", "subagent_type": "explore"}}]},
+    {"type": "tool_calls", "calls": reads},
+    # Next request must be the PARENT's: the halted subagent never asks again.
+    {"type": "text", "content": "A8_MAIN_FINAL"}]}, open(sys.argv[1], "w"))
+PYEOF2
+    start_mock "$CASE/scenario.json" || { fail A8 "mock failed to start"; return; }
+    run_swarm -p "find the config" --no-resume --json
+    cleanup
+    local out; out="$(final_json)"
+    if [ "$RC" -ne 0 ]; then fail A8 "exit code $RC: $out"
+    elif grep -q "guardrail halt\]" "$CASE/stderr.txt"; then fail A8 "subagent's streak halted the PARENT turn"
+    elif ! echo "$out" | grep -q '"status":"ok"'; then fail A8 "parent did not finish ok: $out"
+    elif ! echo "$out" | grep -q "A8_MAIN_FINAL"; then fail A8 "halted subagent kept calling the LLM: $out"
+    elif ! req_has 2 "subagent stopped: guardrail halt"; then fail A8 "parent never got the subagent's halt result"
+    elif ! req_has 2 "missing_7.txt"; then fail A8 "partial result lacks the subagent's tool digest"
+    else pass A8; fi
+}
+
+# ------------------------------------------------------------
+# A9 — explore subagent cannot run bash or write
+# ------------------------------------------------------------
+a9() {
+    new_case a9
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [{"id": "m1", "name": "task", "arguments": {"description": "survey", "prompt": "look around read-only", "subagent_type": "explore"}}]},
+  {"type": "tool_calls", "calls": [{"id": "s1", "name": "bash", "arguments": {"command": "touch EXPLORE_RAN_BASH"}}]},
+  {"type": "tool_calls", "calls": [{"id": "s2", "name": "write", "arguments": {"path": "explore_wrote.txt", "content": "x"}}]},
+  {"type": "text", "content": "sub done"},
+  {"type": "text", "content": "A9_MAIN_DONE"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail A9 "mock failed to start"; return; }
+    run_swarm -p "survey the repo" --no-resume --json
+    cleanup
+    if [ -e "$WORK/EXPLORE_RAN_BASH" ]; then fail A9 "explore subagent ran bash"
+    elif [ -e "$WORK/explore_wrote.txt" ]; then fail A9 "explore subagent wrote a file"
+    elif [ "$RC" -ne 0 ]; then fail A9 "exit code $RC"
+    elif ! req_has 2 "not available to an explore (read-only) subagent"; then fail A9 "bash refusal not explained"
+    elif ! req_has 3 "not available to an explore (read-only) subagent"; then fail A9 "write refusal not explained"
+    elif ! final_json | grep -q "A9_MAIN_DONE"; then fail A9 "final text missing: $(final_json)"
+    else pass A9; fi
+}
+
+# ------------------------------------------------------------
+# A10 — max steps returns the work done so far
+# ------------------------------------------------------------
+a10() {
+    new_case a10
+    python3 - "$CASE/scenario.json" <<'PYEOF2'
+import json, sys
+steps = [{"type": "tool_calls", "content": "", "calls": [{"id": "g%d" % i, "name": "bash",
+          "arguments": {"command": "echo FINDING_%d" % i}}]} for i in range(15)]
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "m1", "name": "task", "arguments": {
+        "description": "dig", "prompt": "investigate", "subagent_type": "general"}}]}]
+    + steps + [{"type": "text", "content": "A10_MAIN_DONE"}]}, open(sys.argv[1], "w"))
+PYEOF2
+    start_mock "$CASE/scenario.json" || { fail A10 "mock failed to start"; return; }
+    run_swarm -p "investigate" --no-resume --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail A10 "exit code $RC"
+    elif [ "$(req_count)" -ne 17 ]; then fail A10 "expected 17 requests (1 + 15 sub + 1), got $(req_count)"
+    elif ! req_has 16 "15-step limit"; then fail A10 "no max-steps notice"
+    elif ! req_has 16 "FINDING_14"; then fail A10 "subagent's findings discarded at max steps"
+    elif ! final_json | grep -q "A10_MAIN_DONE"; then fail A10 "final text missing"
+    else pass A10; fi
+}
+
+# ------------------------------------------------------------
+# A11 — a huge subagent answer is capped before it reaches the parent
+# ------------------------------------------------------------
+a11() {
+    new_case a11
+    python3 - "$CASE/scenario.json" <<'PYEOF2'
+import json, sys
+big = "".join("finding %06d: details details details\n" % i for i in range(8000))  # ~320KB
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "m1", "name": "task", "arguments": {
+        "description": "dig", "prompt": "investigate", "subagent_type": "general"}}]},
+    # Small deltas, like a real server (one huge delta is cut by the
+    # runtime's SSE reader and would not reproduce the uncapped answer).
+    {"type": "text", "content": big, "chunk": 2000},
+    {"type": "text", "content": "A11_MAIN_DONE"}]}, open(sys.argv[1], "w"))
+PYEOF2
+    start_mock "$CASE/scenario.json" || { fail A11 "mock failed to start"; return; }
+    run_swarm -p "investigate" --no-resume --json
+    cleanup
+    local n; n="$(tool_msg_len 2 m1)"
+    if [ "$RC" -ne 0 ]; then fail A11 "exit code $RC"
+    elif [ "$n" -lt 0 ]; then fail A11 "parent never received the task result"
+    elif [ "$n" -gt 26000 ]; then fail A11 "subagent answer reached the parent uncapped ($n bytes)"
+    elif ! req_has 2 "bytes of the subagent's answer elided"; then fail A11 "no truncation marker"
+    elif ! req_has 2 "finding 000000" || ! req_has 2 "finding 007999"; then fail A11 "head/tail of the answer lost"
+    else pass A11; fi
+}
+
+# ------------------------------------------------------------
+# A12 — a hung LLM endpoint fails the subagent after the LLM timeout
+# ------------------------------------------------------------
+a12() {
+    new_case a12
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [{"id": "m1", "name": "task", "arguments": {"description": "dig", "prompt": "investigate", "subagent_type": "general"}}]},
+  {"type": "text", "content": "never delivered", "delay": 15},
+  {"type": "text", "content": "A12_MAIN_DONE"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail A12 "mock failed to start"; return; }
+    SWARM_CODE_LLM_TIMEOUT_MS=3000 run_swarm -p "investigate" --no-resume --json
+    cleanup
+    # How long the parent was blocked: subagent request (#1) → the
+    # parent's next request (#2). Must track the 3s LLM timeout, not
+    # the old fixed 300s wait (nor the endpoint's 15s stall).
+    local gap
+    gap="$(python3 -c 'import json,sys; t={}
+for l in open(sys.argv[1]):
+    r=json.loads(l); t[r["n"]]=r["t"]
+print(int(t[2]-t[1]) if 1 in t and 2 in t else 999)' "$REQLOG")"
+    if [ "$RC" -ne 0 ]; then fail A12 "exit code $RC: $(final_json)"
+    elif [ "$gap" -gt 10 ]; then fail A12 "parent blocked ${gap}s on a hung subagent LLM call"
+    elif ! req_has 2 "no response from the LLM within 3s"; then fail A12 "failure reason not surfaced"
+    elif ! final_json | grep -q "A12_MAIN_DONE"; then fail A12 "final text missing: $(final_json)"
+    else pass A12; fi
+}
+
 agents_cases() {
     a1
     a2
@@ -298,4 +461,9 @@ agents_cases() {
     a5
     a6
     a7
+    a8
+    a9
+    a10
+    a11
+    a12
 }

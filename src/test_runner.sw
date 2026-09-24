@@ -131,6 +131,9 @@ fun main() {
         t_mcp_health_structured(),
         t_mcp_server_spec_envelope(),
         t_json_check_strict(),
+        t_subagent_type_allowlists(),
+        t_subagent_result_capped(),
+        t_subagent_partial_keeps_work(),
         t_sched_wrong_shape_never_panics(),
         t_sched_corrupt_refuses_write(),
         t_sched_strict_exprs(),
@@ -1023,6 +1026,77 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# explore / bash subagent restrictions were prompt-only — an explore
+# subagent ran bash and write. Now a policy (ToolRegistry contexts +
+# subagent_blocked_for), with a clear refusal naming what IS allowed.
+fun t_subagent_type_allowlists() {
+    ok = ag_all([
+        ag_is(Agent.subagent_blocked_for("explore", "bash"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "write"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "edit"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "web_fetch"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "mcp__srv__tool"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "read"), 'false'),
+        ag_is(Agent.subagent_blocked_for("explore", "grep"), 'false'),
+        ag_is(Agent.subagent_blocked_for("explore", "glob"), 'false'),
+        ag_is(Agent.subagent_blocked_for("bash", "bash"), 'false'),
+        ag_is(Agent.subagent_blocked_for("bash", "write"), 'true'),
+        ag_is(Agent.subagent_blocked_for("general", "write"), 'false'),
+        ag_is(Agent.subagent_blocked_for("general", "task"), 'true'),
+        ag_is(ToolRegistry.allowed_in("subagent_explore", "bash"), 'false'),
+        ag_is(ToolRegistry.allowed_in("subagent_explore", "read"), 'true'),
+        ag_is(Agent.subagent_type_of(nil), "general"),
+        ag_is(Agent.subagent_type_of(5), "general"),
+        ag_is(Agent.subagent_type_of(" Explore "), "explore"),
+        ag_is(Agent.subagent_context("explore"), "subagent_explore"),
+        string_contains(Agent.subagent_block_msg("explore", "bash"), "read-only")])
+    check("subagent: explore = read-only, bash = shell only (enforced, not prompt-only)", ok)
+}
+
+# A 320KB subagent answer reached the parent uncapped. Capped like
+# bash/MCP output (24000) with an explicit marker; head + tail kept;
+# cut points never split a UTF-8 sequence.
+fun t_subagent_result_capped() {
+    big = "HEAD-MARK " ++ ag_repeat("finding: details details details\n", 10000, "") ++ " TAIL-MARK"
+    capped = Agent.subagent_cap(big)
+    # One ASCII byte first puts every 'é' (2 bytes) at an ODD offset, so
+    # a naive cut at 16000 would split one; a boundary-safe cut is odd.
+    uni = "x" ++ ag_repeat("é", 20000, "")
+    ucap = Agent.subagent_cap(uni)
+    marker_at = string_index_of(ucap, "\n\n…[")
+    ok = ag_all([
+        if (string_length(capped) <= 24400) { 'true' } else { 'false' },
+        string_contains(capped, "bytes of the subagent's answer elided"),
+        string_starts_with(capped, "HEAD-MARK "),
+        string_ends_with(capped, " TAIL-MARK"),
+        ag_is(Agent.subagent_cap("short answer"), "short answer"),
+        ag_is(marker_at % 2, 1),
+        string_ends_with(ucap, "é")])
+    check("subagent: answer capped at 24000 with marker, UTF-8 safe", ok)
+}
+
+# Hitting max steps returned only "[subagent hit max steps…]" — the
+# work was discarded. subagent_partial keeps the latest notes plus a
+# digest of the most recent tool calls/results, headed by the reason.
+fun t_subagent_partial_keeps_work() {
+    h = [LLM.new_message_system("sys"), LLM.new_message_user("task"),
+         LLM.new_message_assistant("looking at config", [%{id: "c1", name: "bash", arguments: "{\"command\":\"echo F1\"}"}], nil),
+         LLM.new_message_tool("c1", "[exit 0]\nFINDING_ONE"),
+         LLM.new_message_assistant("", [%{id: "c2", name: "read", arguments: "{\"path\":\"x\"}"}], nil),
+         LLM.new_message_tool("c2", "FINDING_TWO")]
+    p = Agent.subagent_partial(h, "hit the 15-step limit before a final answer")
+    empty = Agent.subagent_partial([LLM.new_message_user("t")], "LLM call failed — boom")
+    ok = ag_all([
+        string_contains(p, "subagent stopped: hit the 15-step limit"),
+        string_contains(p, "looking at config"),
+        string_contains(p, "FINDING_ONE"),
+        string_contains(p, "FINDING_TWO"),
+        string_contains(p, "read {\"path\":\"x\"}"),
+        string_contains(empty, "LLM call failed — boom"),
+        string_contains(empty, "no findings yet")])
+    check("subagent: abnormal stop returns partial work + reason", ok)
 }
 
 # Non-interactive entry points cannot answer an "ask" permission
