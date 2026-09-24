@@ -13,6 +13,9 @@
 #                             "connection lost" / "did not respond" never
 #                             touches server health (no reconnect), and
 #                             headless --json stdout stays one line
+#   A4  --mcp-server spec   — ping → {}, unknown tool → -32602, bad
+#                             "jsonrpc" / object or null ids → -32600,
+#                             notifications get no reply
 #
 # Run standalone: tests/integration/run.sh (these run after T1..T10).
 
@@ -114,8 +117,63 @@ EOF
     else pass A3; fi
 }
 
+# ------------------------------------------------------------
+# A4 — --mcp-server envelope + method conformance (no LLM)
+# ------------------------------------------------------------
+a4() {
+    new_case a4
+    (
+        cd "$WORK" || exit 97
+        printf '%s\n' \
+          '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"a4","version":"1"}}}' \
+          '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+          '{"jsonrpc":"2.0","id":2,"method":"ping"}' \
+          '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}' \
+          '{"jsonrpc":"1.0","id":4,"method":"ping"}' \
+          '{"id":5,"method":"ping"}' \
+          '{"jsonrpc":"2.0","id":{"x":1},"method":"ping"}' \
+          '{"jsonrpc":"2.0","id":"six","method":"no/such/method"}' |
+            HOME="$CASE_HOME" perl -e 'alarm 20; exec @ARGV' "$BIN" --mcp-server \
+            >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
+    )
+    RC=$?
+    if [ "$RC" -ne 0 ]; then fail A4 "MCP server exit code $RC"; return; fi
+    local why
+    why="$(python3 - "$CASE/stdout.txt" <<'PYEOF'
+import json, sys
+lines = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
+msgs = []
+for l in lines:
+    try:
+        msgs.append(json.loads(l))
+    except ValueError:
+        print("non-JSON stdout line: %r" % l[:120]); sys.exit(0)
+def by_id(i):
+    return [m for m in msgs if m.get("id") == i]
+def code(m):
+    return (m.get("error") or {}).get("code")
+checks = [
+    (len(msgs) == 7, "want 7 responses (notification unanswered), got %d" % len(msgs)),
+    (all(m.get("jsonrpc") == "2.0" for m in msgs), "a response lacks jsonrpc 2.0"),
+    (by_id(2) and by_id(2)[0].get("result") == {}, "ping must return an empty result"),
+    (by_id(3) and code(by_id(3)[0]) == -32602, "unknown tool must be -32602"),
+    (by_id(4) and code(by_id(4)[0]) == -32600, "jsonrpc 1.0 must be -32600"),
+    (by_id(5) and code(by_id(5)[0]) == -32600, "missing jsonrpc must be -32600"),
+    (len([m for m in by_id(None) if code(m) == -32600]) == 1, "object id must be -32600 with id null"),
+    (not [m for m in msgs if isinstance(m.get("id"), dict)], "object id echoed back"),
+    (by_id("six") and code(by_id("six")[0]) == -32601, "unknown method must be -32601"),
+]
+bad = [why for ok, why in checks if not ok]
+print(bad[0] if bad else "")
+PYEOF
+)"
+    if [ -n "$why" ]; then fail A4 "$why"
+    else pass A4; fi
+}
+
 agents_cases() {
     a1
     a2
     a3
+    a4
 }

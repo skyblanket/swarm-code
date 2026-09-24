@@ -26,6 +26,7 @@ import UI
 import Memory
 import Tools
 import Mcp
+import McpServer
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -127,6 +128,7 @@ fun main() {
         # --- agents / MCP / scheduler / persistence regressions ---
         t_mcp_msg_kind_collision(),
         t_mcp_health_structured(),
+        t_mcp_server_spec_envelope(),
         t_memory_embed_db_path(),
         t_memory_dir_suffix(),
         t_memory_slugify_spaces(),
@@ -694,6 +696,49 @@ fun t_mcp_health_structured() {
         ag_is(after_two_timeouts, "failed"),
         ag_is(after_lost, "failed")])
     check("mcp: health follows call status (ok/error/timeout/lost), never result text", ok)
+}
+
+# --mcp-server spec conformance: ping used to be -32601 (spec: empty
+# result), an unknown tool -32601 (spec: -32602 Invalid params), and
+# neither "jsonrpc" nor the id type was validated (object ids echoed).
+fun ag_rpc(line) {
+    out = McpServer.dispatch(json_decode(line),
+                             %{settings: map_new(), execution_context: "mcp_server"})
+    if (out == nil) { nil } else { json_decode(to_string(out)) }
+}
+
+fun ag_rpc_code(r) {
+    if (r == nil) { nil }
+    else { e = map_get(r, 'error') ; if (e == nil) { nil } else { map_get(e, 'code') } }
+}
+
+fun t_mcp_server_spec_envelope() {
+    ping = McpServer.dispatch(json_decode("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}"),
+                              %{settings: map_new(), execution_context: "mcp_server"})
+    unknown_tool = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\",\"arguments\":{}}}")
+    bad_args = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":[1]}}")
+    unknown_method = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"nope/x\"}")
+    wrong_ver = ag_rpc("{\"jsonrpc\":\"1.0\",\"id\":5,\"method\":\"ping\"}")
+    no_ver = ag_rpc("{\"id\":6,\"method\":\"ping\"}")
+    obj_id = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":{\"a\":1},\"method\":\"ping\"}")
+    null_id = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}")
+    str_id = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"ping\"}")
+    note = ag_rpc("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+    ok = ag_all([
+        ag_is(to_string(ping), "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}"),
+        ag_is(ag_rpc_code(unknown_tool), -32602),
+        ag_is(ag_rpc_code(bad_args), -32602),
+        ag_is(ag_rpc_code(unknown_method), -32601),
+        ag_is(ag_rpc_code(wrong_ver), -32600),
+        ag_is(map_get(wrong_ver, 'id'), 5),
+        ag_is(ag_rpc_code(no_ver), -32600),
+        ag_is(ag_rpc_code(obj_id), -32600),
+        ag_is(map_get(obj_id, 'id'), nil),
+        ag_is(ag_rpc_code(null_id), -32600),
+        ag_is(map_get(str_id, 'id'), "abc"),
+        ag_is(ag_rpc_code(str_id), nil),
+        ag_is(note, nil)])
+    check("mcp-server: ping -> {}, unknown tool -> -32602, jsonrpc/id validated (-32600)", ok)
 }
 
 # remember saved frontmatter but an empty body: the schema named the
