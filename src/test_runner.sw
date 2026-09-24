@@ -32,6 +32,7 @@ import Flows
 import Trajectory
 import Log
 import Skills
+import SessionSearch
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -143,6 +144,7 @@ fun main() {
         t_trajectory_redacts_valid_jsonl(),
         t_log_redact_value_shapes(),
         t_skill_slug_traversal_blocked(),
+        t_session_search_reindexes_changed(),
         t_sched_wrong_shape_never_panics(),
         t_sched_corrupt_refuses_write(),
         t_sched_strict_exprs(),
@@ -1035,6 +1037,34 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# A journal still being written by another instance when this one
+# booted was marked indexed and never refreshed (only presence in meta
+# was checked). Now size+mtime are recorded and a changed journal is
+# reindexed at the next init — here: a line appended after indexing.
+fun t_session_search_reindexes_changed() {
+    d = ag_tmp("sessidx")
+    file_delete(d)
+    file_mkdir(d)
+    j = d ++ "/journal-100.jsonl"
+    file_write(j, "{\"role\":\"user\",\"content\":\"alphaword first turn\"}\n")
+    SessionSearch.init_at(d)
+    h1 = SessionSearch.search_at(d, "alphaword", 10)
+    file_append(j, "{\"role\":\"assistant\",\"content\":\"zuluword appended later\"}\n")
+    SessionSearch.init_at(d)
+    h2 = SessionSearch.search_at(d, "zuluword", 10)
+    h3 = SessionSearch.search_at(d, "alphaword", 10)
+    SessionSearch.init_at(d)
+    h4 = SessionSearch.search_at(d, "alphaword", 10)
+    file_delete(j)
+    file_delete(d ++ "/index.db")
+    ok = ag_all([
+        ag_is(length(h1), 1),
+        ag_is(length(h2), 1),
+        ag_is(length(h3), 1),
+        ag_is(length(h4), 1)])
+    check("session search: a journal that changed after indexing is reindexed", ok)
 }
 
 # forget_skill {"slug":"../../../work/proj"} deleted work/proj/SKILL.md

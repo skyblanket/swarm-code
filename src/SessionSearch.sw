@@ -9,7 +9,7 @@ import Util
 # Layout on disk:
 #
 #   ~/.swarm-code/sessions/
-#     index.db              — SQLite with FTS5 virtual table + mtime meta
+#     index.db              — SQLite with FTS5 virtual table + size/mtime meta
 #     journal-<ts>.jsonl    — existing per-session journals (one JSON per line)
 #     .active               — pointer to current session journal
 #
@@ -18,68 +18,79 @@ import Util
 # System prompts are not journaled so they don't pollute the index.
 #
 # How the cache stays fresh: at session start we walk the journals
-# directory, compare each file's mtime against the cached value in
-# `meta`, and reindex only the ones that changed. A journal is
+# directory, compare each file's size + mtime (file_stat — an in-process
+# stat(2), no shell) against the values recorded in `meta` when it was
+# last indexed, and reindex only the ones that changed. A journal is
 # rewritten on every turn (`journal_sync`), so the active session's
-# new turns land in the index on the next session start.
+# new turns land in the index on the next session start — including a
+# journal that was still being written by ANOTHER instance when this
+# one booted (previously it was marked indexed once and never
+# refreshed, because only "present in meta" was checked).
 #
 # Usage:
 #   /search QUERY        — slash command, prints top hits inline
 #   session_search tool  — agent-callable; returns hits as a string
 
-export [init, search, search_render, db_path, sessions_dir]
+export [init, init_at, search, search_at, search_render, db_path, sessions_dir]
 
 fun sessions_dir() { getenv("HOME") ++ "/.swarm-code/sessions" }
-fun db_path()      { sessions_dir() ++ "/index.db" }
+fun db_path()      { db_path_at(sessions_dir()) }
+fun db_path_at(dir) { dir ++ "/index.db" }
 
 # ------------------------------------------------------------
 # init — create schema if missing, then incrementally reindex.
-# Idempotent. Called from main.sw at session start.
+# Idempotent. Called from main.sw at session start. init_at(dir) is the
+# same over an explicit sessions directory (unit tests).
 # ------------------------------------------------------------
-fun init() {
-    file_mkdir(sessions_dir())
-    db = db_open(db_path())
+fun init() { init_at(sessions_dir()) }
+
+fun init_at(dir) {
+    file_mkdir(dir)
+    db = db_open(db_path_at(dir))
     db_exec(db,
         "CREATE VIRTUAL TABLE IF NOT EXISTS journals USING fts5(" ++
         "session UNINDEXED, role UNINDEXED, content)")
     db_exec(db,
         "CREATE TABLE IF NOT EXISTS meta(" ++
-        "session TEXT PRIMARY KEY, indexed_at INTEGER)")
-    reindex(db)
+        "session TEXT PRIMARY KEY, indexed_at INTEGER, size INTEGER, mtime INTEGER)")
+    # Migrate an index.db created before size/mtime were tracked. On a
+    # current schema these fail ("duplicate column") — harmless. Old
+    # rows read back NULL, so every such journal reindexes once.
+    db_exec(db, "ALTER TABLE meta ADD COLUMN size INTEGER")
+    db_exec(db, "ALTER TABLE meta ADD COLUMN mtime INTEGER")
+    reindex(db, dir)
     db_close(db)
     'session_search_ready'
 }
 
 # ------------------------------------------------------------
 # reindex — enumerate journals via the file_list builtin (no shell)
-# and index any that aren't in the meta cache yet. The currently-
-# active session (per the .active marker) is always re-indexed,
-# since its turns grow during a run.
-#
-# Why no mtime check: swarmrt's shell() polls every 1s, so 60 files
-# × 1 stat call each = 60s startup. file_list is in-process and free,
-# but doesn't surface mtimes — so we trade per-file freshness for
-# instant boot. The active session is the only one that mutates
-# during a run, and we always refresh it.
+# and (re)index every one that is new or whose size / mtime differ
+# from what meta recorded at its last indexing. The currently-active
+# session (per the .active marker) is always re-indexed as well: its
+# turns grow during a run and a same-second rewrite could keep mtime.
+# file_stat is an in-process stat(2) — the old "no mtime check, stat
+# costs a 1s shell() poll per file" trade-off no longer applies.
 # ------------------------------------------------------------
-fun reindex(db) {
-    active = read_active_marker()
-    names = file_list(sessions_dir())
-    reindex_loop(db, names, active)
+fun reindex(db, dir) {
+    active = read_active_marker(dir)
+    names = file_list(dir)
+    reindex_loop(db, dir, names, active)
 }
 
-fun reindex_loop(db, names, active) {
+fun reindex_loop(db, dir, names, active) {
     if (length(names) == 0) { 'ok' }
     else {
         n = hd(names)
         if (is_journal_name(n) == 'true') {
-            path = sessions_dir() ++ "/" ++ n
+            path = dir ++ "/" ++ n
+            sig = file_sig(path)
             needs = if (path == active) { 'true' }
-                    else { if (is_indexed(db, path) == 'true') { 'false' }
+                    else { if (is_fresh(db, path, sig) == 'true') { 'false' }
                     else { 'true' }}
-            if (needs == 'true') { index_one(db, path) }
+            if (needs == 'true') { index_one(db, path, sig) }
         }
-        reindex_loop(db, tl(names), active)
+        reindex_loop(db, dir, tl(names), active)
     }
 }
 
@@ -88,15 +99,28 @@ fun is_journal_name(n) {
     string_ends_with(n, ".jsonl") == 'true'
 }
 
-fun is_indexed(db, path) {
-    rows = db_query(db, "SELECT 1 FROM meta WHERE session = ?", [path])
-    if (length(rows) == 0) { 'false' } else { 'true' }
+# {size, mtime} of a journal right now ({-1, -1} if it vanished).
+fun file_sig(path) {
+    st = file_stat(path)
+    if (st == nil) { {0 - 1, 0 - 1} }
+    else { {map_get(st, 'size'), map_get(st, 'mtime')} }
+}
+
+# Indexed AND unchanged since: meta's size + mtime match the file's.
+fun is_fresh(db, path, sig) {
+    rows = db_query(db, "SELECT size, mtime FROM meta WHERE session = ?", [path])
+    if (length(rows) == 0) { 'false' }
+    else {
+        r = hd(rows)
+        if (map_get(r, "size") == elem(sig, 0) && map_get(r, "mtime") == elem(sig, 1)) { 'true' }
+        else { 'false' }
+    }
 }
 
 # Read the .active pointer to know which journal is the currently
 # running session (the only one that may have grown since last index).
-fun read_active_marker() {
-    p = sessions_dir() ++ "/.active"
+fun read_active_marker(dir) {
+    p = dir ++ "/.active"
     if (file_exists(p) == 'false') { nil }
     else {
         c = file_read(p)
@@ -104,7 +128,10 @@ fun read_active_marker() {
     }
 }
 
-fun index_one(db, path) {
+# `sig` is the {size, mtime} observed BEFORE reading: if the journal
+# grows while we ingest it, the recorded sig is older than the file and
+# the next boot reindexes it again (never the reverse).
+fun index_one(db, path, sig) {
     # swarmrt's db_exec() doesn't bind params — only db_query does.
     # Use db_query for parameterised writes; empty result is harmless.
     db_query(db, "DELETE FROM journals WHERE session = ?", [path])
@@ -114,8 +141,8 @@ fun index_one(db, path) {
         ingest_lines(db, path, clines)
     }
     db_query(db,
-        "INSERT OR REPLACE INTO meta(session, indexed_at) VALUES (?, ?)",
-        [path, timestamp()])
+        "INSERT OR REPLACE INTO meta(session, indexed_at, size, mtime) VALUES (?, ?, ?, ?)",
+        [path, timestamp(), elem(sig, 0), elem(sig, 1)])
     'ok'
 }
 
@@ -168,8 +195,10 @@ fun ingest_tool_calls(db, path, tcs) {
 #   %{session, role, snippet}
 # `snippet()` wraps matched terms in >>><<<.
 # ------------------------------------------------------------
-fun search(query, limit) {
-    db = db_open(db_path())
+fun search(query, limit) { search_at(sessions_dir(), query, limit) }
+
+fun search_at(dir, query, limit) {
+    db = db_open(db_path_at(dir))
     rows = db_query(db,
         "SELECT session, role, " ++
         "snippet(journals, 2, '>>>', '<<<', '…', 40) AS snip " ++
