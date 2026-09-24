@@ -430,6 +430,7 @@ fun print_usage() {
     print("  SWARM_CODE_API_KEY       API key for a remote provider")
     print("  SWARM_CODE_TOOL_FORMAT   native | inband (else auto-detected)")
     print("  SWARM_CODE_ALLOW_REMOTE  set to 1 to permit non-local endpoints")
+    print("  SWARM_CODE_HEADLESS_APPROVE  set to 1 to auto-approve 'ask' tools in -p runs")
     print("  SWARM_CODE_CWD           working directory shown to the model")
     print("  SWARM_CODE_PLAN=auto|on|off   plan mode (default: auto)")
     print("  SWARM_CODE_EMBED_ENDPOINT   embedding API URL (enables semantic recall)")

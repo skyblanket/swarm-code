@@ -29,6 +29,8 @@
 #   T13 control files       — write/edit can't touch ~/.swarm-code/hooks,
 #                             schedule.json, .profile_override, or a case-
 #                             variant .SSH; memory/ stays writable
+#   T14 headless 'ask'      — an explicit "ask" or a dangerous command is
+#                             denied headless unless HEADLESS_APPROVE=1
 #
 # Exit code: 0 iff every test passes.
 
@@ -599,6 +601,58 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T14 — headless has nobody to answer an 'ask': an explicit "ask"
+#       permission or a dangerous command is DENIED (with the opt-in in
+#       the message) unless SWARM_CODE_HEADLESS_APPROVE=1 is set.
+#       Default-allowed tools keep working (T2/T3).
+# ------------------------------------------------------------
+t14() {
+    new_case t14
+    local sentinel="$WORK/ask-ran"
+    mkdir -p "$CASE_HOME/.swarm-code" "$CASE_HOME/victim"
+    echo '{"permissions": {"bash": "ask"}}' >"$CASE_HOME/.swarm-code/settings.json"
+    cat >"$CASE/scenario.json" <<EOF
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_ask", "name": "bash", "arguments": {"command": "touch $sentinel"}}]},
+  {"type": "text", "content": "ASK_DENIED_T14"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T14 "mock failed to start"; return; }
+    run_swarm -p "t14 ask" --no-resume --json
+    cleanup
+    if [ -e "$sentinel" ]; then fail T14 "headless auto-approved an explicit \"ask\" permission"; return
+    elif [ "$RC" -ne 0 ]; then fail T14 "ask: exit code $RC"; return
+    elif ! req_has 1 "SWARM_CODE_HEADLESS_APPROVE=1"; then fail T14 "denial does not name the opt-in"; return
+    fi
+    # A dangerous command under default permissions: 'ask' → denied.
+    rm -f "$CASE_HOME/.swarm-code/settings.json"
+    cat >"$CASE/scenario2.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_rm", "name": "bash", "arguments": {"command": "rm -rf ~/victim"}}]},
+  {"type": "text", "content": "DANGER_DENIED_T14"}
+]}
+EOF
+    start_mock "$CASE/scenario2.json" || { fail T14 "mock 2 failed to start"; return; }
+    run_swarm -p "t14 danger" --no-resume --json
+    cleanup
+    if [ ! -d "$CASE_HOME/victim" ]; then fail T14 "headless auto-approved a dangerous rm -rf ~"; return
+    elif ! req_has 1 "permission denied"; then fail T14 "dangerous command was not denied"; return
+    fi
+    # The opt-in restores auto-approval.
+    echo '{"permissions": {"bash": "ask"}}' >"$CASE_HOME/.swarm-code/settings.json"
+    start_mock "$CASE/scenario.json" || { fail T14 "mock 3 failed to start"; return; }
+    RUN_ENV=("SWARM_CODE_HEADLESS_APPROVE=1")
+    run_swarm -p "t14 approved" --no-resume --json
+    RUN_ENV=()
+    cleanup
+    if [ ! -e "$sentinel" ]; then fail T14 "SWARM_CODE_HEADLESS_APPROVE=1 did not approve the ask"
+    elif [ "$RC" -ne 0 ]; then fail T14 "approved: exit code $RC"
+    else pass T14; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
@@ -615,6 +669,7 @@ t10
 t11
 t12
 t13
+t14
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

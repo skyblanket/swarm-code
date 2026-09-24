@@ -38,6 +38,11 @@ backported.
   allow-lists, argument-rewriting hooks, guardrails, and permissions are applied
   *before* any raw handler runs. Execution **fails closed** when the execution
   context is missing or unknown.
+- **No unattended approvals.** In headless mode (`-p`, scheduled jobs, `/flows`
+  children) there is nobody to answer a permission prompt, so a call that
+  needs one — a dangerous command, a tool you set to `"ask"`, an MCP tool —
+  is denied. `SWARM_CODE_HEADLESS_APPROVE=1` opts back into auto-approval
+  (`/flows` children still hard-deny dangerous commands).
 - **Hardline command blocklist.** Destructive commands (`rm -rf /`, `mkfs`, `dd`
   to a device, fork bombs, and similar) are blocked and **cannot be bypassed by
   environment overrides**.

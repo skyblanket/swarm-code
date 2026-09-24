@@ -552,10 +552,9 @@ fun check_permission(tool_name, args, opts) {
         }
 
         # Hard-gate dangerous bash commands regardless of config.
-        # Headless converts 'ask' to 'allow' (agent.resolve_permission),
-        # so unattended children (/flows fan-out sets
-        # SWARM_CODE_DENY_DANGEROUS=1) turn this gate into a hard deny
-        # instead of silently auto-approving.
+        # Headless denies an 'ask' unless SWARM_CODE_HEADLESS_APPROVE=1
+        # (agent.resolve_permission); SWARM_CODE_DENY_DANGEROUS=1 (set for
+        # /flows fan-out children) makes this a hard deny even then.
         if (tool_name == 'bash' && is_dangerous_bash(args) == 'true') {
             if (getenv("SWARM_CODE_DENY_DANGEROUS") == "1") { 'deny' } else { 'ask' }
         } else {

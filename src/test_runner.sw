@@ -236,7 +236,10 @@ fun main() {
         # --- security: swarm-code control files ---
         t_pathguard_control_files_blocked(),
         t_pathguard_data_dirs_writable(),
-        t_pathguard_case_insensitive()
+        t_pathguard_case_insensitive(),
+        # --- security: headless 'ask' ---
+        t_headless_ask_denied(),
+        t_headless_default_allowed_still_run()
     ]
 
     passed = sum_list(results, 0)
@@ -2881,4 +2884,32 @@ fun t_pathguard_case_insensitive() {
         if (PathGuard.validate_read(home ++ "/.SSH/id_ed25519") == "ok") { 'false' } else { 'true' },
         PathGuard.is_sensitive(home ++ "/.SSH/config"))
     check("pathguard: sensitive-dir checks are case-insensitive (.SSH, .Aws, .Swarm-Code)", ok)
+}
+
+# ------------------------------------------------------------
+# Security: headless mode must not auto-approve an 'ask'
+# ------------------------------------------------------------
+# An explicit "ask", a dangerous command and an MCP tool (default 'ask')
+# have nobody to approve them headless — denied unless the user exported
+# SWARM_CODE_HEADLESS_APPROVE=1 (then the old auto-approval applies).
+fun t_headless_ask_denied() {
+    want = if (getenv("SWARM_CODE_HEADLESS_APPROVE") == "1") { 'allow' } else { 'deny' }
+    ask_opts = %{settings: %{permissions: %{bash: "ask"}}, perms_table: ets_new(), headless: 'true'}
+    dflt = %{settings: %{}, perms_table: ets_new(), headless: 'true'}
+    danger_want = if (getenv("SWARM_CODE_ALLOW_DANGEROUS") == "1") { 'allow' } else { want }
+    ok = sec_all([
+        eqs(Agent.resolve_permission('bash', %{command: "touch /tmp/x"}, ask_opts), want),
+        eqs(Agent.resolve_permission('bash', %{command: "rm -rf ~/victim"}, dflt), danger_want),
+        eqs(Agent.resolve_permission('mcp__srv__tool', %{}, dflt), want)])
+    check("headless: an explicit ask / dangerous command / MCP tool is denied, not auto-approved", ok)
+}
+
+fun t_headless_default_allowed_still_run() {
+    dflt = %{settings: %{}, perms_table: ets_new(), headless: 'true'}
+    ok = sec_all([
+        eqs(Agent.resolve_permission('bash', %{command: "echo hi"}, dflt), 'allow'),
+        eqs(Agent.resolve_permission('write', %{path: "/tmp/x"}, dflt), 'allow'),
+        eqs(Agent.resolve_permission('read', %{path: "/tmp/x"}, dflt), 'allow'),
+        eqs(Agent.resolve_permission('bash', %{command: "mkfs /dev/sda1"}, dflt), 'deny')])
+    check("headless: default-allowed tools still run; hardline still denies", ok)
 }

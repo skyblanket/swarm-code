@@ -520,7 +520,8 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     }
     journal_sync(opts_journal, history)
 
-    # Auto-accept permissions in headless.
+    # Headless: no Reader to ask — an 'ask' is denied unless
+    # SWARM_CODE_HEADLESS_APPROVE=1 (see resolve_permission).
     opts_h = map_put(opts_journal, 'headless', 'true')
 
     final_history = route_input(prompt, history, opts_h)
@@ -2655,7 +2656,7 @@ fun execute_all(tool_calls, history, opts) {
                 effective_args = map_get(prepared, 'args')
                 decision = resolve_permission(name_atom, effective_args, opts)
                 if (decision == 'deny') {
-                    denial = "error: permission denied for tool '" ++ name_str ++ "'"
+                    denial = permission_denial(name_atom, name_str, effective_args, opts)
                     turn_print(opts, UI.err_text(denial))
                     denial
                 } else {
@@ -2780,7 +2781,13 @@ fun resolve_permission(name, args, opts) {
     else { if (raw == 'deny') { 'deny' }
     else {
         headless = map_get(opts, 'headless')
-        if (headless == 'true') { 'allow' }
+        # Headless has nobody to answer an 'ask' — which only arises for a
+        # dangerous bash command, a user-configured "ask", or an MCP tool
+        # (default-allowed tools never get here). Deny unless the user
+        # opted in; permission_denial tells the model how.
+        if (headless == 'true') {
+            if (getenv("SWARM_CODE_HEADLESS_APPROVE") == "1") { 'allow' } else { 'deny' }
+        }
         else {
             # Session answer cache FIRST: a user who explicitly said "No,
             # always deny X this session" must stay denied even after
@@ -2818,6 +2825,24 @@ fun resolve_permission(name, args, opts) {
             }}
         }
     }}
+}
+
+# Model-facing denial text. A headless 'ask' is refused only because no
+# one can approve it, so name the opt-in; a hardline / configured 'deny'
+# keeps the plain message (no opt-in exists for those).
+fun permission_denial(name_atom, name_str, args, opts) {
+    base = "error: permission denied for tool '" ++ name_str ++ "'"
+    if (map_get(opts, 'headless') == 'true' &&
+        Config.check_permission(name_atom, args, opts) == 'ask') {
+        how = if (name_atom == 'bash' && Config.is_dangerous_bash(args) == 'true') {
+            "run headless with SWARM_CODE_HEADLESS_APPROVE=1"
+        } else {
+            "run headless with SWARM_CODE_HEADLESS_APPROVE=1, or set \"" ++ name_str ++
+            "\": \"allow\" under permissions in ~/.swarm-code/settings.json"
+        }
+        base ++ " — it needs approval and headless mode has no one to ask. " ++
+        "To allow such calls unattended, the user can " ++ how
+    } else { base }
 }
 
 fun ask_via_reader(name, opts, table, cache_key) {
