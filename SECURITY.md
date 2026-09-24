@@ -55,7 +55,8 @@ backported.
 - **Restricted contexts.** Subagents, MCP-server, and council-panel contexts run
   under narrowed, often read-only, tool policies.
 - **Secret redaction.** Known secret patterns are redacted from session logs and
-  trajectory exports.
+  trajectory exports. The raw LLM request body is written to disk only with
+  `SWARM_CODE_DEBUG=1`, to `~/.swarm-code/last-body.json` with mode 600.
 
 ## Known limitations
 

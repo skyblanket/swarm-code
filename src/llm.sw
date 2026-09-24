@@ -504,7 +504,7 @@ fun inject_context_status(messages, opts) {
                 else {
                     # Bracketed marker (not XML) — avoids any future
                     # JSON-escape weirdness on `<`/`>` and reads cleaner
-                    # to humans glancing at /tmp/swarm-code-last-body.json.
+                    # to humans glancing at the SWARM_CODE_DEBUG body dump.
                     new_content = to_string(content) ++ "\n\n[" ++ status ++ "]"
                     new_msg = map_put(last_msg, 'content', new_content)
                     replace_at(messages, last_idx, new_msg, 0, [])
@@ -1763,7 +1763,7 @@ fun chat_native(messages, opts) {
     body_chars = string_length(body)
 
     file_mkdir(getenv("HOME") ++ "/.swarm-code")
-    file_write(getenv("HOME") ++ "/.swarm-code/last-body.json", body)
+    dump_last_body(body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     # Substantive live-wait line shown for the whole TTFT window.
     # Suppressed on wake turns — the Reader is pinned in read_line and
@@ -1939,6 +1939,26 @@ fun api_tool_calls_to_internal(raw, acc) {
     }}
 }
 
+# Debug-only copy of the outbound request body — it carries the whole
+# conversation (prompts, tool output, any secrets in them), so it is
+# written only with SWARM_CODE_DEBUG=1 and never world-readable: mkstemp
+# (file_temp) creates the file 0600 and the rename keeps that mode.
+# Nothing reads it back; it is for a human debugging a request.
+fun dump_last_body(body) {
+    home = getenv("HOME")
+    if (getenv("SWARM_CODE_DEBUG") != "1" || home == nil) { 'skip' }
+    else {
+        dir = home ++ "/.swarm-code"
+        file_mkdir(dir)
+        tmp = file_temp(dir ++ "/.last-body.")
+        if (tmp == nil) { 'skip' }
+        else {
+            file_write(tmp, body)
+            file_rename(tmp, dir ++ "/last-body.json")
+        }
+    }
+}
+
 # ============================================================
 # Inband streaming path — parse markers ONCE into structured form
 # ============================================================
@@ -1950,7 +1970,7 @@ fun chat_inband(messages, opts) {
     body = build_request_body(messages, opts)
     body_chars = string_length(body)
 
-    file_write("/tmp/swarm-code-last-body.json", body)
+    dump_last_body(body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     # Same live-wait line for the inband (Gemma-style) path. Suppressed
     # on wake turns (Reader pinned in read_line); newline-less in

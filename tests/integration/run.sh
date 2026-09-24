@@ -31,6 +31,7 @@
 #                             variant .SSH; memory/ stays writable
 #   T14 headless 'ask'      — an explicit "ask" or a dangerous command is
 #                             denied headless unless HEADLESS_APPROVE=1
+#   T15 request-body dump   — never to /tmp; only SWARM_CODE_DEBUG=1, 0600
 #
 # Exit code: 0 iff every test passes.
 
@@ -653,6 +654,46 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T15 — the request body (prompts, tool output, secrets) is never dumped
+#       to a shared world-readable path. Only SWARM_CODE_DEBUG=1 writes it,
+#       to ~/.swarm-code/last-body.json with mode 600. /tmp is shared with
+#       other runs, so the check is "OUR marker is absent", not "no file".
+# ------------------------------------------------------------
+file_mode() { python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$1"; }
+
+t15() {
+    new_case t15
+    local marker="T15_BODY_MARKER_$$_$RANDOM"
+    local dump="$CASE_HOME/.swarm-code/last-body.json"
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "BODY_T15_A"},
+               {"type": "text", "content": "BODY_T15_B"},
+               {"type": "text", "content": "BODY_T15_C"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T15 "mock failed to start"; return; }
+    local fmt
+    for fmt in inband native; do
+        RUN_ENV=("SWARM_CODE_TOOL_FORMAT=$fmt")
+        run_swarm -p "t15 $fmt $marker" --no-resume --json
+        RUN_ENV=()
+        if [ "$RC" -ne 0 ]; then cleanup; fail T15 "$fmt: exit code $RC"; return; fi
+        if grep -qs "$marker" /tmp/swarm-code-last-body.json; then
+            cleanup; fail T15 "$fmt: request body written to /tmp/swarm-code-last-body.json"; return
+        fi
+        if [ -e "$dump" ]; then cleanup; fail T15 "$fmt: body dumped without SWARM_CODE_DEBUG"; return; fi
+    done
+    RUN_ENV=("SWARM_CODE_TOOL_FORMAT=inband" "SWARM_CODE_DEBUG=1")
+    run_swarm -p "t15 debug $marker" --no-resume --json
+    RUN_ENV=()
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T15 "debug: exit code $RC"
+    elif ! grep -qs "$marker" "$dump"; then fail T15 "SWARM_CODE_DEBUG=1 did not write $dump"
+    elif [ "$(file_mode "$dump")" != "0o600" ]; then fail T15 "debug dump is mode $(file_mode "$dump"), want 600"
+    elif grep -qs "$marker" /tmp/swarm-code-last-body.json; then fail T15 "debug: body also written to /tmp"
+    else pass T15; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
@@ -670,6 +711,7 @@ t11
 t12
 t13
 t14
+t15
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"
