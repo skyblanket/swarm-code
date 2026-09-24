@@ -48,7 +48,8 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         get_session_mode, set_session_mode, next_mode, resolve_permission,
         show_expand, handle_bg_command, route_input,
         skip_remaining_tools, turn_interrupted,
-        args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls]
+        args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls,
+        headless_answer]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -547,14 +548,22 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     }
     journal_sync(opts_journal, history)
 
-    # Auto-accept permissions in headless.
-    opts_h = map_put(opts_journal, 'headless', 'true')
+    # Auto-accept permissions in headless. run_id stamps every assistant message
+    # this run appends (run_turn), so the result can only ever be THIS run's
+    # answer: resume is the headless default, and the resumed history already
+    # holds earlier runs' answers — a run whose LLM call failed (400, server
+    # down) used to report the previous run's reply as {"status":"ok"}, exit 0.
+    run_id = uuid()
+    opts_h = map_put(map_put(opts_journal, 'headless', 'true'), 'run_id', run_id)
 
     final_history = route_input(prompt, history, opts_h)
     journal_sync(opts_h, final_history)
 
-    last_text = last_assistant_text(final_history)
-    ok = if (string_length(last_text) > 0) { 'true' } else { 'false' }
+    last_text = headless_answer(final_history, run_id)
+    # A slash command (/compact, /profile …) is a successful run with no model
+    # answer — not a failure.
+    ok = if (string_length(last_text) > 0) { 'true' }
+         else { if (is_slash_prompt(prompt) == 'true') { 'true' } else { 'false' } }
     result_fd = map_get(opts, 'result_fd')
     if (json_mode == 'true') {
         status = if (ok == 'true') { "ok" } else { "error" }
@@ -575,18 +584,28 @@ fun emit_result(result_fd, s) {
     else { print(s) }
 }
 
-fun last_assistant_text(history) {
-    last_assistant_loop(history, "")
+# The headless result: the content of the history's FINAL message when it is
+# an assistant reply this run produced (stamped with run_id by run_turn) that
+# asks for no further tools. Anything else — the turn ended on an LLM failure
+# (history ends at the user message or a tool result), hit max steps, or
+# appended nothing — is "" (status error), never an earlier run's answer.
+# (Was: the last assistant message ANYWHERE in the resumed history.)
+fun headless_answer(history, run_id) {
+    if (length(history) == 0 || run_id == nil) { "" }
+    else {
+        last = hd(take_last(history, 1))
+        tcs = map_get(last, 'tool_calls')
+        if (map_get(last, 'role') == 'assistant' && map_get(last, 'run_id') == run_id &&
+            (tcs == nil || length(tcs) == 0)) {
+            to_string(map_get(last, 'content'))
+        } else { "" }
+    }
 }
 
-fun last_assistant_loop(msgs, acc) {
-    if (length(msgs) == 0) { acc }
-    else {
-        msg = hd(msgs)
-        role = map_get(msg, 'role')
-        na = if (role == 'assistant') { to_string(map_get(msg, 'content')) } else { acc }
-        last_assistant_loop(tl(msgs), na)
-    }
+fun is_slash_prompt(prompt) {
+    t = string_trim(to_string(prompt))
+    if (string_starts_with(t, "/") == 'true' && is_known_slash_command(first_token(t)) == 'true') { 'true' }
+    else { 'false' }
 }
 
 # ------------------------------------------------------------
@@ -2044,7 +2063,11 @@ fun run_turn(history, opts, step) {
             # History keeps a wire-safe copy of the calls (cut-off arguments
             # stored as "{}", see sanitize_tool_calls); dispatch below uses the
             # raw ones.
-            asst_msg = LLM.new_message_assistant(content, sanitize_tool_calls(tool_calls, []), reasoning)
+            # A headless run stamps its replies with run_id (see run_headless;
+            # the journal doesn't keep the field).
+            asst_msg0 = LLM.new_message_assistant(content, sanitize_tool_calls(tool_calls, []), reasoning)
+            run_id = map_get(opts, 'run_id')
+            asst_msg = if (run_id == nil) { asst_msg0 } else { map_put(asst_msg0, 'run_id', run_id) }
             with_assistant = list_append(working_hist, asst_msg)
             journal_sync(opts, with_assistant)
             # F2: a turn completed cleanly — clear any poison flag a PRIOR turn in

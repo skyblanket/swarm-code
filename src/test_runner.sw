@@ -228,7 +228,9 @@ fun main() {
         t_args_malformed_despite_lenient_decode(),
         t_cut_turn_reason(),
         t_cut_turn_calls_refused(),
-        t_sanitize_cut_tool_calls()
+        t_sanitize_cut_tool_calls(),
+        # --- headless reports only this run's answer ---
+        t_headless_answer_this_run_only()
     ]
 
     passed = sum_list(results, 0)
@@ -2715,4 +2717,24 @@ fun t_sanitize_cut_tool_calls() {
           bool_and3(eqs(map_get(hd(out), 'arguments'), "{}"),
                     eqs(map_get(hd(tl(out)), 'arguments'), "{\"command\":\"ls\"}"),
                     eqs(map_get(hd(out), 'id'), "a")))
+}
+
+# ------------------------------------------------------------
+# Headless reports only THIS run's answer
+# ------------------------------------------------------------
+# Resume is the headless default: the history already holds earlier runs'
+# replies. A run whose LLM call failed ends on its user message (or a tool
+# result) and must not report the previous run's answer as success.
+fun t_headless_answer_this_run_only() {
+    prev = [LLM.new_message_system("s"), LLM.new_message_user("first"),
+            map_put(LLM.new_message_assistant("FIRST_RUN_ANSWER", [], nil), 'run_id', "run-1")]
+    failed = list_append(prev, LLM.new_message_user("second"))
+    answered = list_append(failed, map_put(LLM.new_message_assistant("SECOND", [], nil), 'run_id', "run-2"))
+    mid_tools = list_append(failed, map_put(LLM.new_message_assistant("let me look",
+                    [%{id: "c", name: "bash", arguments: "{}"}], nil), 'run_id', "run-2"))
+    check("headless_answer: this run's final reply only — never an earlier run's",
+          bool_and3(eqs(Agent.headless_answer(failed, "run-2"), ""),
+                    eqs(Agent.headless_answer(prev, "run-2"), ""),
+                    bool_and(eqs(Agent.headless_answer(answered, "run-2"), "SECOND"),
+                             eqs(Agent.headless_answer(mid_tools, "run-2"), ""))))
 }

@@ -23,6 +23,7 @@
 #   T11 truncated tool call — finish_reason=length: the cut-off write never runs
 #   T12 malformed args      — cut mid-string, no finish_reason: strict check stops it
 #   T13 interrupted stream  — tool calls of an ESC-interrupted stream never run
+#   T14 stale headless ok   — a failed resumed run never reports the prior answer
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -495,11 +496,49 @@ PYEOF
 }
 
 # ------------------------------------------------------------
+# T14 — headless reports only THIS run's answer. Resume is the default, so
+#       run 2's history holds run 1's reply; a run 2 whose request fails
+#       (HTTP 400, or no server at all) must be status error / exit 1, not
+#       run 1's answer with status ok.
+# ------------------------------------------------------------
+t14() {
+    new_case t14
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "FIRST_RUN_ANSWER_T14"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T14 "mock failed to start"; return; }
+    run_swarm -p "t14 first" --json
+    cleanup
+    if [ "$RC" -ne 0 ] || ! final_json | grep -q FIRST_RUN_ANSWER_T14; then
+        fail T14 "run 1 did not succeed: rc=$RC $(final_json)"; return
+    fi
+
+    cat >"$CASE/scenario2.json" <<'EOF'
+{"responses": [{"type": "http", "status": 400, "body": "{\"error\":{\"message\":\"bad request\"}}"}]}
+EOF
+    start_mock "$CASE/scenario2.json" || { fail T14 "mock 2 failed to start"; return; }
+    run_swarm -p "t14 second" --json
+    cleanup
+    local out2; out2="$(final_json)"
+    if [ "$RC" -eq 0 ]; then fail T14 "run 2 (HTTP 400) exited 0: $out2"; return; fi
+    if echo "$out2" | grep -q FIRST_RUN_ANSWER_T14; then fail T14 "run 2 (HTTP 400) reported run 1's answer: $out2"; return; fi
+    if ! echo "$out2" | grep -q '"status":"error"'; then fail T14 "run 2 (HTTP 400) status not error: $out2"; return; fi
+
+    # Run 3: nothing listening on the port any more.
+    run_swarm -p "t14 third" --json
+    local out3; out3="$(final_json)"
+    if [ "$RC" -eq 0 ]; then fail T14 "run 3 (server down) exited 0: $out3"
+    elif echo "$out3" | grep -q FIRST_RUN_ANSWER_T14; then fail T14 "run 3 (server down) reported run 1's answer: $out3"
+    elif ! echo "$out3" | grep -q '"status":"error"'; then fail T14 "run 3 status not error: $out3"
+    else pass T14; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"
