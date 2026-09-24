@@ -34,6 +34,7 @@ import MemVec
 import ToolExecutor
 import ToolRegistry
 import Background
+import PathGuard
 
 fun main() {
     print("")
@@ -231,7 +232,11 @@ fun main() {
         t_endpoint_gate_bypasses_refused(),
         t_endpoint_gate_locals_allowed(),
         t_endpoint_host_parse(),
-        t_endpoint_refusal_reason()
+        t_endpoint_refusal_reason(),
+        # --- security: swarm-code control files ---
+        t_pathguard_control_files_blocked(),
+        t_pathguard_data_dirs_writable(),
+        t_pathguard_case_insensitive()
     ]
 
     passed = sum_list(results, 0)
@@ -2821,4 +2826,59 @@ fun t_endpoint_refusal_reason() {
                        else { string_contains(r_remote, "SWARM_CODE_ALLOW_REMOTE=1") }}
     check("network gate: endpoint_refusal names SWARM_CODE_ALLOW_REMOTE=1, passes locals",
           bool_and(remote_ok, eqs(r_local, nil)))
+}
+
+# ------------------------------------------------------------
+# Security: the model can't write swarm-code's control files (PathGuard)
+# ------------------------------------------------------------
+# 'true' iff PathGuard.validate_write refuses (want='true') / allows
+# (want='false') every path. Validation only — nothing is written.
+fun sec_write_blocked_all(paths, want) {
+    if (length(paths) == 0) { 'true' }
+    else {
+        p = hd(paths)
+        blocked = if (PathGuard.validate_write(p) == "ok") { 'false' } else { 'true' }
+        if (blocked == want) { sec_write_blocked_all(tl(paths), want) }
+        else {
+            print("      mismatch: " ++ p ++ " (want blocked=" ++ to_string(want) ++ ")")
+            'false'
+        }
+    }
+}
+
+# hooks/pre_tool.sh runs on every tool call (even with bash denied);
+# schedule.json queues headless runs; .profile_override redirects the LLM;
+# sessions/ journals are replayed as conversation history.
+fun t_pathguard_control_files_blocked() {
+    sc = getenv("HOME") ++ "/.swarm-code"
+    ok = sec_write_blocked_all([
+        sc ++ "/hooks/pre_tool.sh", sc ++ "/hooks/post_llm.sh",
+        sc ++ "/schedule.json", sc ++ "/.profile_override", sc ++ "/.plan_mode",
+        sc ++ "/settings.json", sc ++ "/sessions/journal-1.jsonl",
+        sc ++ "/SWARM_MANIFESTO.md", sc ++ "/history", sc,
+        sc ++ "/memory/../hooks/pre_tool.sh",
+        "/tmp/some-repo/.swarm-code.json"], 'true')
+    check("pathguard: write refuses ~/.swarm-code hooks/schedule/override/sessions + .swarm-code.json", ok)
+}
+
+fun t_pathguard_data_dirs_writable() {
+    sc = getenv("HOME") ++ "/.swarm-code"
+    ok = sec_write_blocked_all([
+        sc ++ "/memory/note.md", sc ++ "/skills/deploy/SKILL.md",
+        "/tmp/sw_pathguard_ok.txt", "/tmp/.swarm-code-notes.txt",
+        "/tmp/x.swarm-code.json"], 'false')
+    check("pathguard: ~/.swarm-code/memory + skills and ordinary files stay writable", ok)
+}
+
+# macOS filesystems are case-insensitive by default: ~/.SSH IS ~/.ssh.
+fun t_pathguard_case_insensitive() {
+    home = getenv("HOME")
+    ok = bool_and3(
+        sec_write_blocked_all([
+            home ++ "/.SSH/authorized_keys", home ++ "/.Aws/credentials",
+            home ++ "/.GnuPG/pubring.kbx", home ++ "/.Swarm-Code/hooks/pre_tool.sh",
+            home ++ "/.swarm-code/Settings.json", "/ETC/passwd"], 'true'),
+        if (PathGuard.validate_read(home ++ "/.SSH/id_ed25519") == "ok") { 'false' } else { 'true' },
+        PathGuard.is_sensitive(home ++ "/.SSH/config"))
+    check("pathguard: sensitive-dir checks are case-insensitive (.SSH, .Aws, .Swarm-Code)", ok)
 }

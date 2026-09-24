@@ -41,6 +41,12 @@ backported.
 - **Hardline command blocklist.** Destructive commands (`rm -rf /`, `mkfs`, `dd`
   to a device, fork bombs, and similar) are blocked and **cannot be bypassed by
   environment overrides**.
+- **Protected paths.** The `write` / `edit` / `multi_edit` tools refuse
+  credential locations (`.ssh`, `.gnupg`, `.aws`, `/etc`, …) and swarm-code's
+  own control files — everything under `~/.swarm-code/` except the `memory/`
+  and `skills/` data dirs (hooks there run on every tool call), plus
+  `.swarm-code.json`. Matching is case-insensitive (macOS filesystems are).
+  `SWARM_CODE_UNSAFE_WRITES=1` lifts these guards.
 - **Restricted contexts.** Subagents, MCP-server, and council-panel contexts run
   under narrowed, often read-only, tool policies.
 - **Secret redaction.** Known secret patterns are redacted from session logs and

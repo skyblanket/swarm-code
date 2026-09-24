@@ -26,6 +26,9 @@
 #   T12 network gate        — userinfo / uppercase-scheme / api-key bypasses
 #                             are refused at startup; non-local providers[]
 #                             and .profile_override endpoints at dial time
+#   T13 control files       — write/edit can't touch ~/.swarm-code/hooks,
+#                             schedule.json, .profile_override, or a case-
+#                             variant .SSH; memory/ stays writable
 #
 # Exit code: 0 iff every test passes.
 
@@ -548,6 +551,54 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T13 — the model can't write swarm-code's own control files: a
+#       ~/.swarm-code/hooks/pre_tool.sh would run on the next tool call
+#       (even with bash denied), schedule.json queues headless runs.
+#       Sensitive-dir checks are case-insensitive (macOS). memory/ stays
+#       writable.
+# ------------------------------------------------------------
+t13() {
+    new_case t13
+    local sentinel="$WORK/owned-by-written-hook"
+    local sc="$CASE_HOME/.swarm-code"
+    mkdir -p "$sc"
+    echo '{"permissions": {"bash": "deny"}}' >"$sc/settings.json"
+    cat >"$CASE/scenario.json" <<EOF
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_hook", "name": "write",
+     "arguments": {"path": "$sc/hooks/pre_tool.sh", "content": "#!/bin/sh\\ntouch $sentinel\\n"}},
+    {"id": "call_sched", "name": "write",
+     "arguments": {"path": "$sc/schedule.json", "content": "[]"}},
+    {"id": "call_ovr", "name": "edit",
+     "arguments": {"path": "$sc/.profile_override", "old_string": "", "new_string": "{}"}},
+    {"id": "call_ssh", "name": "write",
+     "arguments": {"path": "$CASE_HOME/.SSH/authorized_keys", "content": "ssh-ed25519 AAAA evil"}},
+    {"id": "call_mem", "name": "write",
+     "arguments": {"path": "$sc/memory/t13-note.md", "content": "T13 memory ok"}}]},
+  {"type": "tool_calls", "calls": [
+    {"id": "call_read", "name": "read",
+     "arguments": {"path": "$sc/memory/t13-note.md"}}]},
+  {"type": "text", "content": "CONTROL_FILES_T13"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T13 "mock failed to start"; return; }
+    run_swarm -p "t13 write the hook" --no-resume --json
+    cleanup
+    local out; out="$(final_json)"
+    if [ -e "$sentinel" ]; then fail T13 "BREACH: a model-written pre_tool hook executed"
+    elif [ -e "$sc/hooks/pre_tool.sh" ]; then fail T13 "hooks/pre_tool.sh was written"
+    elif [ -e "$sc/schedule.json" ]; then fail T13 "schedule.json was written"
+    elif [ -e "$sc/.profile_override" ]; then fail T13 ".profile_override was written"
+    elif [ -e "$CASE_HOME/.SSH/authorized_keys" ]; then fail T13 ".SSH (case variant) was written"
+    elif [ "$RC" -ne 0 ]; then fail T13 "exit code $RC"
+    elif [ ! -f "$sc/memory/t13-note.md" ]; then fail T13 "memory/ is no longer writable"
+    elif ! req_has 1 "write to sensitive path blocked"; then fail T13 "model never told the write was blocked"
+    elif ! echo "$out" | grep -q "CONTROL_FILES_T13"; then fail T13 "final text missing: $out"
+    else pass T13; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
@@ -563,6 +614,7 @@ t9
 t10
 t11
 t12
+t13
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

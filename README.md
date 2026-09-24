@@ -122,6 +122,7 @@ swarm-code runs shell commands, reads and writes files, and can reach the networ
 
 - **Local-network-only by default**; remote endpoints require an explicit `SWARM_CODE_ALLOW_REMOTE=1`.
 - A cloned repo's `./.swarm-code.json` cannot run hooks, start MCP servers, redirect the endpoint/key, or loosen permissions unless you add the directory to `trusted_projects`.
+- The `write`/`edit` tools refuse swarm-code's own control files (`~/.swarm-code/` hooks, schedule, settings, sessions, profile override; `.swarm-code.json`) — only `~/.swarm-code/memory/` and `skills/` are writable — and credential dirs (`.ssh`, `.aws`, `.gnupg`, …) case-insensitively.
 - Every tool runs through one **`ToolExecutor` policy boundary** — context allow-lists, argument-rewriting hooks, guardrails, and permissions — *before* any raw handler executes, and **fails closed** on a missing or unknown execution context.
 - A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd`, fork bombs, …) cannot be bypassed by environment overrides.
 - Subagents, MCP, and council contexts run under restricted (often read-only) policies.
