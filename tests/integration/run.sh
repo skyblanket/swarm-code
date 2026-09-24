@@ -33,6 +33,13 @@
 #                             denied headless unless HEADLESS_APPROVE=1
 #   T15 request-body dump   — never to /tmp; only SWARM_CODE_DEBUG=1, 0600
 #   A*  agents/MCP/scheduler — see tests/integration/agents_cases.sh
+#   T16 grep without a path — MCP server's stdin (the JSON-RPC stream) is never
+#                             read by a tool subprocess; the next request survives
+#   T17 command-tool gate   — `background` gets the same hardline gate as bash
+#                             (denial names the pattern); a command merely
+#                             MENTIONING reboot/halt still runs
+#
+# INTEG_ONLY="t4 t11" runs just those tests (default: all).
 #
 # Exit code: 0 iff every test passes.
 
@@ -555,6 +562,65 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T16 — grep with no `path` in MCP server mode: rg used to be run with no
+#       path and inherited stdin, so it searched the JSON-RPC stream —
+#       blocking until the client closed it and swallowing the NEXT request.
+# ------------------------------------------------------------
+t16() {
+    new_case t16
+    printf 'needle-t11 here\n' >"$WORK/a.txt"
+    local req1 req2
+    req1='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grep","arguments":{"pattern":"needle-t11"}}}'
+    req2="{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":{\"path\":\"$WORK/a.txt\"}}}"
+    (
+        cd "$WORK" || exit 97
+        { printf '%s\n' "$req1"; sleep 1; printf '%s\n' "$req2"; sleep 2; } |
+            HOME="$CASE_HOME" perl -e 'alarm 40; exec @ARGV' "$BIN" --mcp-server \
+            >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
+    )
+    RC=$?
+    if [ "$RC" -ne 0 ]; then fail T16 "MCP server exit code $RC"
+    elif ! grep -q '"id":1' "$CASE/stdout.txt"; then fail T16 "no response to the grep request"
+    elif ! grep '"id":1' "$CASE/stdout.txt" | grep -q 'a.txt:1:needle-t11'; then
+        fail T16 "grep searched the wrong input: $(grep '"id":1' "$CASE/stdout.txt" | head -c 300)"
+    elif ! grep -q '"id":2' "$CASE/stdout.txt"; then fail T16 "the second JSON-RPC request was swallowed"
+    else pass T16; fi
+}
+
+# ------------------------------------------------------------
+# T17 — every command-running tool shares the classifier: `background`
+#       used to run a hardline command ungated. And the classifier is
+#       token-aware: words inside quoted args / grep patterns don't trip it.
+# ------------------------------------------------------------
+t17() {
+    new_case t17
+    local sentinel="$WORK/owned-by-background"
+    cat >"$CASE/scenario.json" <<EOF
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_bg", "name": "background",
+     "arguments": {"command": "mkfs.ext4 -n /dev/null; touch $sentinel"}}]},
+  {"type": "tool_calls", "calls": [
+    {"id": "call_fp", "name": "bash",
+     "arguments": {"command": "echo reboot required; grep -c 'shutdown now' /dev/null; echo fp-ran-t12"}}]},
+  {"type": "text", "content": "GATE_ACK_T17"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T17 "mock failed to start"; return; }
+    run_swarm -p "clean up" --no-resume --json
+    cleanup
+    sleep 1
+    local out; out="$(final_json)"
+    if [ -e "$sentinel" ]; then fail T17 "HARDLINE BREACH: background command executed"
+    elif [ "$RC" -ne 0 ]; then fail T17 "exit code $RC"
+    elif ! req_has 1 "permission denied"; then fail T17 "background call was not denied"
+    elif ! req_has 1 "hardline"; then fail T17 "denial does not name the reason"
+    elif ! req_has 2 "fp-ran-t12"; then fail T17 "false positive: a command mentioning reboot/halt was blocked"
+    elif ! echo "$out" | grep -q "GATE_ACK_T17"; then fail T17 "final text missing: $out"
+    else pass T17; fi
+}
+
+# ------------------------------------------------------------
 # T13 — the model can't write swarm-code's own control files: a
 #       ~/.swarm-code/hooks/pre_tool.sh would run on the next tool call
 #       (even with bash denied), schedule.json queues headless runs.
@@ -701,22 +767,9 @@ EOF
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
-t1
-t2
-t3
-t4
-t5
-t6
-t7
-t8
-t9
-t10
-t11
-t12
-t13
-t14
-t15
-agents_cases
+for t in ${INTEG_ONLY:-t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 agents_cases}; do
+    "$t"
+done
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

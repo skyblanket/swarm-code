@@ -98,7 +98,9 @@ fun prepare(name, args, opts) {
         } else {
             filesystem_hook = Hooks.run_pre_tool(name, args, opts)
             if (map_get(filesystem_hook, 'veto') == 'true') {
-                failed("tool '" ++ to_string(name) ++ "' blocked by pre_tool hook")
+                why = map_get(filesystem_hook, 'reason')
+                detail = if (why == nil) { "" } else { " — " ++ to_string(why) }
+                failed("tool '" ++ to_string(name) ++ "' blocked by pre_tool hook" ++ detail)
             } else {
                 # Hooks may rewrite arguments, so every safety decision below
                 # must inspect the effective arguments, never the originals.
@@ -108,9 +110,10 @@ fun prepare(name, args, opts) {
                 if (guard != 'ok') {
                     failed(to_string(guard))
                 } else {
-                    configured_hook = Config.run_hooks("PreToolUse", name, args_raw, opts)
-                    if (configured_hook == 'block') {
-                        failed("tool '" ++ to_string(name) ++ "' blocked by PreToolUse hook")
+                    configured_hook = Config.run_hooks_verdict("PreToolUse", name, args_raw, opts)
+                    if (configured_hook != 'ok') {
+                        failed("tool '" ++ to_string(name) ++ "' blocked by PreToolUse hook — " ++
+                               to_string(elem(configured_hook, 1)))
                     } else {
                         %{ok: 'true', args: effective}
                     }
@@ -151,10 +154,12 @@ fun permission_gate(name, args, opts) {
     decision = Config.check_permission(name, args, opts)
     if (decision == 'allow') { 'ok' }
     else { if (decision == 'deny') {
-        "error: permission denied for tool '" ++ to_string(name) ++ "'"
+        Config.denial_message(name, args, opts)
     } else {
+        risk = Config.command_risk(name, args)
+        why = if (elem(risk, 0) == 'dangerous') { " — flagged dangerous: " ++ elem(risk, 1) } else { "" }
         "error: tool '" ++ to_string(name) ++
-        "' requires interactive permission in this execution context"
+        "' requires interactive permission in this execution context" ++ why
     }}
 }
 

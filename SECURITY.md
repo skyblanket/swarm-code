@@ -45,7 +45,11 @@ backported.
   (`/flows` children still hard-deny dangerous commands).
 - **Hardline command blocklist.** Destructive commands (`rm -rf /`, `mkfs`, `dd`
   to a device, fork bombs, and similar) are blocked and **cannot be bypassed by
-  environment overrides**.
+  environment overrides**. The check covers every tool that runs a shell
+  command (`bash`, `background`, `bg_server`, `run_tests`) and parses the
+  command like `sh` (quotes, separators, `$(…)`, `sh -c`, wrappers such as
+  `sudo`/`env`/`xargs`), so respellings are caught; it is a floor against
+  accidents, not a sandbox — a command assembled at runtime can't be judged.
 - **Protected paths.** The `write` / `edit` / `multi_edit` tools refuse
   credential locations (`.ssh`, `.gnupg`, `.aws`, `/etc`, …) and swarm-code's
   own control files — everything under `~/.swarm-code/` except the `memory/`

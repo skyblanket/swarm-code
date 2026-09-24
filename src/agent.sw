@@ -3060,18 +3060,21 @@ fun resolve_permission(name, args, opts) {
 # one can approve it, so name the opt-in; a hardline / configured 'deny'
 # keeps the plain message (no opt-in exists for those).
 fun permission_denial(name_atom, name_str, args, opts) {
-    base = "error: permission denied for tool '" ++ name_str ++ "'"
     if (map_get(opts, 'headless') == 'true' &&
         Config.check_permission(name_atom, args, opts) == 'ask') {
-        how = if (name_atom == 'bash' && Config.is_dangerous_bash(args) == 'true') {
+        risk = Config.command_risk(name_atom, args)
+        dangerous = if (elem(risk, 0) == 'dangerous') { 'true' } else { 'false' }
+        what = if (dangerous == 'true') { " — flagged dangerous: " ++ to_string(elem(risk, 1)) } else { "" }
+        how = if (dangerous == 'true') {
             "run headless with SWARM_CODE_HEADLESS_APPROVE=1"
         } else {
             "run headless with SWARM_CODE_HEADLESS_APPROVE=1, or set \"" ++ name_str ++
             "\": \"allow\" under permissions in ~/.swarm-code/settings.json"
         }
-        base ++ " — it needs approval and headless mode has no one to ask. " ++
+        "error: permission denied for tool '" ++ name_str ++ "'" ++ what ++
+        " — it needs approval and headless mode has no one to ask. " ++
         "To allow such calls unattended, the user can " ++ how
-    } else { base }
+    } else { Config.denial_message(name_str, args, opts) }
 }
 
 fun ask_via_reader(name, opts, table, cache_key) {

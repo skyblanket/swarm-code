@@ -30,6 +30,7 @@ import Mcp
 import Util
 import TestRunner
 import PathGuard
+import CommandGuard
 
 export [exec_raw, max_output_bytes]
 
@@ -39,7 +40,7 @@ export [exec_raw, max_output_bytes]
 # turn). Each tool now gets a cap tuned to its role, mirroring claude-code's
 # per-tool limits. truncate_output keeps HEAD+TAIL so the failing tail of a
 # log survives the cut. max_output_bytes() stays as the conservative default
-# (and the read_ceiling base) for any caller without a dedicated cap.
+# for any caller without a dedicated cap.
 fun max_output_bytes() { 6000 }
 fun bash_output_cap() { 24000 }
 fun run_tests_raw_cap() { 16000 }
@@ -143,7 +144,9 @@ fun all_tools() {
 # removed: it only SIGALRM'd the direct child (leaking grandchildren) and left
 # swarmrt's shell() polling for an exit file that never arrived → a multi-minute
 # wedge. These constants supply the per-tool budgets in SECONDS; callers pass
-# `* 1000` to shell_managed. Timeouts mirror Claude Code:
+# `* 1000` to shell_managed. Helper pipelines go through run_sh (stdin from
+# /dev/null — a child must never read the terminal or the MCP server's
+# JSON-RPC stream); bash runs Util.noninteractive_wrap. Timeouts mirror Claude Code:
 #   bash:       120s default, 600s max, overridable via timeout_ms arg
 #   git/search: 30s · web_fetch: 45s · read-probes: 5s
 # ------------------------------------------------------------
@@ -288,16 +291,9 @@ fun do_bash(args, opts) {
     if (cmd == nil) {
         "error: missing 'command' argument"
     } else {
-        # Sudo guard — outright block unless explicitly enabled. The
-        # model has no safe way to enter a sudo password, and the
-        # ambient setuid escalation risk is too high to gate behind
-        # only a prompt (which is_dangerous_bash already does).
-        # Set SWARM_CODE_ALLOW_SUDO=1 to opt back in.
         cmd_s = to_string(cmd)
-        sudo_allowed = getenv("SWARM_CODE_ALLOW_SUDO")
-        if (string_contains(cmd_s, "sudo ") == 'true' && sudo_allowed != "1") {
-            "error: sudo is disabled — set SWARM_CODE_ALLOW_SUDO=1 to enable (acknowledge that an agent running sudo is high-risk)"
-        }
+        refusal = sudo_refusal(cmd_s)
+        if (refusal != nil) { refusal }
         else {
             bg_table = map_get(opts, 'bg_table')
             run_bg = bash_run_in_background(args)
@@ -319,6 +315,20 @@ fun do_bash(args, opts) {
             }
         }
     }
+}
+
+# Sudo guard — outright block unless explicitly enabled. The model has no
+# safe way to enter a sudo password, and the ambient setuid escalation risk
+# is too high to gate behind only a prompt (which the dangerous-command gate
+# already does). Token-aware (CommandGuard: `sudo<TAB>ls`, `env sudo …`,
+# `$(sudo …)` all count; the word "sudo" inside an echo'd string doesn't),
+# and applied to every command-running tool, not just bash.
+# Set SWARM_CODE_ALLOW_SUDO=1 to opt back in. Returns nil or the error.
+fun sudo_refusal(cmd_s) {
+    if (getenv("SWARM_CODE_ALLOW_SUDO") == "1") { nil }
+    else { if (CommandGuard.uses_sudo(cmd_s) == 'true') {
+        "error: sudo is disabled — set SWARM_CODE_ALLOW_SUDO=1 to enable (acknowledge that an agent running sudo is high-risk)"
+    } else { nil }}
 }
 
 # Classic blocking path: run under shell_managed with the resolved timeout.
@@ -376,12 +386,12 @@ fun bash_label(cmd_s) {
 
 # Explicit detach — launch and return a task id immediately, no wait.
 fun bash_launch_bg(bg_table, cmd_s) {
-    id = Background.launch(bg_table, cmd_s, bash_label(cmd_s))
+    id = Background.launch_cmd(bg_table, noninteractive_wrap(cmd_s), cmd_s, bash_label(cmd_s))
     # launch returns an "error: ..." STRING if shell_detached failed — surface
     # it directly instead of treating the error string as a task id.
     if (string_starts_with(to_string(id), "error") == 'true') { id }
     else {
-        "[backgrounded] task " ++ id ++ " — log: " ++ Background.log_path_for(id) ++
+        "[backgrounded] task " ++ id ++ " — log: " ++ Background.log_path_for(bg_table, id) ++
             "\n(bg_tail / bg_result / bg_kill to manage; you'll get a bg_done wake when it finishes)"
     }
 }
@@ -391,7 +401,9 @@ fun bash_launch_bg(bg_table, cmd_s) {
 # foreground contract), ESC (kill the whole pgroup, return partial tail),
 # or budget exhausted (leave it running so the heartbeat's bg_done fires).
 fun bash_auto_bg(bg_table, cmd_s, after_ms) {
-    id = Background.launch(bg_table, cmd_s, bash_label(cmd_s))
+    # Same wrapped script as the foreground path, so a command behaves the
+    # same whichever way it ends up running (CI=1 env, comments, heredocs).
+    id = Background.launch_cmd(bg_table, noninteractive_wrap(cmd_s), cmd_s, bash_label(cmd_s))
     # launch returns an "error: ..." STRING if shell_detached failed — surface
     # it directly (no task exists to wait on, claim, or release).
     if (string_starts_with(to_string(id), "error") == 'true') { id }
@@ -412,7 +424,7 @@ fun bash_auto_bg(bg_table, cmd_s, after_ms) {
                 # Budget exhausted → hand off to the heartbeat: release the claim
                 # so poll_loop can finalize it and fire bg_done on completion.
                 Background.fg_release(bg_table, id)
-                path = Background.log_path_for(id)
+                path = Background.log_path_for(bg_table, id)
                 "[backgrounded after " ++ to_string(after_ms / 1000) ++ "s] still running — task " ++
                     id ++ ", log: " ++ path ++ "\n\nlast output:\n" ++
                     Background.tail_log(bg_table, id, 20) ++
@@ -475,18 +487,16 @@ fun drain_stdin_keys() {
     }}
 }
 
-# Wrap a user command in a subshell that:
-#   - exports CI=1 and friends BEFORE the command runs (so every
-#     child process, including npm/cargo/pip subcommands, sees them)
-#   - redirects stdin from /dev/null (closes the tty ghost)
-#   - merges stderr into stdout for capture
-# Applied before the timeout wrapper so the alarm covers the whole
-# pipeline including the `export` setup.
+# Wrap a user command so that it:
+#   - runs with CI=1 and friends exported (so every child process,
+#     including npm/cargo/pip subcommands, sees them)
+#   - reads stdin from /dev/null (closes the tty ghost)
+#   - merges stderr into stdout for capture — INCLUDING sh's own syntax
+#     errors, so the model sees why a command didn't parse
+# The command goes in on its own lines (see Util.noninteractive_wrap), so a
+# trailing `# comment` or a final heredoc terminator can't eat the wrapper.
 fun noninteractive_wrap(user_cmd) {
-    "( export CI=1 DEBIAN_FRONTEND=noninteractive NO_COLOR=1 FORCE_COLOR=0 " ++
-    "NPM_CONFIG_YES=true PIP_DISABLE_PIP_VERSION_CHECK=1 " ++
-    "PYTHONUNBUFFERED=1; " ++
-    user_cmd ++ " ) </dev/null 2>&1"
+    Util.noninteractive_wrap(user_cmd)
 }
 
 fun bash_max_lines() { 100 }
@@ -500,8 +510,12 @@ fun do_read(args) {
     # limit is max lines to return. Both optional; defaults match CC.
     offset_raw = map_get(args, 'offset')
     limit_raw = map_get(args, 'limit')
-    offset = if (offset_raw == nil) { 1 } else { to_int(offset_raw) }
-    limit = if (limit_raw == nil) { 2000 } else { to_int(limit_raw) }
+    # parse_int_safe, not to_int: the to_int BUILTIN returns nil for junk
+    # like "abc", which then leaked into the line numbers as "nil".
+    offset_n = if (offset_raw == nil) { 1 } else { parse_int_safe(to_string(offset_raw), 1) }
+    limit_n = if (limit_raw == nil) { 2000 } else { parse_int_safe(to_string(limit_raw), 2000) }
+    offset = if (offset_n < 1) { 1 } else { offset_n }
+    limit = if (limit_n < 1) { 2000 } else { limit_n }
     if (p == nil) {
         "error: missing 'path' argument"
     } else {
@@ -521,7 +535,7 @@ fun read_file_capped(path, offset, limit) {
     # and `head -c` would all hang, freezing the tool worker. Refuse before
     # touching the path. Every probe below is also timeout-guarded as a
     # backstop (a path on a dead NFS mount can hang even `test`).
-    rf_r = shell_managed(
+    rf_r = run_sh(
         "if test -f " ++ pq ++ "; then echo reg; elif test -e " ++ pq ++
         "; then echo nonreg; else echo missing; fi", read_probe_timeout_s() * 1000)
     rf = string_trim(elem(rf_r, 1))
@@ -543,35 +557,37 @@ fun read_file_capped(path, offset, limit) {
         # in the first 8KB (git's heuristic). MIME types misclassify text —
         # libmagic reports .js/.ts as application/javascript — and `file` is
         # missing from many slim container images.
-        nul_r = shell_managed("head -c 8192 " ++ pq ++ " | tr -dc '\\000' | wc -c",
+        nul_r = run_sh("head -c 8192 " ++ pq ++ " | tr -dc '\\000' | wc -c",
                               read_probe_timeout_s() * 1000)
         nul_count = parse_int_safe(string_trim(elem(nul_r, 1)), 0)
         if (nul_count == 0) {
-            # Size guard: file_read() pulls the WHOLE file into memory, so a
-            # multi-GB file would OOM the VM before truncate_output ever runs.
-            # Stat first; for anything large, read only a capped head via
-            # `head -c` instead of slurping the whole thing.
-            size_str = string_trim(elem(shell_managed("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
-            size = parse_int_safe(size_str, 0)
-            read_ceiling = read_output_cap()
-            content = if (size == 0) { "" } else { if (size > read_ceiling) {
-                head = elem(shell_managed("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
-                head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
-                to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
-            } else {
-                file_read(path)
-            } }
-            if (content == nil) {
-                "error: could not read " ++ path
-            } else { if (size == 0) {
+            # Size guard: file_read() pulls the WHOLE file into memory (and
+            # refuses anything over 1MB), so only files within that cap are
+            # read in-process. Bigger ones are windowed by LINE with sed —
+            # the old code loaded just `head -c 65000` and THEN applied
+            # offset/limit, so offset 15000 of a 20,000-line file came back
+            # empty with no marker. Either way the OUTPUT is capped.
+            st = file_stat(to_string(path))
+            size = if (st == nil) { 0 } else { map_get(st, 'size') }
+            if (size == 0) {
                 "[empty file] " ++ to_string(path) ++ " exists but has no content."
+            } else { if (size <= file_read_cap()) {
+                content = file_read(path)
+                if (content == nil) {
+                    "error: could not read " ++ path
+                } else { if (string_length(content) != size) {
+                    # A NUL byte past the first 8KB: file_read stopped at it.
+                    read_window_streamed(path, pq, offset, limit,
+                        "\n[note: this file contains NUL bytes after the first 8KB; they are not shown]")
+                } else {
+                    read_window_from_content(path, content, offset, limit)
+                }}
             } else {
-                sliced = slice_lines(content, offset, limit)
-                truncate_output(sliced, read_output_cap())
-            } }
+                read_window_streamed(path, pq, offset, limit, "")
+            }}
         } else {
             # Best-effort label; `file` may not be installed.
-            ft_r = shell_managed("file --brief --mime-type " ++ pq ++ " 2>/dev/null",
+            ft_r = run_sh("file --brief --mime-type " ++ pq ++ " 2>/dev/null",
                                  read_probe_timeout_s() * 1000)
             ft = string_trim(to_string(elem(ft_r, 1)))
             label = if (string_length(ft) == 0) { "binary" } else { "binary, " ++ ft }
@@ -585,15 +601,11 @@ fun read_file_capped(path, offset, limit) {
     } } }
 }
 
-# Slice [offset, offset+limit) lines from content (1-based offset) and
-# prefix each line with its 1-based file line number + a tab — `N\t<content>`,
-# the cat -n shape claude-code's Read emits. The schema PROMISED line numbers
-# (the edit/multi_edit prose tells the model to strip the leading number+tab
-# before using a line as old_string); previously the body returned raw content
-# with no anchors, so the model dropped to `od -c` to count offsets. The line
-# number is the ABSOLUTE file line (start + position-in-window + 1), so anchors
-# stay correct even when reading a windowed slice with offset > 1.
-fun slice_lines(content, offset, limit) {
+# file_read's in-process cap (the runtime returns nil above it).
+fun file_read_cap() { 1048576 }
+
+# Window [offset, offset+limit) of an in-memory file (1-based offset).
+fun read_window_from_content(path, content, offset, limit) {
     parts = string_split(content, "\n")
     # A final newline ends the last line; it doesn't start an empty one
     # (a 6-line file used to read back as 7 lines).
@@ -601,25 +613,86 @@ fun slice_lines(content, offset, limit) {
         take_first_lines(parts, length(parts) - 1, [])
     } else { parts }
     total = length(lines)
-    start = if (offset < 1) { 0 } else { offset - 1 }
-    if (start >= total) {
-        ""
-    } else {
-        window = take_first_lines(drop_first_n(lines, start), limit, [])
-        number_lines(window, start + 1, "")
+    if (offset > total) { read_past_eof(path, offset, total) }
+    else {
+        window = take_first_lines(drop_first_n(lines, offset - 1), limit, [])
+        render_read_window(window, offset, total)
     }
 }
 
-# Join lines, each prefixed with `<lineno>\t`. lineno is the 1-based file line
-# number of the FIRST window line; it increments per line. Matches cat -n /
-# claude-code Read so the model has stable anchors for edit old_strings.
-fun number_lines(lst, lineno, acc) {
-    if (length(lst) == 0) { acc }
+# Window of a big file, selected by line number with sed (bounded: sed quits
+# after the last wanted line, head -c caps the bytes). The first output line
+# is the file's line count (wc -l, +1 when the last line has no newline).
+fun read_window_streamed(path, pq, offset, limit, note) {
+    last = offset + limit - 1
+    cmd = "n=$(wc -l < " ++ pq ++ "); [ -n \"$(tail -c 1 " ++ pq ++ ")\" ] && n=$((n+1)); echo \"$n\"; " ++
+          "sed -n '" ++ to_string(offset) ++ "," ++ to_string(last) ++ "p;" ++ to_string(last) ++ "q' " ++ pq ++
+          " | head -c " ++ to_string(read_output_cap() + 1)
+    r = run_sh(cmd, search_timeout_s() * 1000)
+    if (elem(r, 2) == 'true') {
+        "error: read of " ++ to_string(path) ++ " timed out after " ++ to_string(search_timeout_s()) ++
+        "s (a very large file?) — use bash with sed -n 'A,Bp' for a specific range."
+    } else {
+        out = elem(r, 1)
+        nl = string_index_of(out, "\n")
+        total = if (nl < 0) { parse_int_safe(string_trim(out), 0) } else { parse_int_safe(string_trim(string_sub(out, 0, nl)), 0) }
+        body = if (nl < 0) { "" } else { string_sub(out, nl + 1, string_length(out) - nl - 1) }
+        if (offset > total) { read_past_eof(path, offset, total) }
+        else {
+            parts = string_split(body, "\n")
+            lines = if (string_ends_with(body, "\n") == 'true' && length(parts) > 1) {
+                take_first_lines(parts, length(parts) - 1, [])
+            } else { parts }
+            render_read_window(lines, offset, total) ++ note
+        }
+    }
+}
+
+fun read_past_eof(path, offset, total) {
+    "error: offset " ++ to_string(offset) ++ " is past the end of " ++ to_string(path) ++
+    " (" ++ to_string(total) ++ " lines) — use a smaller offset."
+}
+
+# Prefix each window line with its 1-based file line number + a tab —
+# `N\t<content>`, the cat -n shape claude-code's Read emits (the edit /
+# multi_edit prose tells the model to strip it before using a line as
+# old_string). Numbers are ABSOLUTE file lines, so anchors stay right for a
+# windowed read. The output is capped at read_output_cap() on a LINE
+# boundary, and every cut says where to continue:
+#   [output capped at N bytes — lines A-K of T shown; continue with offset=K+1]
+#   [lines A-B of T shown — continue with offset=B+1]      (limit reached)
+fun render_read_window(window, start, total) {
+    r = cap_numbered_lines(window, start, read_output_cap(), [], 0)
+    parts = elem(r, 0)
+    last = elem(r, 1)
+    capped = elem(r, 2)
+    body = Util.join_all(parts)
+    shown = to_string(start) ++ "-" ++ to_string(last) ++ " of " ++ to_string(total)
+    if (capped == 'true') {
+        body ++ "\n[output capped at " ++ to_string(read_output_cap()) ++ " bytes — lines " ++ shown ++
+        " shown; continue with offset=" ++ to_string(last + 1) ++ "]"
+    } else { if (last < total) {
+        body ++ "\n[lines " ++ shown ++ " shown — continue with offset=" ++ to_string(last + 1) ++ "]"
+    } else { body }}
+}
+
+# → {parts, last_line_number_included, capped}. A single line longer than
+# the whole budget is cut (and flagged) rather than dropped.
+fun cap_numbered_lines(lines, lineno, budget, acc, used) {
+    if (length(lines) == 0) { {acc, lineno - 1, 'false'} }
     else {
-        h = hd(lst)
-        sep = if (string_length(acc) == 0) { "" } else { "\n" }
-        line = to_string(lineno) ++ "\t" ++ h
-        number_lines(tl(lst), lineno + 1, acc ++ sep ++ line)
+        piece = to_string(lineno) ++ "\t" ++ hd(lines)
+        sep = if (length(acc) == 0) { "" } else { "\n" }
+        need = used + string_length(sep) + string_length(piece)
+        if (need > budget) {
+            if (length(acc) == 0) {
+                {[string_sub(piece, 0, budget) ++ "…[line " ++ to_string(lineno) ++ " is " ++
+                  to_string(string_length(hd(lines))) ++ " bytes — cut here; use bash (cut -c / head -c) for the rest]"],
+                 lineno, 'true'}
+            } else { {acc, lineno - 1, 'true'} }
+        } else {
+            cap_numbered_lines(tl(lines), lineno + 1, budget, list_append(acc, sep ++ piece), need)
+        }
     }
 }
 
@@ -686,7 +759,7 @@ fun do_write(args, opts) {
                 # so the caller can show a real overwrite diff. Display-only
                 # (headless suppresses the render). Skipped for files ≥64KB —
                 # a large paste isn't worth diffing in the preview.
-                capture_write_prior(opts, to_string(path))
+                capture_write_prior(opts, to_string(raw_path_arg(args)), to_string(path))
                 ensure_parent_dirs(to_string(path))
                 rc = file_write(path, content)
                 if (rc == 'ok') {
@@ -700,28 +773,32 @@ fun do_write(args, opts) {
 }
 
 # Stash an about-to-be-overwritten file's prior content into the
-# 'write_diff_table' ETS (keyed by the raw path arg, matching
-# resolve_path_key in agent.sw), so show_edit_diff can render a real
+# 'write_diff_table' ETS (keyed by the RAW path arg, matching
+# resolve_path_key in agent.sw — `path` is the ~-expanded file), so show_edit_diff can render a real
 # overwrite diff. No table (subagent / test opts) → no-op. Only for an
 # existing file under 64KB; a fresh create or a huge blob is left alone.
-fun capture_write_prior(opts, path) {
+fun capture_write_prior(opts, key, path) {
     wd = if (opts == nil) { nil } else { map_get(opts, 'write_diff_table') }
     if (wd == nil) { 'ok' }
     else {
         if (file_exists(path) == 'true') {
             prior = file_read(path)
-            if (prior != nil && string_length(prior) < 65536) {
-                ets_put(wd, path, prior)
+            # file_read stops at a NUL byte: a length that disagrees with the
+            # on-disk size means binary content — no (bogus) diff for that.
+            st = file_stat(path)
+            disk = if (st == nil) { 0 - 1 } else { map_get(st, 'size') }
+            if (prior != nil && string_length(prior) < 65536 && string_length(prior) == disk) {
+                ets_put(wd, key, prior)
             } else {
                 # ≥64KB (or unreadable): clear any stale prior from an
                 # earlier write to the same path so show_edit_diff doesn't
                 # render a bogus diff against outdated content.
-                ets_delete(wd, path)
+                ets_delete(wd, key)
             }
         } else {
             # Fresh create: same stale-entry guard (the path may have been
             # written before, then deleted out-of-band).
-            ets_delete(wd, path)
+            ets_delete(wd, key)
         }
     }
 }
@@ -776,11 +853,46 @@ fun do_edit_impl(path, old_s, new_s, replace_all) {
     else { do_edit_impl_inner(path, old_s, new_s, replace_all) }
 }
 
+# Load a file for edit / multi_edit → {'ok', content} | {'missing', nil} |
+# {'error', message}. file_read is C-string based with a 1MB cap: it stops at
+# the first NUL byte (an edit then wrote back the truncated prefix and said
+# "ok") and returns nil above 1MB (edit then took the file for MISSING, so
+# old_string="" overwrote it with new_string). Comparing the loaded length
+# with the on-disk size catches both — the whole file, not just a prefix.
+fun load_for_edit(path) {
+    p = to_string(path)
+    st = file_stat(p)
+    if (st == nil) { {'missing', nil} }
+    else { if (map_get(st, 'is_dir') == 'true') { {'error', "error: " ++ p ++ " is a directory"} }
+    else {
+        size = map_get(st, 'size')
+        if (size == 0) { {'ok', ""} }
+        else { if (size > file_read_cap()) {
+            {'error', "error: " ++ p ++ " is " ++ to_string(size) ++ " bytes — too large to edit safely " ++
+                      "(edit/multi_edit handle files up to 1MB). Use bash (sed -i, python) for this file."}
+        } else {
+            c = file_read(p)
+            if (c == nil) { {'error', "error: could not read " ++ p} }
+            else { if (string_length(c) != size) {
+                {'error', "error: " ++ p ++ " contains NUL bytes (binary data) — edit works on text and would " ++
+                          "truncate it at the first NUL. The file was not modified; use bash/python for binary files."}
+            } else { {'ok', c} }}
+        }}
+    }}
+}
+
 fun do_edit_impl_inner(path, old_s, new_s, replace_all) {
-    original = file_read(path)
+    loaded = load_for_edit(path)
+    if (elem(loaded, 0) == 'error') { elem(loaded, 1) }
+    else { do_edit_loaded(path, elem(loaded, 1), old_s, new_s, replace_all) }
+}
+
+fun do_edit_loaded(path, original, old_s, new_s, replace_all) {
     if (original == nil) {
         # Missing file. Empty old_string = create it with new_string.
         if (string_length(old_s) == 0) {
+            # Same as write: create missing parent directories first.
+            ensure_parent_dirs(to_string(path))
             rc_c = file_write(path, new_s)
             if (rc_c == 'ok') {
                 "ok: created " ++ path ++ " (" ++ to_string(string_length(new_s)) ++ " bytes)"
@@ -950,20 +1062,14 @@ fun join_chars(lst, acc) {
 # ------------------------------------------------------------
 fun do_glob(args) {
     pattern = map_get(args, 'pattern')
-    path = map_get(args, 'path')
+    path = opt_path_arg(args, 'path')
     if (pattern == nil) {
         "error: missing 'pattern'"
     } else {
-        base = if (path == nil) { "." } else { to_string(path) }
+        base = if (path == nil || string_length(string_trim(to_string(path))) == 0) { "." }
+               else { to_string(path) }
         pat = to_string(pattern)
         pat_q = Util.shell_q(pat)
-        # When base is ".", DON'T pass it to rg — `rg --files . ` emits
-        # `./`-prefixed paths, and an anchored glob like `src/**/*.sw`
-        # never matches `./src/...`. With no path arg rg emits clean
-        # relative paths and anchored globs work.
-        base_part = if (base == "." || string_length(string_trim(base)) == 0) {
-            ""
-        } else { " " ++ Util.shell_q(base) }
         base_q = Util.shell_q(base)
         # ripgrep `--files -g` gives real glob semantics, but rg is
         # often unavailable to a plain /bin/sh (e.g. when it's only a
@@ -985,20 +1091,29 @@ fun do_glob(args) {
         } else {
             "-name " ++ Util.shell_q(pat_find)
         }
-        # Pipe through `sed s|^\./||` to strip the `./` prefix `find`
-        # adds when invoked with `.` — matches ripgrep's clean output
-        # so downstream tools (Read) get the same path either way.
+        # The search root is ALWAYS passed explicitly (`.` by default): rg
+        # with no path searches its STDIN whenever stdin isn't a tty. Both
+        # rg and find then print `./`-prefixed paths for `.`, so one
+        # `sed s|^\./||` gives clean relative paths either way (anchored
+        # globs like `src/**/*.sw` still match — rg globs are relative to
+        # the search root). stderr (a bad glob) goes to a private file and
+        # is reported, instead of leaking onto the user's terminal.
+        errf = search_errfile()
         cmd = "if command -v rg >/dev/null 2>&1; then " ++
-              "rg --files --hidden --no-messages -g " ++ pat_q ++ base_part ++ "; " ++
-              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null | sed 's|^\\./||'; fi | head -n 101"
-        result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
-        code = elem(result, 0)
+              "rg --files --hidden --no-messages -g " ++ pat_q ++ " " ++ base_q ++ "; " ++
+              "else find " ++ base_q ++ " -type f " ++ find_expr ++ " 2>/dev/null; fi 2>" ++ errfile_redirect(errf) ++
+              " | sed 's|^\\./||' | head -n 101"
+        result = run_sh(cmd, search_timeout_s() * 1000)
         out = elem(result, 1)
         interrupted = elem(result, 2)
+        err = take_errfile(errf)
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
-            if (string_length(string_trim(out)) == 0) { "(no matches)" }
+            if (string_length(string_trim(out)) == 0) {
+                if (string_length(err) > 0) { "error: glob failed: " ++ err }
+                else { "(no matches)" }
+            }
             else { glob_cap_notice(out) }
         }
     }
@@ -1032,16 +1147,13 @@ fun do_grep(args) {
     pattern = map_get(args, 'pattern')
     if (pattern == nil) { "error: missing 'pattern'" }
     else {
-        path = map_get(args, 'path')
+        path = opt_path_arg(args, 'path')
         glob_arg = map_get(args, 'glob')
         mode = map_get(args, 'output_mode')
         hl = map_get(args, 'head_limit')
-        base = if (path == nil) { "." } else { to_string(path) }
+        base = if (path == nil || string_length(string_trim(to_string(path))) == 0) { "." }
+               else { to_string(path) }
         pat_q = Util.shell_q(to_string(pattern))
-        # Omit a "." path so rg emits clean (non-`./`-prefixed) paths.
-        base_part = if (base == "." || string_length(string_trim(base)) == 0) {
-            ""
-        } else { " " ++ Util.shell_q(base) }
         base_q = Util.shell_q(base)
 
         # Optional glob filter (rg --glob / mirrors Claude Code's Grep).
@@ -1069,39 +1181,122 @@ fun do_grep(args) {
         # `if/then/else` (not `rg || grep`) so an rg run that finds
         # nothing doesn't fall through and re-run grep over the whole
         # tree. --hidden so dotfiles aren't skipped; -e so a pattern
-        # starting with `-` isn't read as a flag.
-        grep_base = if (base == "." || string_length(string_trim(base)) == 0) {
-            " ."
-        } else { " " ++ base_q }
-        # Strip leading `./` so grep's `path:line:text` matches rg's
-        # `path:line:text` exactly — the model often hands those paths
-        # back to Read, which doesn't need (and shouldn't see) a `./`.
+        # starting with `-` isn't read as a flag. The fallback uses -E so
+        # the regex dialect matches rg's (ERE-style groups/alternation).
+        #
+        # The search path is ALWAYS explicit (`.` by default): with no path
+        # rg searches its STDIN when stdin isn't a tty — in --mcp-server
+        # mode that is the JSON-RPC stream, so it blocked for 30s and
+        # swallowed the client's next request. `sed s|^\./||` strips the
+        # `./` prefix that `.` adds so `path:line:text` stays clean (the
+        # model hands those paths back to read).
+        #
+        # stderr goes to a private file, not through the pipe: that's where
+        # an invalid regex (`foo(`) is reported, and the old `… | head 2>&1`
+        # sent it to the user's terminal while the model saw "(no matches)".
+        # --no-messages / -s keep unreadable-file noise out of it.
+        errf = search_errfile()
         cmd = "if command -v rg >/dev/null 2>&1; then " ++
               "rg --color=never --hidden --no-messages" ++ rg_mode ++ glob_flag ++
-              " -e " ++ pat_q ++ base_part ++ "; " ++
-              "else grep" ++ grep_mode ++ " --color=never -e " ++ pat_q ++ grep_base ++ " 2>/dev/null | sed 's|^\\./||'; fi" ++
-              " | head -n " ++ to_string(head_n)
-        result = shell_managed(cmd ++ " 2>&1", search_timeout_s() * 1000)
-        code = elem(result, 0)
+              " -e " ++ pat_q ++ " " ++ base_q ++ "; " ++
+              "else grep -s -E" ++ grep_mode ++ " --color=never -e " ++ pat_q ++ " " ++ base_q ++ "; fi" ++
+              " 2>" ++ errfile_redirect(errf) ++
+              " | sed 's|^\\./||' | head -n " ++ to_string(head_n)
+        result = run_sh(cmd, search_timeout_s() * 1000)
         out = elem(result, 1)
         interrupted = elem(result, 2)
+        err = take_errfile(errf)
         if (interrupted == 'true') {
             "[timed out after " ++ to_string(search_timeout_s()) ++ "s on " ++ base ++ " — narrow the path]"
         } else {
             trimmed = truncate_output(out, grep_output_cap())
-            if (string_length(string_trim(trimmed)) == 0) { "(no matches)" } else { trimmed }
+            if (string_length(string_trim(trimmed)) == 0) {
+                if (string_length(err) > 0) {
+                    "error: grep failed: " ++ err ++
+                    "\n(For an invalid regex, escape literal ( ) [ ] { } . * + ? | with a backslash.)"
+                } else { "(no matches)" }
+            } else {
+                if (string_length(err) > 0) { trimmed ++ "\n[grep stderr: " ++ err ++ "]" }
+                else { trimmed }
+            }
         }
     }
+}
+
+# Private temp file for a search pipeline's stderr (mkstemp → 0600, unique
+# per call). nil if the temp dir is unusable — the command then discards
+# stderr instead of leaking it onto the terminal.
+fun search_errfile() {
+    file_temp(tmp_dir() ++ "/swarm-code-search-")
+}
+
+fun errfile_redirect(errf) {
+    if (errf == nil) { "/dev/null" } else { Util.shell_q(errf) }
+}
+
+# Read (capped, trimmed) and delete a search_errfile. "" when there was none.
+fun take_errfile(errf) {
+    if (errf == nil) { "" }
+    else {
+        raw = file_read(errf)
+        file_delete(errf)
+        if (raw == nil) { "" }
+        else { string_trim(string_truncate(raw, 2000)) }
+    }
+}
+
+fun tmp_dir() {
+    t = getenv("TMPDIR")
+    if (t == nil || string_length(to_string(t)) == 0) { "/tmp" }
+    else {
+        ts = to_string(t)
+        if (string_ends_with(ts, "/") == 'true' && string_length(ts) > 1) {
+            string_sub(ts, 0, string_length(ts) - 1)
+        } else { ts }
+    }
+}
+
+# shell_managed for the harness's own helper pipelines: stdin is /dev/null
+# (Util.no_stdin). shell_managed children otherwise inherit swarm-code's
+# stdin — the terminal, or the MCP server's JSON-RPC pipe.
+fun run_sh(cmd, timeout_ms) {
+    shell_managed(Util.no_stdin(cmd), timeout_ms)
 }
 
 # ------------------------------------------------------------
 # helpers
 # ------------------------------------------------------------
 
-# Accept either 'path' or 'file_path' (Claude Code uses file_path).
+# Accept either 'path' or 'file_path' (Claude Code uses file_path), with a
+# leading `~` / `~/` expanded to $HOME (see expand_home).
 fun resolve_path_arg(args) {
+    p = raw_path_arg(args)
+    if (p == nil) { nil } else { expand_home(p) }
+}
+
+fun raw_path_arg(args) {
     p = map_get(args, 'path')
     if (p != nil) { p } else { map_get(args, 'file_path') }
+}
+
+# `~` / `~/…` → $HOME. Tool paths never pass through a shell unquoted, so
+# nothing expanded them: `read ~/.bashrc` said "file not found" and
+# `write ~/x` created a literal `./~/` directory in the cwd. (`~user` is
+# left alone.)
+fun expand_home(p) {
+    s = to_string(p)
+    home = getenv("HOME")
+    if (home == nil) { s }
+    else { if (s == "~") { to_string(home) }
+    else { if (string_starts_with(s, "~/") == 'true') {
+        to_string(home) ++ string_sub(s, 1, string_length(s) - 1)
+    } else { s }}}
+}
+
+# An optional directory/file arg for search/wait tools: nil stays nil.
+fun opt_path_arg(args, key) {
+    v = map_get(args, key)
+    if (v == nil) { nil } else { expand_home(v) }
 }
 
 # Truncate long output to prevent context blowup.
@@ -1308,12 +1503,14 @@ fun do_background(args, opts) {
     if (cmd == nil) { "error: background needs 'command'" }
     else {
         if (bg_table == nil) { "error: background system not initialized" }
+        else { if (sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
-            id = Background.launch(bg_table, to_string(cmd), label_str)
-            "launched " ++ id ++ ": " ++ label_str ++
-                "\n(use bg_status and bg_result to check progress)"
-        }
+            id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
+            if (string_starts_with(to_string(id), "error") == 'true') { id }
+            else { "launched " ++ id ++ ": " ++ label_str ++
+                "\n(use bg_status and bg_result to check progress)" }
+        }}
     }
 }
 
@@ -1358,14 +1555,18 @@ fun do_bg_server(args, opts) {
     if (cmd == nil) { "error: bg_server needs 'command'" }
     else {
         if (bg_table == nil) { "error: background system not initialized" }
+        else { if (sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
-            id = Background.launch_server(bg_table, to_string(cmd), label_str)
-            log_file = Background.log_path_for(id)
-            "launched detached server " ++ id ++ ": " ++ label_str ++
-                "\nlog: " ++ log_file ++
-                "\n(use bg_tail to read log, bg_kill to stop)"
-        }
+            id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
+            if (string_starts_with(to_string(id), "error") == 'true') { id }
+            else {
+                log_file = Background.log_path_for(bg_table, id)
+                "launched detached server " ++ id ++ ": " ++ label_str ++
+                    "\nlog: " ++ log_file ++
+                    "\n(use bg_tail to read log, bg_kill to stop)"
+            }
+        }}
     }
 }
 
@@ -1424,7 +1625,7 @@ fun do_web_search(args) {
         # the JSON "diag" field, but python itself can still emit warnings /
         # SSL chatter on stderr. Folding stderr into stdout would prepend
         # that text and break json_decode of an otherwise-good result.
-        result = shell_managed(cmd ++ " 2>/dev/null", fetch_timeout_s() * 1000)
+        result = run_sh(cmd ++ " 2>/dev/null", fetch_timeout_s() * 1000)
         code = elem(result, 0)
         out = elem(result, 1)
         interrupted = elem(result, 2)
@@ -1607,26 +1808,39 @@ fun ddg_python_script() {
 # ------------------------------------------------------------
 # run_tests  parse and gate on test output from any framework
 # ------------------------------------------------------------
-# args: {"repo_path": "/path/to/repo", "command": "npm test" (optional)}
+# args: {"repo_path": "/path/to/repo", "command": "npm test" (optional),
+#        "timeout_ms": 300000 (optional, 1000..600000)}
 fun do_run_tests(args) {
     repo = map_get(args, 'repo_path')
     cmd = map_get(args, 'command')
     if (repo == nil) { "error: run_tests needs 'repo_path'" }
+    else { if (cmd != nil && sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
     else {
         command = if (cmd == nil) { "" } else { to_string(cmd) }
-        result = TestRunner.run_tests(to_string(repo), command)
+        t_raw = map_get(args, 'timeout_ms')
+        t_s = if (t_raw == nil) { TestRunner.default_timeout_ms() / 1000 } else { resolve_bash_timeout_s(t_raw) }
+        result = TestRunner.run_tests_timed(expand_home(repo), command, t_s * 1000)
         fw = map_get(result, 'framework')
         passed = map_get(result, 'passed')
         failed = map_get(result, 'failed')
         total = map_get(result, 'total')
         exit_code = map_get(result, 'exit_code')
         raw = map_get(result, 'raw')
-        summary = "Framework: " ++ fw ++ "\n" ++
+        timed_out = map_get(result, 'timed_out')
+        banner = if (timed_out == 'true') {
+            if (exit_code == 130) { "[stopped by user (ESC/Ctrl-C) — test process group killed]\n" }
+            else { "[timed out after " ++ to_string(t_s) ++ "s — test process group killed; pass a larger timeout_ms or a narrower command]\n" }
+        } else { "" }
+        summary = banner ++
+                  "Framework: " ++ fw ++ "\n" ++
                   "Passed: " ++ to_string(passed) ++ "\n" ++
                   "Failed: " ++ to_string(failed) ++ "\n" ++
                   "Total: " ++ to_string(total) ++ "\n" ++
                   "Exit code: " ++ to_string(exit_code)
-        if (failed > 0) {
+        # Show the output tail whenever something went wrong — failed tests,
+        # a non-zero exit with nothing parsed (compile error, missing tool),
+        # or a timeout — not only when the parser counted failures.
+        if (failed > 0 || exit_code != 0 || timed_out == 'true') {
             cap = run_tests_raw_cap()
             tail = if (string_length(raw) > cap) {
                 string_sub(raw, string_length(raw) - cap, cap)
@@ -1637,7 +1851,7 @@ fun do_run_tests(args) {
         } else {
             summary
         }
-    }
+    }}
 }
 
 # ------------------------------------------------------------
@@ -1647,7 +1861,7 @@ fun do_git_status(args) {
     cwd_arg = map_get(args, 'cwd')
     cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     cmd = git_noninteractive_env() ++ "git " ++ cwd_part ++ "status --porcelain --branch 2>&1 | head -n 100"
-    r = shell_managed(cmd, git_timeout_s() * 1000)
+    r = run_sh(cmd, git_timeout_s() * 1000)
     code = elem(r, 0)
     out = elem(r, 1)
     interrupted = elem(r, 2)
@@ -1667,7 +1881,7 @@ fun do_git_diff(args) {
     cwd_part = if (cwd_arg == nil) { "" } else { "-C " ++ Util.shell_q(to_string(cwd_arg)) ++ " " }
     flag = if (staged == 'true') { "--staged " } else { "" }
     cmd = git_noninteractive_env() ++ "git " ++ cwd_part ++ "diff " ++ flag ++ "--no-color 2>&1"
-    r = shell_managed(cmd, git_timeout_s() * 1000)
+    r = run_sh(cmd, git_timeout_s() * 1000)
     code = elem(r, 0)
     out = elem(r, 1)
     interrupted = elem(r, 2)
@@ -1702,7 +1916,7 @@ fun do_git_commit(args) {
             "{ git " ++ cwd_part ++ "add " ++ stage_list ++
             " && git " ++ cwd_part ++ "commit -m " ++ Util.shell_q(to_string(msg)) ++
             " && git " ++ cwd_part ++ "rev-parse --short HEAD ; } 2>&1"
-        r = shell_managed(cmd, git_timeout_s() * 1000)
+        r = run_sh(cmd, git_timeout_s() * 1000)
         code = elem(r, 0)
         out = elem(r, 1)
         interrupted = elem(r, 2)
@@ -1739,7 +1953,7 @@ fun do_code_search(args) {
     if (pat == nil) { "error: code_search needs 'pattern'" }
     else {
         kind = map_get(args, 'kind')
-        path = map_get(args, 'path')
+        path = opt_path_arg(args, 'path')
         lang = map_get(args, 'lang')
         k = if (kind == nil) { "ref" } else { to_string(kind) }
         base = if (path == nil) { "." } else { to_string(path) }
@@ -1772,7 +1986,7 @@ fun do_code_search(args) {
             Util.shell_q(rgx) ++ " " ++ base_q ++
             " || grep -rn --color=never -E " ++ Util.shell_q(rgx) ++ " " ++ base_q ++
             ") 2>&1 | head -n 80"
-        r = shell_managed(cmd, search_timeout_s() * 1000)
+        r = run_sh(cmd, search_timeout_s() * 1000)
         code = elem(r, 0)
         out = elem(r, 1)
         interrupted = elem(r, 2)
@@ -1797,15 +2011,19 @@ fun do_log_wait(args, opts) {
     if (pat == nil) { "error: log_wait needs 'pattern'" }
     else {
         task_id = map_get(args, 'task_id')
-        path_arg = map_get(args, 'path')
-        timeout = map_get(args, 'timeout_sec')
-        timeout_n = if (timeout == nil) { 60 } else { parse_int_safe(to_string(timeout), 60) }
+        path_arg = opt_path_arg(args, 'path')
+        timeout_n = clamp_wait_timeout_s(map_get(args, 'timeout_sec'))
 
-        # Resolve log path: explicit path, or task_id's log file
+        # Resolve log path: explicit path, or task_id's log file (in this
+        # session's private background directory).
+        bg_table = map_get(opts, 'bg_table')
         log_path = if (path_arg != nil) { to_string(path_arg) }
                    else {
-                       if (task_id == nil) { "" }
-                       else { "/tmp/swarm-code-" ++ to_string(task_id) ++ ".log" }
+                       if (task_id == nil || bg_table == nil) { "" }
+                       else {
+                           lp = Background.log_path_for(bg_table, to_string(task_id))
+                           if (lp == nil) { "" } else { lp }
+                       }
                    }
         if (string_length(log_path) == 0) {
             "error: log_wait needs either 'task_id' or 'path'"
@@ -1820,7 +2038,7 @@ fun do_log_wait(args, opts) {
             # wait, and so the `sleep` poll-loop's whole process group dies on
             # timeout. Timeout/interrupt surface via the interrupted flag now,
             # not exit 142.
-            r = shell_managed(inner, timeout_n * 1000)
+            r = run_sh(inner, timeout_n * 1000)
             code = elem(r, 0)
             interrupted = elem(r, 2)
             if (interrupted == 'true') {
@@ -1834,31 +2052,52 @@ fun do_log_wait(args, opts) {
     }
 }
 
+# log_wait / file_watch `timeout_sec`: default 60, clamped to [1, 600].
+# Unclamped, 0 reached shell_managed as "no timeout" — a 600s wedge headless,
+# unbounded on a TTY. Non-numeric junk falls back to the default.
+fun clamp_wait_timeout_s(raw) {
+    if (raw == nil) { 60 }
+    else {
+        n = parse_int_safe(to_string(raw), 60)
+        if (n < 1) { 1 } else { if (n > 600) { 600 } else { n } }
+    }
+}
+
 # ------------------------------------------------------------
-# file_watch — block until a file changes (mtime) or appears
+# file_watch — block until a file changes (mtime/size), appears, or vanishes
 # ------------------------------------------------------------
 # args: {"path": "/path/to/file", "timeout_sec": 60}
-# Returns when the file's mtime changes or it appears, or on timeout.
+# Returns when the file's signature changes, or on timeout.
 fun do_file_watch(args) {
-    path_arg = map_get(args, 'path')
+    path_arg = opt_path_arg(args, 'path')
     if (path_arg == nil) { "error: file_watch needs 'path'" }
     else {
         path = to_string(path_arg)
-        timeout = map_get(args, 'timeout_sec')
-        timeout_n = if (timeout == nil) { 60 } else { to_int(timeout) }
+        timeout_n = clamp_wait_timeout_s(map_get(args, 'timeout_sec'))
 
-        # Capture initial mtime, then poll every 0.5s until it changes.
+        # Capture an initial signature, then poll every 0.5s until it changes.
         # Run via shell_managed so the timeout is enforced in C and the poll
         # loop's process group is killed on timeout/ESC (no GNU `timeout` dep).
+        #
+        # The path is single-quoted with Util.shell_q: it comes from the model,
+        # and the old double-quote escaping ran `$(…)` / backticks in it.
+        # The signature is mtime (full resolution where GNU stat has it) +
+        # size, so two writes in the same second still differ. GNU and BSD
+        # stat disagree on flags — GNU `stat -f` is --file-system, which
+        # printed ever-changing free-space counters and fired "changed" in
+        # 0.5s on an untouched file — so pick the flavour once, up front.
         inner =
-            "p=" ++ shell_inner_quote(path) ++ "; " ++
-            "initial=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
-            "while true; do " ++
-            "  current=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
-            "  [ \"$current\" != \"$initial\" ] && echo \"changed: $initial -> $current\" && exit 0; " ++
-            "  sleep 0.5; " ++
+            "p=" ++ Util.shell_q(path) ++ "\n" ++
+            "if stat -c %Y / >/dev/null 2>&1; then " ++
+            "sig() { stat -c '%y %s' \"$p\" 2>/dev/null || echo missing; }; " ++
+            "else sig() { stat -f '%m %z' \"$p\" 2>/dev/null || echo missing; }; fi\n" ++
+            "initial=$(sig)\n" ++
+            "while :; do " ++
+            "current=$(sig); " ++
+            "if [ \"$current\" != \"$initial\" ]; then echo \"changed: $initial -> $current\"; exit 0; fi; " ++
+            "sleep 0.5; " ++
             "done"
-        r = shell_managed(inner, timeout_n * 1000)
+        r = run_sh(inner, timeout_n * 1000)
         code = elem(r, 0)
         out = string_trim(elem(r, 1))
         interrupted = elem(r, 2)
@@ -1909,7 +2148,7 @@ fun do_sw_check(args) {
                   " >/dev/null 2>" ++ Util.shell_q(errf) ++ "; S=$?; " ++
                   "grep -v 'auto-imported\\|cannot open' " ++ Util.shell_q(errf) ++
                   "; rm -f " ++ Util.shell_q(errf) ++ "; exit $S"
-            r = shell_managed(cmd, 60 * 1000)
+            r = run_sh(cmd, 60 * 1000)
             code = elem(r, 0)
             out = string_trim(elem(r, 1))
             interrupted = elem(r, 2)
@@ -1934,17 +2173,11 @@ fun resolve_swc() {
     override = getenv("SWARM_CODE_SWC")
     if (override != nil) { to_string(override) }
     else {
-        r = shell_managed("command -v swc 2>/dev/null", read_probe_timeout_s() * 1000)
+        r = run_sh("command -v swc 2>/dev/null", read_probe_timeout_s() * 1000)
         found = string_trim(elem(r, 1))
         if (string_length(found) > 0) { found }
         else { "../swarmrt/bin/swc" }
     }
-}
-
-# Escape for use INSIDE a double-quoted shell string (bash).
-fun shell_inner_quote(s) {
-    no_dq = string_replace(s, "\"", "\\\"")
-    "\"" ++ no_dq ++ "\""
 }
 
 # Format the parsed results list as a readable string for the model.
@@ -1981,12 +2214,14 @@ fun do_multi_edit(args) {
             guard = PathGuard.validate_write(to_string(path))
             if (guard != "ok") { guard }
             else {
-                original = file_read(path)
-                if (original == nil) {
-                    "error: could not read " ++ path
+                loaded = load_for_edit(path)
+                tag = elem(loaded, 0)
+                if (tag == 'error') { elem(loaded, 1) }
+                else { if (tag == 'missing') {
+                    "error: could not read " ++ path ++ " (no such file — use write to create it)"
                 } else {
-                    apply_edits(path, original, edits, 0, length(edits))
-                }
+                    apply_edits(path, elem(loaded, 1), edits, 0, length(edits))
+                }}
             }
         }
     }
@@ -2130,7 +2365,7 @@ fun do_web_fetch(args, opts) {
                         " -e 's/&nbsp;/ /g' -e 's/&amp;/\\&/g'" ++
                         " -e 's/&lt;/</g' -e 's/&gt;/>/g'" ++
                         " -e 's/&quot;/\"/g' | tr -s ' \\n' | head -c 30000"
-            result = shell_managed(strip_cmd ++ " 2>&1", fetch_timeout_s() * 1000)
+            result = run_sh(strip_cmd ++ " 2>&1", fetch_timeout_s() * 1000)
             text = elem(result, 1)
             file_delete(tmp_path)
             "fetched " ++ url ++ " (" ++ to_string(string_length(text)) ++

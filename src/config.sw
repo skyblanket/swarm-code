@@ -1,6 +1,8 @@
 module Config
 
 import Util
+import CommandGuard
+import Hooks
 
 # ============================================================
 # Config — settings.json, SWARM.md, permissions, hooks
@@ -39,7 +41,9 @@ import Util
 
 export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
         llm_timeout_ms, project_scope, project_ignored_keys, is_trusted_dir, project_notice,
-        endpoint_host, is_local_endpoint, endpoint_refusal]
+        endpoint_host, is_local_endpoint, endpoint_refusal,
+        command_of, command_risk, denial_message, denial_reason, uses_sudo,
+        run_hooks_verdict]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
@@ -512,7 +516,7 @@ fun load_project_context() {
 # Permissions — decide whether a tool call should run.
 # Returns an atom: 'allow', 'deny', or 'ask'.
 #
-# Policy (updated):
+# Policy:
 #   1. Default-allow for every BUILT-IN tool. The user explicitly asked
 #      for "all allowed by default" — prompting on every bash/write/edit
 #      was breaking flow during tool test runs. The one exception is MCP
@@ -521,46 +525,53 @@ fun load_project_context() {
 #   2. settings.permissions[tool_name] in settings.json can downgrade
 #      a specific tool to 'ask' or 'deny' if the user wants tighter
 #      control on one tool (e.g. "bash": "ask").
-#   3. The dangerous-bash hard gate still fires regardless. Commands
-#      that look like `rm -rf`, `sudo`, `curl | sh`, `mkfs`, force
-#      push, or hard resets still prompt even in default-allow mode.
-#      We are not giving a model root access to the box.
+#   3. Every tool that runs a model-supplied shell command (command_of:
+#      bash, background, bg_server, run_tests.command) goes through the
+#      CommandGuard classifier, which parses the command like sh does:
+#        * hardline  (rm -r on /, mkfs, dd to a raw disk, halt/reboot,
+#          chmod -R on /, fork bomb) → 'deny', unconditionally — before
+#          any settings/env lookup, so SWARM_CODE_ALLOW_DANGEROUS=1
+#          cannot turn it off.
+#        * dangerous (sudo, rm -rf on ~ or a system path, dd to a
+#          device) → escalates 'allow' to 'ask' (a configured 'deny'
+#          stays 'deny'); 'deny' outright when SWARM_CODE_DENY_DANGEROUS=1
+#          (unattended /flows children); skipped entirely when
+#          SWARM_CODE_ALLOW_DANGEROUS=1.
+#      denial_message() names the matched pattern so the model can adapt.
 # ------------------------------------------------------------
 fun check_permission(tool_name, args, opts) {
-    # HARDLINE: unbypassable deny for catastrophic patterns (mkfs, dd
-    # to disk, shutdown/reboot, fork bomb, rm -rf /*). Fires BEFORE
-    # any settings/env lookup so SWARM_CODE_ALLOW_DANGEROUS=1 cannot
-    # turn it off. See is_hardline_bash for the pattern list.
-    if (tool_name == 'bash' && is_hardline_bash(args) == 'true') {
+    risk = command_risk(tool_name, args)
+    level = elem(risk, 0)
+    if (level == 'hardline') {
         'deny'
     }
     else {
-        settings = map_get(opts, 'settings')
-        perms = if (settings == nil) { nil } else { map_get(settings, 'permissions') }
+        decision = configured_decision(tool_name, opts)
 
-        # settings.json is decoded with atom keys, so pass tool_name directly.
-        configured = if (perms == nil) {
-            nil
-        } else {
-            map_get(perms, tool_name)
-        }
-
-        decision = if (configured != nil) {
-            string_to_perm(configured)
-        } else {
-            default_permission(tool_name)
-        }
-
-        # Hard-gate dangerous bash commands regardless of config.
         # Headless denies an 'ask' unless SWARM_CODE_HEADLESS_APPROVE=1
         # (agent.resolve_permission); SWARM_CODE_DENY_DANGEROUS=1 (set for
-        # /flows fan-out children) makes this a hard deny even then.
-        if (tool_name == 'bash' && is_dangerous_bash(args) == 'true') {
-            if (getenv("SWARM_CODE_DENY_DANGEROUS") == "1") { 'deny' } else { 'ask' }
+        # /flows fan-out and scheduled children) makes this a hard deny
+        # even then.
+        if (level == 'dangerous' && dangerous_bypassed() == 'false') {
+            if (decision == 'deny') { 'deny' }
+            else { if (getenv("SWARM_CODE_DENY_DANGEROUS") == "1") { 'deny' } else { 'ask' } }
         } else {
             decision
         }
     }
+}
+
+# settings.permissions[tool] if set, else the built-in default.
+fun configured_decision(tool_name, opts) {
+    settings = if (opts == nil) { nil } else { map_get(opts, 'settings') }
+    perms = if (settings == nil) { nil } else { map_get(settings, 'permissions') }
+    # settings.json is decoded with atom keys, so pass tool_name directly.
+    configured = if (perms == nil) { nil } else { map_get(perms, tool_name) }
+    if (configured != nil) { string_to_perm(configured) } else { default_permission(tool_name) }
+}
+
+fun dangerous_bypassed() {
+    if (getenv("SWARM_CODE_ALLOW_DANGEROUS") == "1") { 'true' } else { 'false' }
 }
 
 fun string_to_perm(s) {
@@ -581,142 +592,67 @@ fun default_permission(tool_name) {
     else { 'allow' }
 }
 
-# Return 'true' ONLY for truly catastrophic, unambiguous patterns.
-# Scoped down from a broad "destructive commands" net because the old
-# version was flagging perfectly normal dev workflows like
-# `rm -rf ./build-dir`, `git push --force` on feature branches, and
-# `git reset --hard HEAD~1`. The model is a coding assistant; those
-# are its daily bread.
-#
-# What still trips the gate (after much narrowing):
-#   * rm -rf targeting `/` or `~` or `$HOME` literally
-#   * mkfs (formatting a block device)
-#   * dd if=... writing to /dev/disk, /dev/sd, /dev/nvme, /dev/rdisk
-#   * sudo (privilege escalation is always worth a beat)
-#
-# You can fully disable even this minimal gate by exporting
-# SWARM_CODE_ALLOW_DANGEROUS=1 before launching swarm-code. Everything
-# runs, nothing prompts. YOLO mode.
+# The shell command a tool call will run, or nil for tools that don't run
+# one. Every tool listed here gets the same hardline/dangerous gate as bash —
+# before, `background` / `bg_server` / `run_tests.command` ran ungated.
+fun command_of(tool_name, args) {
+    t = to_string(tool_name)
+    if (args == nil || is_map(args) == 'false') { nil }
+    else { if (t == "bash" || t == "background" || t == "bg_server" || t == "run_tests") {
+        c = map_get(args, 'command')
+        if (c == nil) { nil } else { to_string(c) }
+    } else { nil }}
+}
+
+# {'hardline'|'dangerous'|'ok', reason} for a tool call.
+fun command_risk(tool_name, args) {
+    cmd = command_of(tool_name, args)
+    if (cmd == nil) { {'ok', ""} } else { CommandGuard.risk_of(cmd) }
+}
+
+fun uses_sudo(cmd) { CommandGuard.uses_sudo(cmd) }
+
+# "error: permission denied for tool 'X' — <why>". The why names the
+# matched pattern (and the offending simple command), so the model can
+# pick a narrower command instead of retrying the same call.
+fun denial_message(tool_name, args, opts) {
+    "error: permission denied for tool '" ++ to_string(tool_name) ++ "'" ++
+        denial_reason(tool_name, args, opts)
+}
+
+fun denial_reason(tool_name, args, opts) {
+    risk = command_risk(tool_name, args)
+    level = elem(risk, 0)
+    if (level == 'hardline') {
+        " — blocked by the hardline safety floor: " ++ elem(risk, 1) ++
+        ". This is never allowed (no setting or env var lifts it); use a narrower command."
+    } else { if (configured_decision(tool_name, opts) == 'deny') {
+        " — denied by settings.json (permissions." ++ to_string(tool_name) ++ " = \"deny\")."
+    } else { if (level == 'dangerous' && dangerous_bypassed() == 'false' &&
+                 getenv("SWARM_CODE_DENY_DANGEROUS") == "1") {
+        " — flagged dangerous: " ++ elem(risk, 1) ++
+        ". SWARM_CODE_DENY_DANGEROUS=1 is set for this unattended run, so it is denied; use a narrower command."
+    } else { if (level == 'dangerous' && dangerous_bypassed() == 'false') {
+        " — flagged dangerous: " ++ elem(risk, 1) ++ "; it was not approved."
+    } else {
+        " — not approved at the permission prompt (don't retry the same call; ask the user or try another approach)."
+    }}}}
+}
+
+# Kept for callers/tests that ask about a bash args map directly.
+# 'true' for dangerous OR hardline commands (a hardline command is certainly
+# dangerous); 'false' when SWARM_CODE_ALLOW_DANGEROUS=1 (YOLO mode).
 fun is_dangerous_bash(args) {
-    bypass = getenv("SWARM_CODE_ALLOW_DANGEROUS")
-    if (bypass == "1") { 'false' }
+    if (dangerous_bypassed() == 'true') { 'false' }
     else {
-        cmd = map_get(args, 'command')
-        if (cmd == nil) { 'false' }
-        else {
-            # rm targeting the filesystem root or user home literally.
-            # We look for "rm " ++ anything ++ " /" at word boundary
-            # rather than the broad "rm -rf" string match. A simple
-            # conservative approach: flag only the specific dangerous
-            # literal suffixes.
-            if (string_contains(cmd, "rm -rf /") == 'true' &&
-                string_contains(cmd, "rm -rf /tmp") == 'false' &&
-                string_contains(cmd, "rm -rf /var/") == 'false' &&
-                string_contains(cmd, "rm -rf /Users/") == 'false' &&
-                string_contains(cmd, "rm -rf /home/") == 'false' &&
-                string_contains(cmd, "rm -rf /opt/") == 'false') { 'true' }
-            else { if (string_contains(cmd, "rm -rf ~") == 'true') { 'true' }
-            else { if (string_contains(cmd, "rm -rf $HOME") == 'true') { 'true' }
-            else { if (string_contains(cmd, "sudo ") == 'true') { 'true' }
-            else { if (string_contains(cmd, "mkfs") == 'true') { 'true' }
-            else { if (string_contains(cmd, "dd if=") == 'true' &&
-                        string_contains(cmd, "of=/dev/") == 'true') { 'true' }
-            else { 'false' }}}}}}
-        }
+        level = elem(command_risk('bash', args), 0)
+        if (level == 'ok') { 'false' } else { 'true' }
     }
 }
 
-# ------------------------------------------------------------
-# HARDLINE blocklist — UNBYPASSABLE bash patterns.
-# ------------------------------------------------------------
-# Unlike is_dangerous_bash, this CANNOT be turned off with
-# SWARM_CODE_ALLOW_DANGEROUS=1. If your agent is asking to mkfs a
-# disk or reboot the box, no env var should let it through.
-#
-# Categories:
-#   * Filesystem destruction: mkfs, mkswap
-#   * Disk wipe: dd if=... of=/dev/{sd,nvme,disk,rdisk}
-#   * System halt: shutdown, reboot, halt, poweroff, init 0, init 6
-#   * Filesystem lockout: chmod 000 /, chown -R 0:0 /
-#   * Fork bomb literal: :(){:|:&};:
-#   * Whole-disk rm: rm -rf /*
-# ------------------------------------------------------------
+# 'true' for the unbypassable tier (see CommandGuard for the categories).
 fun is_hardline_bash(args) {
-    cmd = map_get(args, 'command')
-    if (cmd == nil) { 'false' }
-    else {
-        s = to_string(cmd)
-        # Filesystem destruction
-        if (string_contains(s, "mkfs") == 'true') { 'true' }
-        else { if (string_contains(s, "mkswap") == 'true') { 'true' }
-        # dd writing to a raw disk node
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/sd") == 'true') { 'true' }
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/nvme") == 'true') { 'true' }
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/disk") == 'true') { 'true' }
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/rdisk") == 'true') { 'true' }
-        # System halt — matched as whole command words (not bare substrings),
-        # so `cat asphalt_survey.csv` / `vim shutdown_handler.py` are NOT
-        # blocked while `shutdown -h now`, `/sbin/reboot`, `poweroff` still are.
-        else { if (contains_command_word(s, "shutdown") == 'true') { 'true' }
-        else { if (contains_command_word(s, "reboot") == 'true') { 'true' }
-        else { if (contains_command_word(s, "halt") == 'true') { 'true' }
-        else { if (contains_command_word(s, "poweroff") == 'true') { 'true' }
-        else { if (contains_command_word(s, "init 0") == 'true') { 'true' }
-        else { if (contains_command_word(s, "init 6") == 'true') { 'true' }
-        # telinit N is the SysV alias (telinit 0 halts, telinit 6 reboots) —
-        # word-boundary "init 0" misses it ("init" preceded by 'l'), so match
-        # the verb directly. Keep this as long as "init 0"/"init 6" are blocked.
-        else { if (contains_command_word(s, "telinit") == 'true') { 'true' }
-        # Filesystem lockout
-        else { if (string_contains(s, "chmod 000 /") == 'true') { 'true' }
-        else { if (string_contains(s, "chown -R 0:0 /") == 'true') { 'true' }
-        # Fork bomb
-        else { if (string_contains(s, ":(){:|:&};:") == 'true') { 'true' }
-        # Whole-disk wipe
-        else { if (string_contains(s, "rm -rf /*") == 'true') { 'true' }
-        else { 'false' }}}}}}}}}}}}}}}}}
-    }
-}
-
-# Whole-word match for a catastrophic verb: the word must be bounded by a
-# non-identifier char (or string edge) on both sides, so it isn't matched as
-# a substring of a larger filename/identifier (asphalt, rebooter,
-# shutdown_handler). Over-blocks rare cases like `cat shutdown.sh` — the safe
-# direction for an unbypassable floor (never under-blocks a real `shutdown`).
-fun contains_command_word(s, word) {
-    cw_scan(s, word, string_length(word), string_length(s), 0)
-}
-
-fun cw_scan(s, word, wlen, slen, i) {
-    if (i + wlen > slen) { 'false' }
-    else {
-        if (string_sub(s, i, wlen) == word) {
-            prev_ch = cw_char_at(s, i - 1, slen)
-            next_ch = cw_char_at(s, i + wlen, slen)
-            if (cw_boundary(prev_ch) == 'true' && cw_boundary(next_ch) == 'true') { 'true' }
-            else { cw_scan(s, word, wlen, slen, i + 1) }
-        } else { cw_scan(s, word, wlen, slen, i + 1) }
-    }
-}
-
-fun cw_char_at(s, idx, slen) {
-    if (idx < 0 || idx >= slen) { "" }
-    else { string_sub(s, idx, 1) }
-}
-
-fun cw_boundary(ch) {
-    if (ch == "") { 'true' }
-    else { if (cw_is_ident(ch) == 'true') { 'false' } else { 'true' }}
-}
-
-fun cw_is_ident(ch) {
-    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
-        || (ch >= "0" && ch <= "9") || ch == "_") { 'true' }
-    else { 'false' }
+    if (elem(command_risk('bash', args), 0) == 'hardline') { 'true' } else { 'false' }
 }
 
 # ------------------------------------------------------------
@@ -724,21 +660,38 @@ fun cw_is_ident(ch) {
 #
 # Settings shape:
 #   "hooks": {
-#     "PreToolUse":  [ {"matcher": "bash", "command": "..."} ],
-#     "PostToolUse": [ {"matcher": "edit|write", "command": "..."} ],
+#     "PreToolUse":  [ {"matcher": "bash", "command": "..."} ],       (+ background, bg_server, run_tests, …)
+#     "PostToolUse": [ {"matcher": "edit|write", "command": "..."} ], (+ multi_edit)
 #     "UserPromptSubmit": [ {"command": "..."} ],
 #     "Stop":            [ {"command": "..."} ]
 #   }
 #
-# Matcher is a literal substring of the tool name, or "*" for all.
-# Hooks receive context through environment variables set before shell():
-#   SWARM_CODE_EVENT, SWARM_CODE_TOOL, SWARM_CODE_ARGS
+# Matcher: "*" (or none) for all tools, else "|"-separated alternatives,
+# each a case-insensitive substring of the tool name or a tool FAMILY —
+# "bash" also fires for background/bg_server/run_tests/file_watch/log_wait,
+# "edit" also for multi_edit. See matches() for the exact rules.
+# Hooks receive context through the environment and stdin:
+#   SWARM_CODE_EVENT, SWARM_CODE_TOOL — event and tool name
+#   stdin, and the private 0600 file $SWARM_CODE_ARGS_FILE — the args JSON
+#     (always; read one of these to see every call)
+#   SWARM_CODE_ARGS — the same JSON inline, only when it is under 100KB;
+#     above that it is unset and SWARM_CODE_ARGS_OMITTED=1
+# (The args used to be spliced into the command line + env: a >128KB
+# write hit E2BIG, the hook never ran, and shell() polled 120s before
+# reporting a block.) Hooks time out after hook_cmd_timeout_ms().
 #
 # Returns 'ok' normally. Returns 'block' if any PreToolUse hook exited
-# non-zero (blocking the tool call).
+# non-zero, timed out, or could not be run at all (fail closed) —
+# blocking the tool call. run_hooks_verdict also says why.
 # ------------------------------------------------------------
 fun run_hooks(event, tool_name, args_json, opts) {
-    settings = map_get(opts, 'settings')
+    v = run_hooks_verdict(event, tool_name, args_json, opts)
+    if (v == 'ok') { 'ok' } else { 'block' }
+}
+
+# 'ok' | {'block', reason}
+fun run_hooks_verdict(event, tool_name, args_json, opts) {
+    settings = if (opts == nil) { nil } else { map_get(opts, 'settings') }
     if (settings == nil) { 'ok' }
     else {
         hooks = map_get(settings, 'hooks')
@@ -795,8 +748,8 @@ fun run_matching_hooks(hooks_list, tool_name, args_json, event) {
         } else {
             if (matches(matcher, tool_name) == 'true') {
                 result = run_hook_cmd(cmd, event, tool_name, args_json)
-                if (result == 'block') {
-                    'block'
+                if (result != 'ok') {
+                    result
                 } else {
                     run_matching_hooks(tl(hooks_list), tool_name, args_json, event)
                 }
@@ -807,41 +760,88 @@ fun run_matching_hooks(hooks_list, tool_name, args_json, event) {
     }
 }
 
+# Matcher semantics (PreToolUse / PostToolUse):
+#   nil, "", "*"   → every tool
+#   "a|b" / "a,b"  → any alternative matches
+#   an alternative matches a tool — case-insensitively, so Claude-Code-style
+#   "Bash" / "Edit|Write" / "MultiEdit" work — when it is a substring of the
+#   tool name (so "browser" covers every browser_* tool and "mcp__github"
+#   every tool of that server; underscores are ignored, "WebFetch" ≈
+#   "web_fetch"), or when it names a FAMILY the tool belongs to:
+#     bash (or shell) → bash, background, bg_server, run_tests, file_watch,
+#                       log_wait — every tool that runs a shell command or
+#                       shell poll loop, so a "bash" guard hook can't be
+#                       sidestepped by calling `background` instead
+#     edit            → edit, multi_edit
+#     multiedit       → multi_edit
+# (The old check was "matcher ⊂ tool or tool ⊂ matcher" on the raw string:
+# "edit|write" never fired for multi_edit, "bash" never for background.)
 fun matches(matcher, tool_name) {
     if (matcher == nil) { 'true' }
     else {
-        if (matcher == "*") { 'true' }
+        m = string_lower(string_trim(to_string(matcher)))
+        if (m == "" || m == "*") { 'true' }
         else {
-            # Two semantics, both supported via "either direction"
-            # check:
-            #   1. Pipe-alternation: matcher "bash|edit" matches tool
-            #      "bash" because tool_name is a substring of matcher.
-            #   2. Substring: matcher "ed" matches tool "edit" because
-            #      matcher is a substring of tool_name.
-            # The original code only did (1); the audit miscalled this
-            # as a bug. Doing both makes the obvious matchers work
-            # whichever way the user expected.
-            m = to_string(matcher)
-            t = to_string(tool_name)
-            if (string_contains(m, t) == 'true') { 'true' }
-            else { string_contains(t, m) }
+            alts = string_split(string_replace(m, ",", "|"), "|")
+            any_alt_matches(alts, string_lower(to_string(tool_name)))
         }
     }
 }
 
-# Run a single hook command. Wrap with env exports for context.
-# If the command exits non-zero, treat as a block signal.
-# Args JSON is exposed as SWARM_CODE_ARGS so hooks can inspect the
-# tool payload (e.g. a `bash` hook that greps the command). Quoted
-# with shell_q_local because args_json contains arbitrary JSON
-# (including single quotes inside strings).
+fun any_alt_matches(alts, t) {
+    if (length(alts) == 0) { 'false' }
+    else { if (alt_matches(string_trim(hd(alts)), t) == 'true') { 'true' }
+    else { any_alt_matches(tl(alts), t) }}
+}
+
+fun alt_matches(a, t) {
+    if (a == "") { 'false' }
+    else { if (a == "*") { 'true' }
+    else { if (hook_list_has(hook_family(a), t) == 'true') { 'true' }
+    else { if (string_contains(t, a) == 'true') { 'true' }
+    else { string_contains(string_replace(t, "_", ""), string_replace(a, "_", "")) }}}}
+}
+
+fun hook_family(a) {
+    if (a == "bash" || a == "shell") {
+        ["bash", "background", "bg_server", "run_tests", "file_watch", "log_wait"]
+    } else { if (a == "edit") { ["edit", "multi_edit"] }
+    else { if (a == "multiedit") { ["multi_edit"] }
+    else { [] }}}
+}
+
+fun hook_list_has(lst, item) {
+    if (length(lst) == 0) { 'false' }
+    else { if (hd(lst) == item) { 'true' } else { hook_list_has(tl(lst), item) } }
+}
+
+# Run a single hook command with the context described above run_hooks.
+# 'ok' on exit 0; {'block', reason} on a non-zero exit, a timeout, or when
+# the hook could not be run at all — the reason carries the exit code and
+# the start of the hook's output (stdout+stderr) so the model can see why.
+fun hook_cmd_timeout_ms() { 60000 }
+
 fun run_hook_cmd(cmd, event, tool_name, args_json) {
-    args_safe = Util.shell_q(to_string(args_json))
-    full = "export SWARM_CODE_EVENT=" ++ Util.shell_q(to_string(event)) ++ "; " ++
-           "export SWARM_CODE_TOOL="  ++ Util.shell_q(to_string(tool_name)) ++ "; " ++
-           "export SWARM_CODE_ARGS="  ++ args_safe ++ "; " ++
-           cmd
-    result = shell(full)
-    code = elem(result, 0)
-    if (code == 0) { 'ok' } else { 'block' }
+    exports = "export SWARM_CODE_EVENT=" ++ Util.shell_q(to_string(event)) ++ "; " ++
+              "export SWARM_CODE_TOOL="  ++ Util.shell_q(to_string(tool_name)) ++ ";"
+    res = Hooks.run_with_payload(cmd, to_string(args_json), "SWARM_CODE_ARGS", exports,
+                                 hook_cmd_timeout_ms(), hook_tmp_prefix())
+    label = to_string(event) ++ " hook `" ++ string_truncate(to_string(cmd), 80) ++ "`"
+    if (map_get(res, 'ran') != 'true') {
+        {'block', label ++ " could not run — " ++ to_string(map_get(res, 'error'))}
+    } else { if (map_get(res, 'interrupted') == 'true') {
+        {'block', label ++ " timed out after " ++ to_string(hook_cmd_timeout_ms() / 1000) ++ "s"}
+    } else { if (map_get(res, 'code') == 0) {
+        'ok'
+    } else {
+        out = string_trim(to_string(map_get(res, 'out')))
+        tail = if (string_length(out) == 0) { "" } else { ": " ++ string_truncate(out, 500) }
+        {'block', label ++ " exited " ++ to_string(map_get(res, 'code')) ++ tail}
+    }}}
+}
+
+fun hook_tmp_prefix() {
+    t = getenv("TMPDIR")
+    base = if (t == nil || string_length(to_string(t)) == 0) { "/tmp" } else { to_string(t) }
+    base ++ "/swarm-code-hook-"
 }

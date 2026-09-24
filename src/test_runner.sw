@@ -42,6 +42,8 @@ import ToolExecutor
 import ToolRegistry
 import Background
 import PathGuard
+import Hooks
+import ToolSchemas
 
 fun main() {
     print("")
@@ -265,7 +267,35 @@ fun main() {
         t_pathguard_case_insensitive(),
         # --- security: headless 'ask' ---
         t_headless_ask_denied(),
-        t_headless_default_allowed_still_run()
+        t_headless_default_allowed_still_run(),
+        # --- tool-layer review fixes ---
+        t_bash_trailing_comment(),
+        t_bash_heredoc_last(),
+        t_bash_syntax_error_reaches_model(),
+        t_bg_trailing_comment(),
+        t_grep_invalid_regex_surfaces(),
+        t_grep_glob_default_path(),
+        t_file_watch_no_injection(),
+        t_file_watch_portable_mtime(),
+        t_wait_timeout_clamped(),
+        t_classifier_catches_bypasses(),
+        t_classifier_no_false_positives(),
+        t_command_tools_gated(),
+        t_denial_names_reason(),
+        t_sudo_tab_blocked(),
+        t_bg_sessions_isolated(),
+        t_pre_tool_hook_big_payload(),
+        t_configured_hook_big_payload(),
+        t_pre_tool_hook_fails_closed(),
+        t_hook_matcher_families(),
+        t_read_offset_past_64k(),
+        t_read_huge_file_window(),
+        t_edit_refuses_nul_and_huge(),
+        t_run_tests_quoting_timeout_output(),
+        t_edit_create_makes_parents(),
+        t_tilde_paths_expand(),
+        t_guardrail_counts_bash_exit_codes(),
+        t_schema_text_matches_code()
     ]
 
     passed = sum_list(results, 0)
@@ -2062,7 +2092,7 @@ fun t_bg_auto_after_ms_no_double_finalize() {
     backgrounded = bool_and3(
         string_contains(s, "[backgrounded"),
         string_contains(s, id),
-        string_contains(s, Background.log_path_for(id)))
+        string_contains(s, Background.log_path_for(table, id)))
 
     st = Background.wait_for_task(table, id, 6000)
     done_ok = if (st == 'done') { 'true' } else { 'false' }
@@ -3421,4 +3451,480 @@ fun t_headless_default_allowed_still_run() {
         eqs(Agent.resolve_permission('read', %{path: "/tmp/x"}, dflt), 'allow'),
         eqs(Agent.resolve_permission('bash', %{command: "mkfs /dev/sda1"}, dflt), 'deny')])
     check("headless: default-allowed tools still run; hardline still denies", ok)
+# Tool-layer review fixes
+# ------------------------------------------------------------
+
+# bash wrapped the command as `( export …; CMD ) </dev/null 2>&1`, so a
+# trailing `# comment` commented out the closing paren (and a final heredoc
+# terminator became `EOF ) </dev/null…`): sh saw a syntax error, the tool
+# returned `[exit 2]` with EMPTY output, and the error went to the agent's
+# own stderr instead of the model.
+fun t_bash_trailing_comment() {
+    r = Tools.exec_raw('bash', %{command: "echo hi-comment # say hi"}, %{})
+    check("bash: a trailing # comment doesn't break the wrapper",
+          bool_and(string_starts_with(r, "[exit 0]"), string_contains(r, "hi-comment")))
+}
+
+fun t_bash_heredoc_last() {
+    dir = "/tmp/swc_bash_heredoc"
+    shell("rm -rf " ++ dir ++ "; mkdir -p " ++ dir)
+    cmd = "cat > " ++ dir ++ "/app.py <<'EOF'\nprint(1)\nEOF"
+    r = Tools.exec_raw('bash', %{command: cmd}, %{})
+    body = file_read(dir ++ "/app.py")
+    shell("rm -rf " ++ dir)
+    check("bash: a command ending in a heredoc terminator runs",
+          bool_and(string_starts_with(r, "[exit 0]"),
+                   if (body == "print(1)\n") { 'true' } else { 'false' }))
+}
+
+# The model must SEE a shell syntax error — it used to land on the agent's
+# stderr, leaving the model with a bare `[exit 2]`.
+fun t_bash_syntax_error_reaches_model() {
+    r = Tools.exec_raw('bash', %{command: "echo \"unterminated"}, %{})
+    low = string_lower(r)
+    check("bash: a sh syntax error message reaches the model",
+          bool_and(if (string_starts_with(r, "[exit 0]") == 'false') { 'true' } else { 'false' },
+                   if (string_contains(low, "syntax error") == 'true' ||
+                       string_contains(low, "unexpected") == 'true') { 'true' } else { 'false' }))
+}
+
+# The auto-background path (interactive sessions) and the `background` tool
+# run the same wrapped script, so a trailing comment works there too.
+fun t_bg_trailing_comment() {
+    table = Background.init()
+    r = Tools.exec_raw('bash', %{command: "echo bg-comment-ok # note"}, bg_opts(table))
+    r2 = Tools.exec_raw('background', %{command: "echo bgtool-ok # note"}, %{bg_table: table})
+    id2 = "bg-1"
+    st2 = Background.wait_for_task(table, id2, 5000)
+    tail2 = Background.tail_log(table, id2, 5)
+    check("bash auto-bg + background tool: trailing # comment runs, exit 0",
+          bool_and3(bool_and(string_starts_with(r, "[exit 0]"), string_contains(r, "bg-comment-ok")),
+                    if (st2 == 'done') { 'true' } else { 'false' },
+                    string_contains(tail2, "bgtool-ok")))
+}
+
+# grep with an invalid regex returned "(no matches)": rg's error went to the
+# terminal (the `2>&1` sat after `| head`) and its exit code was dropped.
+fun t_grep_invalid_regex_surfaces() {
+    r = Tools.exec_raw('grep', %{pattern: "foo(", path: "src"}, %{})
+    check("grep: an invalid regex is reported to the model, not '(no matches)'",
+          bool_and(string_starts_with(r, "error:"), string_contains(string_lower(r), "regex")))
+}
+
+# grep/glob with no path search the cwd explicitly (never stdin) and still
+# print clean relative paths (no `./` prefix).
+fun t_grep_glob_default_path() {
+    g = Tools.exec_raw('grep', %{pattern: "^module Tools$"}, %{})
+    f = Tools.exec_raw('glob', %{pattern: "src/Tool*.sw"}, %{})
+    check("grep/glob without a path search cwd and print clean relative paths",
+          bool_and3(string_contains(g, "src/tools.sw:1:module Tools"),
+                    string_contains(f, "src/ToolExecutor.sw"),
+                    if (string_contains(g ++ f, "./src") == 'false') { 'true' } else { 'false' }))
+}
+
+# file_watch spliced the path into `p="…"` with only `"` escaped, so `$(…)`
+# and backticks in a model-supplied path RAN. It also used BSD-only
+# `stat -f %m`; GNU stat prints (changing) filesystem stats instead, so an
+# untouched file "changed" within 0.5s on Linux.
+fun t_file_watch_no_injection() {
+    pwned = "/tmp/swc_fw_PWNED"
+    file_delete(pwned)
+    r = Tools.exec_raw('file_watch', %{path: "/tmp/$(touch " ++ pwned ++ ")x", timeout_sec: 1}, %{})
+    r2 = Tools.exec_raw('file_watch', %{path: "/tmp/`touch " ++ pwned ++ "`y", timeout_sec: 1}, %{})
+    created = file_exists(pwned)
+    file_delete(pwned)
+    check("file_watch: $(…)/backticks in the path are not executed",
+          if (created == 'false') { 'true' } else { 'false' })
+}
+
+fun t_file_watch_portable_mtime() {
+    p = "/tmp/swc_fw_probe.txt"
+    file_write(p, "one\n")
+    quiet = Tools.exec_raw('file_watch', %{path: p, timeout_sec: 2}, %{})
+    # Modify it from a detached shell ~1s after the watch starts.
+    shell("(sleep 1; echo two >> " ++ p ++ ") >/dev/null 2>&1 & true")
+    changed = Tools.exec_raw('file_watch', %{path: p, timeout_sec: 6}, %{})
+    file_delete(p)
+    check("file_watch: an untouched file times out; a real write is detected",
+          bool_and(string_starts_with(quiet, "timeout:"), string_starts_with(changed, "ok: changed")))
+}
+
+# timeout_sec wasn't clamped: 0 meant 600s headless / unlimited on a TTY.
+fun t_wait_timeout_clamped() {
+    t0 = timestamp()
+    r = Tools.exec_raw('file_watch', %{path: "/tmp/swc_fw_never_there", timeout_sec: 0}, %{})
+    el = timestamp() - t0
+    check("log_wait/file_watch: timeout_sec clamped to [1,600] (0 → 1s, huge → 600, junk → 60)",
+          bool_and3(if (Tools.clamp_wait_timeout_s(0) == 1 && Tools.clamp_wait_timeout_s(99999) == 600) { 'true' } else { 'false' },
+                    if (Tools.clamp_wait_timeout_s(nil) == 60 && Tools.clamp_wait_timeout_s("soon") == 60) { 'true' } else { 'false' },
+                    bool_and(string_starts_with(r, "timeout:"), if (el < 5000) { 'true' } else { 'false' })))
+}
+
+# The hardline/dangerous gates matched raw substrings, so trivial respellings
+# sailed through. Every command here MUST be hard-denied (hardline).
+fun hardline_bypass_cases() {
+    ["rm -r -f /", "rm -fr /", "rm -Rf /*", "rm -rf  /*", "rm -rf --no-preserve-root /",
+     "rm -rf -- /", "rm --recursive --force /", ":(){ :|:& };:", "bomb(){ bomb|bomb& };bomb",
+     "chmod -R 000 /", "chown -R nobody /", "dd of=/dev/sda if=/dev/zero",
+     "dd bs=1M of=/dev/nvme0n1 if=img", "echo ok; shutdown -h now", "true && /sbin/reboot",
+     "sh -c 'mkfs.ext4 /dev/sdb1'", "bash -lc \"halt\"", "echo \"$(poweroff)\"", "echo `reboot`",
+     "systemctl poweroff", "cat /dev/zero > /dev/sda", "sudo rm -rf /", "r''eboot",
+     "x=1 init 0", "env FOO=1 mkswap /dev/sdc", "nohup telinit 6 &", "eval 'rm -rf /*'",
+     "find . -name x | xargs rm -rf /", "cd /tmp && { rm -rf /; }"]
+}
+
+# ...and every command here must at least ASK (dangerous tier).
+fun dangerous_bypass_cases() {
+    ["rm -rf \"$HOME\"", "rm -rf ~", "rm -rf ~/", "rm -r ${HOME}/*", "sudo\tls",
+     "sudo -u root ls", "ls; sudo reboot-ish", "rm -rf /etc/nginx", "dd if=x of=/dev/tty7"]
+}
+
+# False positives: words inside quoted args / echo / grep patterns / heredoc
+# bodies were hard-denied with no override. These must all be allowed.
+fun false_positive_cases() {
+    ["grep -r shutdown src/", "echo reboot required", "git commit -m 'halt the build'",
+     "cat > app.py <<'EOF'\ndef shutdown(self):\n    os.system('reboot')\nEOF",
+     "python3 - <<EOF\nprint('mkfs and rm -rf / are scary')\nEOF\necho done",
+     "python3 -c 'def shutdown(): pass'", "cat asphalt_survey.csv", "vim shutdown_handler.py",
+     "rm -rf ./build /tmp/x", "echo hi # shutdown now", "grep mkfs notes.txt",
+     "dd if=/dev/zero of=/dev/null count=1", "ls -la /tmp", "echo 'rm -rf /'",
+     "printf '%s\\n' \"sudo is just a word\"", "git log --grep=reboot", "man halt > /tmp/h.txt",
+     "rg -n 'poweroff|reboot' .", "echo \"init 0\""]
+}
+
+fun failing_cases(cases, pred, acc) {
+    if (length(cases) == 0) { acc }
+    else {
+        c = hd(cases)
+        next = if (pred(c) == 'true') { acc } else { list_append(acc, c) }
+        failing_cases(tl(cases), pred, next)
+    }
+}
+
+fun report_cases(label, bad) {
+    if (length(bad) > 0) { print("      " ++ label ++ ": " ++ json_encode(bad)) }
+    if (length(bad) == 0) { 'true' } else { 'false' }
+}
+
+fun t_classifier_catches_bypasses() {
+    bad_h = failing_cases(hardline_bypass_cases(),
+        fn(c) { Config.is_hardline_bash(%{command: c}) }, [])
+    bad_d = failing_cases(dangerous_bypass_cases(),
+        fn(c) { Config.is_dangerous_bash(%{command: c}) }, [])
+    check("command classifier: respelled rm/dd/chmod/halt/fork-bomb/sudo are caught",
+          bool_and(report_cases("not hardline", bad_h), report_cases("not dangerous", bad_d)))
+}
+
+fun t_classifier_no_false_positives() {
+    bad = failing_cases(false_positive_cases(),
+        fn(c) {
+            if (Config.is_hardline_bash(%{command: c}) == 'false' &&
+                Config.is_dangerous_bash(%{command: c}) == 'false' &&
+                ToolExecutor.permission_gate('bash', %{command: c}, %{settings: map_new()}) == 'ok') { 'true' }
+            else { 'false' }
+        }, [])
+    check("command classifier: words in quotes/echo/grep/heredocs are not flagged",
+          report_cases("wrongly flagged", bad))
+}
+
+# background / bg_server / run_tests.command ran shell commands with NO gate.
+fun t_command_tools_gated() {
+    o = %{settings: map_new()}
+    evil = "mkfs.ext4 /dev/sdz"
+    g_bg  = ToolExecutor.permission_gate('background', %{command: evil}, o)
+    g_srv = ToolExecutor.permission_gate('bg_server', %{command: evil}, o)
+    g_rt  = ToolExecutor.permission_gate('run_tests', %{repo_path: ".", command: evil}, o)
+    g_ask = ToolExecutor.permission_gate('background', %{command: "rm -rf ~/tmp"},
+                                         %{settings: map_new(), execution_context: "mcp_server"})
+    check("hardline/dangerous gates cover background, bg_server and run_tests",
+          bool_and(bool_and3(string_contains(to_string(g_bg), "permission denied"),
+                             string_contains(to_string(g_srv), "permission denied"),
+                             string_contains(to_string(g_rt), "permission denied")),
+                   string_contains(to_string(g_ask), "requires interactive permission")))
+}
+
+# A denial must say WHY (which pattern), so the model can adapt — it used to
+# be a bare "permission denied for tool 'bash'". A configured deny must also
+# stay a deny for a dangerous command (the dangerous gate turned it into ask).
+fun t_denial_names_reason() {
+    g = to_string(ToolExecutor.permission_gate('bash', %{command: "rm -fr /"}, %{settings: map_new()}))
+    d = Config.check_permission('bash', %{command: "rm -rf ~/x"},
+                                %{settings: %{permissions: %{bash: "deny"}}})
+    check("permission denial names the matched pattern; configured deny beats dangerous-ask",
+          bool_and3(string_contains(g, "hardline"), string_contains(g, "rm"),
+                    if (d == 'deny') { 'true' } else { 'false' }))
+}
+
+# The sudo refusal matched the literal "sudo " — a TAB bypassed it.
+fun t_sudo_tab_blocked() {
+    out = to_string(Tools.exec_raw('bash', %{command: "sudo\tls /"}, %{}))
+    out2 = to_string(Tools.exec_raw('background', %{command: "sudo ls /"}, %{bg_table: Background.init()}))
+    check("sudo refusal is token-aware (sudo<TAB>ls) and covers the background tool",
+          bool_and(string_starts_with(out, "error: sudo is disabled"),
+                   string_starts_with(out2, "error: sudo is disabled")))
+}
+
+# Background ids restart at bg-0 per session and the files lived at fixed
+# /tmp/swarm-code-bg-N.{log,pid,exit}: session B's launch deleted session A's
+# files and `bg_kill bg-0` in A killed B's task. Two tables = two sessions.
+fun t_bg_sessions_isolated() {
+    ta = Background.init()
+    tb = Background.init()
+    ida = Background.launch(ta, "sleep 30", "session A")
+    idb = Background.launch(tb, "sleep 30", "session B")
+    sleep(300)
+    pid_a = to_int_or_zero(ets_get(ta, ida ++ "/pid"))
+    pid_b = to_int_or_zero(ets_get(tb, idb ++ "/pid"))
+    Background.kill_task(ta, ida)
+    sleep(500)
+    a_dead = if (proc_live(pid_a) == 'false') { 'true' } else { 'false' }
+    b_alive = proc_live(pid_b)
+    Background.kill_task(tb, idb)
+    la = Background.log_path_for(ta, ida)
+    lb = Background.log_path_for(tb, idb)
+    dir_mode = string_trim(elem(shell("stat -c %a \"$(dirname " ++ la ++ ")\" 2>/dev/null || stat -f %Lp \"$(dirname " ++ la ++ ")\""), 1))
+    check("background: same task id in two sessions → separate private dirs; bg_kill hits only its own",
+          bool_and3(bool_and(if (ida == idb) { 'true' } else { 'false' }, if (la != lb) { 'true' } else { 'false' }),
+                    bool_and(a_dead, b_alive),
+                    if (dir_mode == "700") { 'true' } else { 'false' }))
+}
+
+fun to_int_or_zero(v) { if (v == nil) { 0 } else { Tools.to_int(v) } }
+
+# Running and not a zombie (container inits often never reap killed workers).
+fun proc_live(pid) {
+    st = string_trim(to_string(elem(shell("ps -o stat= -p " ++ to_string(pid) ++ " 2>/dev/null"), 1)))
+    if (string_length(st) > 0 && string_starts_with(st, "Z") == 'false') { 'true' } else { 'false' }
+}
+
+# Hook payloads went into the command line + an env var: a >128KB write hit
+# E2BIG, so the hook never ran, shell() polled 120s, and then a vetoing
+# pre_tool.sh was SKIPPED (call allowed) while a settings.json PreToolUse
+# hook reported `block` 120s late. The payload now arrives on stdin / in a
+# 0600 file; the hook runs promptly and its verdict is honoured.
+fun big_write_args(marker) {
+    %{path: "/tmp/swc_hook_target.txt", content: repeat_str(repeat_str("0123456789abcdef", 64), 200) ++ marker}
+}
+
+fun t_pre_tool_hook_big_payload() {
+    hook = "/tmp/swc_pre_tool_veto.sh"
+    file_write(hook, "#!/bin/sh\n# veto when the payload (stdin) carries the marker\n" ++
+                     "if grep -q HOOK_MARKER_BIG; then echo '{\"veto\": true}'; fi\n")
+    t0 = timestamp()
+    v = Hooks.run_pre_tool_at(hook, 'write', big_write_args("HOOK_MARKER_BIG"), "/tmp/swarm-code-hook-")
+    el = timestamp() - t0
+    small = Hooks.run_pre_tool_at(hook, 'write', %{path: "/tmp/x", content: "hi"}, "/tmp/swarm-code-hook-")
+    file_delete(hook)
+    check("pre_tool.sh: a >128KB payload reaches the hook (veto honoured, <10s)",
+          bool_and3(if (map_get(v, 'veto') == 'true') { 'true' } else { 'false' },
+                    if (el < 10000) { 'true' } else { 'false' },
+                    if (map_get(small, 'veto') == 'false') { 'true' } else { 'false' }))
+}
+
+fun t_configured_hook_big_payload() {
+    hook_cmd = "if grep -q HOOK_MARKER_BIG; then echo 'refusing big secret write' >&2; exit 3; fi; " ++
+               "[ -n \"$SWARM_CODE_ARGS_OMITTED\" ] || echo \"$SWARM_CODE_ARGS\" | grep -q hi"
+    opts = %{settings: %{hooks: %{PreToolUse: [%{matcher: "write", command: hook_cmd}]}}}
+    t0 = timestamp()
+    big = Config.run_hooks_verdict("PreToolUse", 'write', json_encode(big_write_args("HOOK_MARKER_BIG")), opts)
+    el = timestamp() - t0
+    small = Config.run_hooks_verdict("PreToolUse", 'write', json_encode(%{path: "/tmp/x", content: "hi"}), opts)
+    reason = if (big == 'ok') { "" } else { to_string(elem(big, 1)) }
+    check("settings.json PreToolUse hook: >128KB args via stdin, blocks promptly with its message",
+          bool_and3(bool_and(if (big != 'ok') { 'true' } else { 'false' }, string_contains(reason, "refusing big secret write")),
+                    if (el < 10000) { 'true' } else { 'false' },
+                    if (small == 'ok') { 'true' } else { 'false' }))
+}
+
+# A veto hook that cannot be run at all must fail CLOSED (deny, with why).
+fun t_pre_tool_hook_fails_closed() {
+    hook = "/tmp/swc_pre_tool_noop.sh"
+    file_write(hook, "#!/bin/sh\nexit 0\n")
+    v = Hooks.run_pre_tool_at(hook, 'bash', %{command: "ls"}, "/nonexistent-dir-swc/hook-")
+    file_delete(hook)
+    check("pre_tool.sh that can't be run (no payload file) vetoes with a reason",
+          bool_and(if (map_get(v, 'veto') == 'true') { 'true' } else { 'false' },
+                   string_contains(to_string(map_get(v, 'reason')), "could not run")))
+}
+
+# Hook matchers were bare substring checks: "edit|write" never fired for
+# multi_edit, and a "bash" hook never saw background/bg_server/run_tests —
+# the other tools that run shell commands. Claude-Code-style "Bash" /
+# "Edit|Write" never matched at all (case).
+fun matcher_blocks(matcher, tool) {
+    opts = %{settings: %{hooks: %{PreToolUse: [%{matcher: matcher, command: "exit 7"}]}}}
+    if (Config.run_hooks("PreToolUse", tool, "{}", opts) == 'block') { 'true' } else { 'false' }
+}
+
+fun t_hook_matcher_families() {
+    fires = bool_and3(
+        bool_and3(matcher_blocks("edit|write", 'multi_edit'), matcher_blocks("edit|write", 'write'),
+                  matcher_blocks("Edit", 'edit')),
+        bool_and3(matcher_blocks("bash", 'background'), matcher_blocks("bash", 'bg_server'),
+                  matcher_blocks("bash", 'run_tests')),
+        bool_and3(matcher_blocks("Bash", 'bash'), matcher_blocks("bash", 'file_watch'),
+                  matcher_blocks("*", 'read')))
+    quiet = bool_and3(
+        if (matcher_blocks("bash", 'read') == 'false') { 'true' } else { 'false' },
+        if (matcher_blocks("edit|write", 'bash') == 'false') { 'true' } else { 'false' },
+        if (matcher_blocks("write", 'multi_edit') == 'false') { 'true' } else { 'false' })
+    check("hook matchers: edit covers multi_edit, bash covers every shell tool, case-insensitive",
+          bool_and(fires, quiet))
+}
+
+# read loaded only `head -c 65000` and THEN applied offset/limit, so a
+# 20,000-line file read with offset 15000 came back EMPTY with no marker.
+fun make_lines_file(path, n) {
+    shell("awk 'BEGIN { for (i = 1; i <= " ++ to_string(n) ++ "; i++) printf \"line %d of the numbered test file\\n\", i }' > " ++ path)
+}
+
+fun t_read_offset_past_64k() {
+    p = "/tmp/swc_read_20k.txt"
+    make_lines_file(p, 20000)
+    r = Tools.exec_raw('read', %{path: p, offset: 15000, limit: 5}, %{})
+    d = Tools.exec_raw('read', %{path: p}, %{})
+    past = Tools.exec_raw('read', %{path: p, offset: 25000}, %{})
+    file_delete(p)
+    check("read: offset beyond the first 64KB works; caps and past-EOF are explicit",
+          bool_and3(bool_and3(string_starts_with(r, "15000\tline 15000 of"),
+                              string_contains(r, "15004\tline 15004 of"),
+                              string_contains(r, "offset=15005")),
+                    bool_and(string_contains(d, "[output capped"), string_contains(d, "offset=")),
+                    bool_and(string_contains(past, "past the end"), string_contains(past, "20000 lines"))))
+}
+
+# Files over file_read's 1MB cap are windowed with sed (never slurped).
+fun t_read_huge_file_window() {
+    p = "/tmp/swc_read_huge.txt"
+    make_lines_file(p, 40000)
+    r = Tools.exec_raw('read', %{path: p, offset: 39998, limit: 50}, %{})
+    file_delete(p)
+    check("read: a >1MB file reads its tail window by line number",
+          bool_and3(string_starts_with(r, "39998\tline 39998 of"),
+                    string_contains(r, "40000\tline 40000 of"),
+                    if (string_contains(r, "40001") == 'false') { 'true' } else { 'false' }))
+}
+
+# edit is file_read-based (a C string): a file with a NUL byte was
+# truncated at the NUL and reported ok; a >1MB file (file_read → nil) was
+# treated as MISSING, so old_string="" OVERWROTE it with new_string.
+fun t_edit_refuses_nul_and_huge() {
+    p = "/tmp/swc_edit_nul.bin"
+    file_write_bytes(p, bytes_from_ints([72, 69, 65, 68, 69, 82, 32, 97, 98, 99, 0, 1, 2, 32, 116, 97, 105, 108]))
+    e1 = Tools.exec_raw('edit', %{path: p, old_string: "HEADER", new_string: "HDR"}, %{})
+    e2 = Tools.exec_raw('multi_edit', %{path: p, edits: [%{old_string: "HEADER", new_string: "HDR"}]}, %{})
+    wd = ets_new()
+    Tools.exec_raw('write', %{path: p, content: "replaced"}, %{write_diff_table: wd})
+    stashed = ets_get(wd, p)
+    h = "/tmp/swc_edit_huge.txt"
+    make_lines_file(h, 40000)
+    sz0 = map_get(file_stat(h), 'size')
+    e3 = Tools.exec_raw('edit', %{path: h, old_string: "", new_string: "APPENDED"}, %{})
+    sz1 = map_get(file_stat(h), 'size')
+    file_delete(p)
+    file_delete(h)
+    check("edit/multi_edit refuse NUL-containing and >1MB files (no truncation, no overwrite)",
+          bool_and3(bool_and(string_contains(e1, "NUL"), string_contains(e2, "NUL")),
+                    if (stashed == nil) { 'true' } else { 'false' },
+                    bool_and(string_starts_with(e3, "error:"), if (sz0 == sz1) { 'true' } else { 'false' })))
+}
+
+# run_tests: repo_path was spliced unquoted into `cd … && cmd` (a space broke
+# it with exit 2; `;` injected), it ran under shell() with no timeout (a long
+# suite returned "Exit code: -1" with no output after 120s and was orphaned),
+# and a non-zero exit with no parsed failures showed no output at all.
+fun t_run_tests_quoting_timeout_output() {
+    dir = "/tmp/swc rt dir"
+    shell("mkdir -p '" ++ dir ++ "'")
+    pwned = "/tmp/swc_rt_PWNED"
+    file_delete(pwned)
+    ok_r = Tools.exec_raw('run_tests', %{repo_path: dir, command: "echo PASS: 3 FAIL: 0 TOTAL: 3"}, %{})
+    inj = Tools.exec_raw('run_tests', %{repo_path: "/tmp; touch " ++ pwned, command: "true"}, %{})
+    bad = Tools.exec_raw('run_tests', %{repo_path: dir, command: "echo boom-compile-error; exit 2"}, %{})
+    t0 = timestamp()
+    slow = Tools.exec_raw('run_tests', %{repo_path: dir, command: "echo started-rt; sleep 30", timeout_ms: 1500}, %{})
+    el = timestamp() - t0
+    injected = file_exists(pwned)
+    file_delete(pwned)
+    shell("rm -rf '" ++ dir ++ "'")
+    check("run_tests: quoted repo_path, no injection, timeout keeps output, failing output shown",
+          bool_and3(bool_and(string_contains(ok_r, "Passed: 3"), string_contains(ok_r, "Exit code: 0")),
+                    bool_and(if (injected == 'false') { 'true' } else { 'false' },
+                             string_contains(bad, "boom-compile-error")),
+                    bool_and3(string_contains(slow, "timed out"), string_contains(slow, "started-rt"),
+                              if (el < 10000) { 'true' } else { 'false' })))
+}
+
+# edit with old_string="" on a missing file creates it — but unlike write it
+# did not create parent directories, so a new file in a new dir failed.
+fun t_edit_create_makes_parents() {
+    root = "/tmp/swc_edit_newdir"
+    shell("rm -rf " ++ root)
+    p = root ++ "/a/b/new.txt"
+    r = Tools.exec_raw('edit', %{path: p, old_string: "", new_string: "hello\n"}, %{})
+    body = file_read(p)
+    shell("rm -rf " ++ root)
+    check("edit: creating a file in a missing directory makes the parents (like write)",
+          bool_and(string_starts_with(r, "ok: created"), if (body == "hello\n") { 'true' } else { 'false' }))
+}
+
+# `~` wasn't expanded: `read ~/.bashrc` → file not found, and `write ~/x`
+# created a literal ./~/ directory in the cwd.
+fun t_tilde_paths_expand() {
+    home = getenv("HOME")
+    name = "swc_tilde_probe_" ++ to_string(timestamp()) ++ ".txt"
+    w = Tools.exec_raw('write', %{path: "~/" ++ name, content: "tilde-ok\n"}, %{})
+    r = Tools.exec_raw('read', %{path: "~/" ++ name}, %{})
+    at_home = file_exists(home ++ "/" ++ name)
+    literal = file_exists("./~/" ++ name)
+    file_delete(home ++ "/" ++ name)
+    if (literal == 'true') { shell("rm -rf './~'") }
+    check("read/write expand ~/ to $HOME (no literal ./~ directory)",
+          bool_and3(string_starts_with(w, "ok:"), string_starts_with(r, "1\ttilde-ok"),
+                    bool_and(at_home, if (literal == 'false') { 'true' } else { 'false' })))
+}
+
+# The 8-consecutive-failures brake only counted results starting "error:",
+# but bash reports failure as "[exit N]" — so it never fired for bash.
+fun t_guardrail_counts_bash_exit_codes() {
+    opts = guardrail_opts()
+    fail_n(opts, 8)
+    table = map_get(opts, 'guardrails_table')
+    halted = ets_get(table, 'halt_reason')
+    opts2 = guardrail_opts()
+    fail_n(opts2, 7)
+    ToolGuardrails.observe_after(opts2, "bash", "[exit 0]\nok")
+    ToolGuardrails.observe_after(opts2, "bash", "[exit 1]\nfail")
+    t2 = map_get(opts2, 'guardrails_table')
+    check("guardrail: 8 consecutive non-zero [exit N] bash results halt; [exit 0] resets",
+          bool_and(if (halted != nil) { 'true' } else { 'false' },
+                   if (ets_get(t2, 'halt_reason') == nil) { 'true' } else { 'false' }))
+}
+
+fun fail_n(opts, n) {
+    if (n > 0) {
+        ToolGuardrails.observe_after(opts, "bash", "[exit 1]\nsomething failed")
+        fail_n(opts, n - 1)
+    }
+}
+
+# Schema text must describe what the code does: grep defaults to content
+# (not "file paths by default"); glob's output isn't mtime-sorted.
+fun schema_desc(schemas, name) {
+    if (length(schemas) == 0) { "" }
+    else {
+        f = map_get(hd(schemas), 'function')
+        if (to_string(map_get(f, 'name')) == name) { to_string(map_get(f, 'description')) }
+        else { schema_desc(tl(schemas), name) }
+    }
+}
+
+fun t_schema_text_matches_code() {
+    all = ToolSchemas.all_schemas()
+    g = schema_desc(all, "grep")
+    f = schema_desc(all, "glob")
+    check("tool schemas: grep says content by default; glob doesn't claim mtime order",
+          bool_and3(if (string_contains(g, "file paths by default") == 'false') { 'true' } else { 'false' },
+                    string_contains(g, "matching lines"),
+                    if (string_contains(f, "modification time") == 'false') { 'true' } else { 'false' }))
 }
