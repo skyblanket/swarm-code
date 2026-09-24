@@ -245,7 +245,8 @@ fun main() {
         t_hook_matcher_families(),
         t_read_offset_past_64k(),
         t_read_huge_file_window(),
-        t_edit_refuses_nul_and_huge()
+        t_edit_refuses_nul_and_huge(),
+        t_run_tests_quoting_timeout_output()
     ]
 
     passed = sum_list(results, 0)
@@ -3039,4 +3040,30 @@ fun t_edit_refuses_nul_and_huge() {
           bool_and3(bool_and(string_contains(e1, "NUL"), string_contains(e2, "NUL")),
                     if (stashed == nil) { 'true' } else { 'false' },
                     bool_and(string_starts_with(e3, "error:"), if (sz0 == sz1) { 'true' } else { 'false' })))
+}
+
+# run_tests: repo_path was spliced unquoted into `cd … && cmd` (a space broke
+# it with exit 2; `;` injected), it ran under shell() with no timeout (a long
+# suite returned "Exit code: -1" with no output after 120s and was orphaned),
+# and a non-zero exit with no parsed failures showed no output at all.
+fun t_run_tests_quoting_timeout_output() {
+    dir = "/tmp/swc rt dir"
+    shell("mkdir -p '" ++ dir ++ "'")
+    pwned = "/tmp/swc_rt_PWNED"
+    file_delete(pwned)
+    ok_r = Tools.exec_raw('run_tests', %{repo_path: dir, command: "echo PASS: 3 FAIL: 0 TOTAL: 3"}, %{})
+    inj = Tools.exec_raw('run_tests', %{repo_path: "/tmp; touch " ++ pwned, command: "true"}, %{})
+    bad = Tools.exec_raw('run_tests', %{repo_path: dir, command: "echo boom-compile-error; exit 2"}, %{})
+    t0 = timestamp()
+    slow = Tools.exec_raw('run_tests', %{repo_path: dir, command: "echo started-rt; sleep 30", timeout_ms: 1500}, %{})
+    el = timestamp() - t0
+    injected = file_exists(pwned)
+    file_delete(pwned)
+    shell("rm -rf '" ++ dir ++ "'")
+    check("run_tests: quoted repo_path, no injection, timeout keeps output, failing output shown",
+          bool_and3(bool_and(string_contains(ok_r, "Passed: 3"), string_contains(ok_r, "Exit code: 0")),
+                    bool_and(if (injected == 'false') { 'true' } else { 'false' },
+                             string_contains(bad, "boom-compile-error")),
+                    bool_and3(string_contains(slow, "timed out"), string_contains(slow, "started-rt"),
+                              if (el < 10000) { 'true' } else { 'false' })))
 }

@@ -428,7 +428,8 @@ fun run_tests_s() {
         "changes. If tests fail, fix them before committing.",
         obj(%{
             repo_path: s("Absolute path to the repository root"),
-            command: s("Optional: test command to run (defaults to npm test, pytest, etc)")
+            command: s("Optional: test command to run (defaults to npm test, pytest, etc)"),
+            timeout_ms: i("Optional: wall-clock limit in ms (default 300000, max 600000); on timeout the process group is killed and the partial output returned")
         }, ["repo_path"]))
 }
 

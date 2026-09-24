@@ -1,10 +1,26 @@
 module TestRunner
 
-export [run_tests, parse_output, test_gate, format_result]
+import Util
+
+export [run_tests, run_tests_timed, parse_output, test_gate, format_result, default_timeout_ms]
+
+# Default / maximum wall clock for a test run (overridable per call with the
+# tool's timeout_ms arg, clamped to [1s, 600s]).
+fun default_timeout_ms() { 300000 }
 
 # Run tests and return structured results
-# shell() returns {exit_code, stdout} as a tuple
 fun run_tests(repo_path, command) {
+  run_tests_timed(repo_path, command, default_timeout_ms())
+}
+
+# The suite runs under shell_managed: its own process group, a C-enforced
+# timeout that kills the whole tree (the old shell() call left a >120s suite
+# running, orphaned, and reported "Exit code: -1" with no output), and ESC
+# interrupts it. repo_path is single-quoted (a space in it broke `cd`, and a
+# `;` injected a command), and the script is Util.noninteractive_wrap'd:
+# stdin from /dev/null, stderr folded in, CI=1 exported, the command on its
+# own lines. On timeout the partial output is kept and timed_out is 'true'.
+fun run_tests_timed(repo_path, command, timeout_ms) {
   cmd = if (command == "") { detect_test_command(repo_path) } else { command }
   if (cmd == "") {
     # No explicit command and nothing recognizable in the repo. A clear hint
@@ -17,13 +33,15 @@ fun run_tests(repo_path, command) {
       raw: "run_tests: could not auto-detect a test framework in " ++ repo_path ++
            " (looked for package.json / Cargo.toml / go.mod / pyproject.toml / setup.py / pytest.ini / test_*.py). " ++
            "Pass an explicit 'command', e.g. \"pytest -q\".",
-      exit_code: 0
+      exit_code: 0,
+      timed_out: 'false'
     }
   } else {
-    full = "cd " ++ repo_path ++ " && " ++ cmd ++ " 2>&1"
-    result = shell(full)
+    full = Util.noninteractive_wrap("cd " ++ Util.shell_q(repo_path) ++ " || exit 2\n" ++ cmd)
+    result = shell_managed(full, timeout_ms)
     exit_code = elem(result, 0)
     stdout = elem(result, 1)
+    interrupted = elem(result, 2)
     parsed = parse_output(stdout)
 
     %{
@@ -35,7 +53,8 @@ fun run_tests(repo_path, command) {
       duration_ms: parsed.duration_ms,
       failures: parsed.failures,
       raw: stdout,
-      exit_code: exit_code
+      exit_code: exit_code,
+      timed_out: interrupted
     }
   }
 }

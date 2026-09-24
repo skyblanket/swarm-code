@@ -1780,7 +1780,8 @@ fun ddg_python_script() {
 # ------------------------------------------------------------
 # run_tests  parse and gate on test output from any framework
 # ------------------------------------------------------------
-# args: {"repo_path": "/path/to/repo", "command": "npm test" (optional)}
+# args: {"repo_path": "/path/to/repo", "command": "npm test" (optional),
+#        "timeout_ms": 300000 (optional, 1000..600000)}
 fun do_run_tests(args) {
     repo = map_get(args, 'repo_path')
     cmd = map_get(args, 'command')
@@ -1788,19 +1789,30 @@ fun do_run_tests(args) {
     else { if (cmd != nil && sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
     else {
         command = if (cmd == nil) { "" } else { to_string(cmd) }
-        result = TestRunner.run_tests(to_string(repo), command)
+        t_raw = map_get(args, 'timeout_ms')
+        t_s = if (t_raw == nil) { TestRunner.default_timeout_ms() / 1000 } else { resolve_bash_timeout_s(t_raw) }
+        result = TestRunner.run_tests_timed(to_string(repo), command, t_s * 1000)
         fw = map_get(result, 'framework')
         passed = map_get(result, 'passed')
         failed = map_get(result, 'failed')
         total = map_get(result, 'total')
         exit_code = map_get(result, 'exit_code')
         raw = map_get(result, 'raw')
-        summary = "Framework: " ++ fw ++ "\n" ++
+        timed_out = map_get(result, 'timed_out')
+        banner = if (timed_out == 'true') {
+            if (exit_code == 130) { "[stopped by user (ESC/Ctrl-C) — test process group killed]\n" }
+            else { "[timed out after " ++ to_string(t_s) ++ "s — test process group killed; pass a larger timeout_ms or a narrower command]\n" }
+        } else { "" }
+        summary = banner ++
+                  "Framework: " ++ fw ++ "\n" ++
                   "Passed: " ++ to_string(passed) ++ "\n" ++
                   "Failed: " ++ to_string(failed) ++ "\n" ++
                   "Total: " ++ to_string(total) ++ "\n" ++
                   "Exit code: " ++ to_string(exit_code)
-        if (failed > 0) {
+        # Show the output tail whenever something went wrong — failed tests,
+        # a non-zero exit with nothing parsed (compile error, missing tool),
+        # or a timeout — not only when the parser counted failures.
+        if (failed > 0 || exit_code != 0 || timed_out == 'true') {
             cap = run_tests_raw_cap()
             tail = if (string_length(raw) > cap) {
                 string_sub(raw, string_length(raw) - cap, cap)
