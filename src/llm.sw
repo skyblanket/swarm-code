@@ -619,28 +619,6 @@ fun parse_positive_int_local(s, i, acc, saw_digit) {
     }
 }
 
-# inband mode fallback: pull the text block out of a multimodal
-# content list. Images are dropped silently — inband protocol
-# (Gemma 4 in-band tool calls) is text-only.
-# Workaround for a swarmrt-side bug: http_post_stream's content
-# accumulator doesn't decode \uXXXX JSON escapes for ASCII-range
-# characters, so prose like `df -h / && free` comes through as
-# `df -h / u0026u0026 free` (the backslash is gone, but the `uXXXX`
-# stays). Until swarmrt's stream emitter is fixed, replace the most
-# common offenders on the prose we extracted. Limited to chars that
-# almost never appear as a literal `uXXXX` in real prose, so the
-# false-positive risk is negligible.
-fun fix_json_unicode_escapes(s) {
-    s1 = string_replace(s,  "u0026", "&")
-    s2 = string_replace(s1, "u003c", "<")
-    s3 = string_replace(s2, "u003e", ">")
-    s4 = string_replace(s3, "u0027", "'")
-    s5 = string_replace(s4, "u0022", "\"")
-    s6 = string_replace(s5, "u002f", "/")
-    s7 = string_replace(s6, "u003d", "=")
-    string_replace(s7,      "u005c", "\\")
-}
-
 # True when the only content the model produced is the C-side truncation
 # marker — a reasoning-only turn that hit max_tokens. Lets the recovery
 # surface the reasoning instead of showing a near-blank turn.
@@ -654,6 +632,9 @@ fun is_truncation_marker_only(prose) {
     }
 }
 
+# inband mode fallback: pull the text block out of a multimodal
+# content list. Images are dropped silently — inband protocol
+# (Gemma 4 in-band tool calls) is text-only.
 fun extract_text_block(content_list) {
     if (length(content_list) == 0) { "" }
     else {
@@ -1899,8 +1880,11 @@ fun chat_native(messages, opts) {
                     msg_obj = map_get(choice0, 'message')
                     raw_content = map_get(msg_obj, 'content')
                     raw_tool_calls = map_get(msg_obj, 'tool_calls')
-                    prose_raw = if (raw_content == nil) { "" }
-                                else { fix_json_unicode_escapes(to_string(raw_content)) }
+                    # Content is used verbatim: the runtime already decodes \uXXXX
+                    # escapes. (A u003c -> "<" "repair" pass left over from an old
+                    # runtime bug turned "\u003c" in code into "\<" and mangled
+                    # prose that mentions such escapes.)
+                    prose_raw = if (raw_content == nil) { "" } else { to_string(raw_content) }
                     # Length-truncation recovery: when the server stops on
                     # max_tokens with an empty content but populated
                     # reasoning_content (Kimi K2 thinking mid-stream), we'd
@@ -2065,7 +2049,10 @@ fun chat_inband(messages, opts) {
             reason_text = extract_reasoning(resp)
             record_reasoning(opts, reason_text)
 
-            parsed = parse_inband_tool_calls(fix_json_unicode_escapes(to_string(raw_content)))
+            # Verbatim, like chat_native — the runtime already decoded \uXXXX, so
+            # a JSON escape the model put INSIDE call:NAME{...} arguments
+            # (\u003c for "<") is decoded once, by the arguments' own parse.
+            parsed = parse_inband_tool_calls(to_string(raw_content))
             prose_raw = map_get(parsed, 'content')
             tool_calls = map_get(parsed, 'tool_calls')
 
@@ -2307,8 +2294,7 @@ fun chat_for_subagent(messages, opts, target_pid, name) {
                 choice0 = hd(choices)
                 msg_obj = map_get(choice0, 'message')
                 raw_content = map_get(msg_obj, 'content')
-                prose_raw = if (raw_content == nil) { "" }
-                            else { fix_json_unicode_escapes(to_string(raw_content)) }
+                prose_raw = if (raw_content == nil) { "" } else { to_string(raw_content) }
                 tool_format = map_get(opts, 'tool_format')
                 result_map = if (tool_format == 'native') {
                     %{

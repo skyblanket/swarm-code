@@ -28,6 +28,7 @@
 #   T16 /compact safety     — no-op when nothing is old, merges summaries, 503 keeps all
 #   T17 mid-turn compaction — the live user request survives compaction
 #   T18 fatal 4xx           — completed tool pairs survive; context overflow retries once
+#   T19 escapes round-trip  — "<div>" / "\u003c" in args and prose, native + inband
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -99,21 +100,24 @@ new_case() {
 
 # run_swarm <args...> — run the binary headless with the isolated env,
 # 90s watchdog (LLM retry backoff can stack up on a broken path).
-# Captures stdout/stderr into $CASE, sets RC. RUN_ENV="VAR=val ..." adds
-# (or overrides) environment variables for this one run.
+# Captures stdout/stderr into $CASE, sets RC. RUN_ENV="VAR=val ..." adds or
+# overrides environment variables for this one run; RUN_UNSET="VAR ..."
+# removes defaults (e.g. SWARM_CODE_MODEL, to exercise settings/overrides).
 run_swarm() {
     (
         cd "$WORK" || exit 97
+        export HOME="$CASE_HOME" \
+               SWARM_CODE_EXECUTION_CONTEXT="${RUN_EXECUTION_CONTEXT:-main}" \
+               SWARM_CODE_ENDPOINT="http://127.0.0.1:$PORT" \
+               SWARM_CODE_MODEL=test \
+               SWARM_CODE_TOOL_FORMAT=native \
+               SWARM_CODE_PLAN=off \
+               SWARM_CODE_NO_RESUME=0 \
+               PWD="${RUN_PWD:-$PWD}"
         # shellcheck disable=SC2086
         if [ -n "${RUN_ENV:-}" ]; then export $RUN_ENV; fi
-        HOME="$CASE_HOME" \
-        SWARM_CODE_EXECUTION_CONTEXT="${RUN_EXECUTION_CONTEXT:-main}" \
-        SWARM_CODE_ENDPOINT="http://127.0.0.1:$PORT" \
-        SWARM_CODE_MODEL=test \
-        SWARM_CODE_TOOL_FORMAT=native \
-        SWARM_CODE_PLAN=off \
-        SWARM_CODE_NO_RESUME=0 \
-        PWD="${RUN_PWD:-$PWD}" \
+        # shellcheck disable=SC2086
+        if [ -n "${RUN_UNSET:-}" ]; then unset $RUN_UNSET; fi
         "$BIN" "$@" </dev/null >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
     ) &
     local pid=$!
@@ -776,11 +780,57 @@ PYEOF
 }
 
 # ------------------------------------------------------------
+# T19 — text round-trips byte for byte: "<div>", "<" and a literal <
+#       (JS source) in tool arguments and prose, native and inband. A
+#       u003c -> "<" "repair" pass (for a long-fixed runtime bug) turned
+#       "<" into "\<" — in files the model wrote and in its prose.
+# ------------------------------------------------------------
+t19() {
+    new_case t19
+    python3 - "$CASE" "$WORK" <<'PYEOF'
+import json, sys
+case, work = sys.argv[1], sys.argv[2]
+# The file the model means to write: markup, a bare "<", and a JS <
+# escape that must land as the six characters backslash-u-0-0-3-c.
+want = 's = "<div>";\nlt = "<";\njs = "\\u003cp\\u003e";\n'
+open(case + "/want.txt", "w").write(want)
+args = json.dumps({"path": work + "/esc.js", "content": want})
+# Some models JSON-escape "<" as < inside the arguments: decoded once
+# by the argument parse, it must become a plain "<".
+args_escaped = args.replace('"<div>"', '"\\u003cdiv\\u003e"')
+prose = 'Use <div>, not \\u003cdiv\\u003e, when the text says "<".'
+open(case + "/prose.txt", "w").write(prose)
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_esc", "name": "write", "arguments": args_escaped}]},
+    {"type": "text", "content": prose}]}, open(case + "/native.json", "w"))
+json.dump({"responses": [
+    {"type": "text", "content": "Writing it.\ncall:write" + args_escaped},
+    {"type": "text", "content": prose}]}, open(case + "/inband.json", "w"))
+PYEOF
+    local fmt
+    for fmt in native inband; do
+        rm -f "$WORK/esc.js"
+        start_mock "$CASE/$fmt.json" || { fail T19 "$fmt: mock failed to start"; return; }
+        RUN_ENV="SWARM_CODE_TOOL_FORMAT=$fmt" run_swarm -p "write esc.js" --no-resume --json
+        cleanup
+        if [ "$RC" -ne 0 ]; then fail T19 "$fmt: exit code $RC"; return; fi
+        if ! cmp -s "$WORK/esc.js" "$CASE/want.txt"; then
+            fail T19 "$fmt: file content changed: $(cat "$WORK/esc.js" 2>/dev/null)"; return
+        fi
+        if ! python3 -c 'import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if d["summary"]==open(sys.argv[2]).read() else 1)' \
+                "$CASE/stdout.txt" "$CASE/prose.txt"; then
+            fail T19 "$fmt: prose changed: $(final_json)"; return
+        fi
+    done
+    pass T19
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"
