@@ -67,6 +67,9 @@ backported.
 
 ## Known limitations
 
+- Protected paths are enforced by the file tools (`write`, `edit`,
+  `multi_edit`, `browser_screenshot`), not by the shell: a `bash` command can
+  still write anywhere your user can, so review the commands you approve.
 - The council panel's read-only isolation is **tool-level**, not yet a filesystem
   sandbox — panelists inherit the read tool's filesystem visibility.
 - swarm-code runs the commands you (or a model you configured) direct it to. Run

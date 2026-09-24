@@ -1063,8 +1063,13 @@ fun run_doctor() {
     hdrs = if (api_key == nil) { [{"Accept", "application/json"}] }
            else { [{"Accept", "application/json"},
                    {"Authorization", "Bearer " ++ to_string(api_key)}] }
-    resp = http_get(models_url, hdrs)
-    if (resp == nil) {
+    # Same gate as the LLM layer: no request (and no API key) goes to a
+    # remote host unless SWARM_CODE_ALLOW_REMOTE=1.
+    refused = Config.endpoint_refusal(models_url)
+    resp = if (refused != nil) { nil } else { http_get(models_url, hdrs) }
+    if (refused != nil) {
+        print("   - skipped: not contacting a remote endpoint without SWARM_CODE_ALLOW_REMOTE=1")
+    } else { if (resp == nil) {
         print("   ✗ " ++ models_url ++ " — no response (network down? endpoint typo?)")
         errors = errors + 1
     } else {
@@ -1090,7 +1095,7 @@ fun run_doctor() {
                       to_string(length(data)) ++ " model(s) advertised")
             }
         }}
-    }
+    }}
     print("")
 
     # 6. Skills / memory inventory
