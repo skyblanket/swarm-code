@@ -1866,6 +1866,10 @@ fun chat_native(messages, opts) {
                                 else { if (string_contains(to_string(prose_raw),
                                           "[Response truncated at max_tokens") == 'true') { 'true' }
                                 else { 'false' }}
+                    # ESC landed mid-stream (the runtime appends the marker; the
+                    # sync path still hands back the tool calls streamed so far,
+                    # arguments possibly cut mid-string). run_turn must not run them.
+                    interrupted = stream_interrupted(prose_raw)
 
                     had_tools = if (length(tool_calls) > 0) { 'true' } else { 'false' }
                     Log.llm_response(latency, string_length(prose), had_tools)
@@ -1887,12 +1891,22 @@ fun chat_native(messages, opts) {
                         content: prose,
                         tool_calls: tool_calls,
                         reasoning: reason_text,
-                        truncated: truncated
+                        truncated: truncated,
+                        interrupted: interrupted
                     }
                 }
             }
         }
     }
+}
+
+# The user stopped this stream (ESC/Ctrl-C): the runtime — and routed mode's
+# interrupted_stream_result — append "[Request interrupted by user]" to the
+# content. Checked on the RAW content: inband parsing cuts the prose at the
+# first call marker, which would drop the marker along with it.
+fun stream_interrupted(raw) {
+    if (string_ends_with(string_trim(to_string(raw)), "[Request interrupted by user]") == 'true') { 'true' }
+    else { 'false' }
 }
 
 # Convert OpenAI tool_calls → internal flat shape.
@@ -2029,10 +2043,13 @@ fun chat_inband(messages, opts) {
             # post_stream_render.
             post_stream_render(opts, to_string(prose), had_tools)
 
-            # F4: same length-truncation signal as chat_native.
+            # F4: same length-truncation signal as chat_native. Tested on the RAW
+            # content: when calls were parsed, prose_raw ends at the first call
+            # marker and the runtime's truncation/interrupt marker (appended at
+            # the very end) is no longer in it.
             fin = extract_finish_reason(resp)
             truncated = if (fin == "length") { 'true' }
-                        else { if (string_contains(to_string(prose_raw),
+                        else { if (string_contains(to_string(raw_content),
                                   "[Response truncated at max_tokens") == 'true') { 'true' }
                         else { 'false' }}
 
@@ -2040,7 +2057,8 @@ fun chat_inband(messages, opts) {
                 content: prose,
                 tool_calls: tool_calls,
                 reasoning: reason_text,
-                truncated: truncated
+                truncated: truncated,
+                interrupted: stream_interrupted(raw_content)
             }
         }
     }

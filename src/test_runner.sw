@@ -34,6 +34,7 @@ import MemVec
 import ToolExecutor
 import ToolRegistry
 import Background
+import Util
 
 fun main() {
     print("")
@@ -221,7 +222,13 @@ fun main() {
         t_read_js_is_text(),
         t_read_line_count_and_empty(),
         t_read_missing_and_binary(),
-        t_edit_crlf_file()
+        t_edit_crlf_file(),
+        # --- cut-off tool calls are never dispatched ---
+        t_json_args_well_formed(),
+        t_args_malformed_despite_lenient_decode(),
+        t_cut_turn_reason(),
+        t_cut_turn_calls_refused(),
+        t_sanitize_cut_tool_calls()
     ]
 
     passed = sum_list(results, 0)
@@ -584,11 +591,10 @@ fun t_drop_to_last_clean_user() {
 
 # F2: trailing_turn_incomplete keeps a COMPLETE tool turn (every tool_call
 # answered) and flags a PARTIAL one (a tool_call left unanswered) — the robust
-# detection that doesn't depend on json_decode. (NB: the args-malformed sub-check
-# is only a weak backup: sw's json_decode is lenient and recovers truncated JSON
-# into a partial map rather than nil, so a mid-string-truncated tool_call is
-# caught by F4's finish_reason/marker path and this partial-tool-set check, not
-# by json_decode==nil.)
+# detection that doesn't depend on json_decode. (NB: sw's json_decode is lenient
+# and recovers truncated JSON into a partial map rather than nil; the
+# args-malformed sub-check uses the strict Util.json_args_well_formed for that —
+# see t_args_malformed_despite_lenient_decode.)
 fun t_trailing_turn_incomplete_detection() {
     complete = [%{role: 'user', content: "u"},
                 %{role: 'assistant', content: "", tool_calls: [%{id: "1", arguments: "{}"}]},
@@ -2636,4 +2642,77 @@ fun t_edit_crlf_file() {
     check("edit: LF old_string matches a CRLF file and writes CRLF",
           bool_and(string_starts_with(r, "ok:"),
                    if (aft == "ONE\r\nTWO\r\nthree\r\n") { 'true' } else { 'false' }))
+}
+
+# ------------------------------------------------------------
+# Cut-off tool calls are never dispatched
+# ------------------------------------------------------------
+fun wf(s) { Util.json_args_well_formed(s) }
+
+# The strict structural check the lenient json_decode doesn't do.
+fun t_json_args_well_formed() {
+    good = bool_and3(wf("{\"command\":\"echo hi\"}"),
+                     wf("  {\"a\":[1,{\"b\":\"}]\\\"\"}],\"c\":\"\"}\n"),
+                     wf("{\"x\":\"café 漢 \\\\\"}"))
+    bad = bool_and3(bool_not(wf("{\"command\":\"echo hi")),
+                    bool_not(wf("{\"a\":[1,2}")),
+                    bool_and3(bool_not(wf("{\"a\":1}{\"b\":2}")),
+                              bool_not(wf("{\"a\":\"q\\\"}")),
+                              bool_not(wf("\"just a string\""))))
+    check("json_args_well_formed: complete objects pass; cut strings/containers, trailing values fail",
+          bool_and(good, bad))
+}
+
+# The reviewer's repro: json_decode accepts a write cut mid-string, so the
+# old `json_decode == nil` test let it run and wrote half a config file.
+fun t_args_malformed_despite_lenient_decode() {
+    cut = "{\"path\": \"config.py\", \"content\": \"SETTINGS = {\\n  'db_url': 'postgres://prod"
+    check("args_malformed: a write cut mid-string is malformed although json_decode accepts it",
+          bool_and3(if (json_decode(cut) != nil) { 'true' } else { 'false' },
+                    Agent.args_malformed(cut),
+                    bool_and3(bool_not(Agent.args_malformed("{\"command\":\"ls\"}")),
+                              bool_not(Agent.args_malformed("")),
+                              bool_not(Agent.args_malformed("{}")))))
+}
+
+fun t_cut_turn_reason() {
+    tr = Agent.turn_cut_reason(%{content: "x", truncated: 'true'})
+    it = Agent.turn_cut_reason(%{content: "x", truncated: 'false', interrupted: 'true'})
+    im = Agent.turn_cut_reason(%{content: "Creating file.\n\n[Request interrupted by user]"})
+    ok = Agent.turn_cut_reason(%{content: "done", truncated: 'false', interrupted: 'false'})
+    check("turn_cut_reason: truncated / interrupted (flag or marker) / complete",
+          bool_and(bool_and(eqs(tr, 'truncated'), eqs(it, 'interrupted')),
+                   bool_and(eqs(im, 'interrupted'), eqs(ok, 'complete'))))
+}
+
+# Every call of a cut-off turn gets a not-run result (history stays valid);
+# an interrupted one reads as a user interrupt so the turn ends.
+fun t_cut_turn_calls_refused() {
+    calls = [%{id: "w1", name: "write", arguments: "{\"path\": \"c.py\", \"content\": \"x = 'pro"},
+             %{id: "b1", name: "bash", arguments: "{\"command\":\"ls\"}"}]
+    base = [LLM.new_message_user("go"), LLM.new_message_assistant("", calls, nil)]
+    tr = Agent.refuse_tool_calls(calls, base, 'truncated', %{is_subagent: 'true'})
+    it = Agent.refuse_tool_calls(calls, base, 'interrupted', %{is_subagent: 'true'})
+    t3 = hd(tl(tl(tr)))
+    t4 = hd(tl(tl(tl(tr))))
+    ids_ok = if (length(tr) == 4 && map_get(t3, 'tool_call_id') == "w1" &&
+                 map_get(t4, 'tool_call_id') == "b1") { 'true' } else { 'false' }
+    tr_ok = bool_and(string_starts_with(to_string(map_get(t3, 'content')), "error: not executed"),
+                     string_contains(to_string(map_get(t3, 'content')), "cut off after"))
+    check("refuse_tool_calls: one not-run result per call; interrupted ends the turn",
+          bool_and3(ids_ok, tr_ok,
+                    bool_and(Agent.turn_interrupted(it, 2),
+                             bool_not(Agent.turn_interrupted(tr, 2)))))
+}
+
+# History keeps "{}" for cut-off arguments (servers that parse them reject
+# every later request); complete arguments are kept verbatim.
+fun t_sanitize_cut_tool_calls() {
+    calls = [%{id: "a", name: "bash", arguments: "{\"command\": \"touch /tmp/x"},
+             %{id: "b", name: "bash", arguments: "{\"command\":\"ls\"}"}]
+    out = Agent.sanitize_tool_calls(calls, [])
+    check("sanitize_tool_calls: cut-off arguments stored as {}, complete ones untouched",
+          bool_and3(eqs(map_get(hd(out), 'arguments'), "{}"),
+                    eqs(map_get(hd(tl(out)), 'arguments'), "{\"command\":\"ls\"}"),
+                    eqs(map_get(hd(out), 'id'), "a")))
 }

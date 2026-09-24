@@ -20,7 +20,11 @@
 #   T8  council boundary    — read-only panel cannot execute shell commands
 #   T9  clean stdout        — headless stdout is only the JSON line / answer
 #   T10 stale PWD           — the real cwd, not $PWD, reaches the system prompt
+#   T11 truncated tool call — finish_reason=length: the cut-off write never runs
+#   T12 malformed args      — cut mid-string, no finish_reason: strict check stops it
+#   T13 interrupted stream  — tool calls of an ESC-interrupted stream never run
 #
+# Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
 
 set -u
@@ -116,21 +120,28 @@ run_swarm() {
 # final_json — last {"status":...} line the binary printed.
 final_json() { grep '"status"' "$CASE/stdout.txt" | tail -1; }
 
-# req_has <n> <substring> — assert request #n to the mock contains the
-# substring anywhere in its messages payload. Exit 0/1.
+# req_has <n> <substring> — assert streaming request #n (an agent turn) to
+# the mock contains the substring anywhere in its messages payload. Exit 0/1.
 req_has() {
     python3 - "$REQLOG" "$1" "$2" <<'PYEOF'
 import json, sys
 path, n, needle = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 for line in open(path):
     r = json.loads(line)
-    if r["n"] == n:
+    if r["n"] == n and r.get("kind", "stream") == "stream":
         sys.exit(0 if needle in json.dumps(r["body"].get("messages", [])) else 1)
 sys.exit(1)
 PYEOF
 }
 
+# req_count — requests of every kind; stream_count / silent_count split
+# agent turns from non-streaming ones (compaction's summarizer).
 req_count() { wc -l <"$REQLOG" | tr -d ' '; }
+stream_count() { grep -c '"kind": "stream"' "$REQLOG"; }
+silent_count() { grep -c '"kind": "silent"' "$REQLOG"; }
+
+# journal_file — the session journal .active points at (for resume checks).
+journal_file() { cat "$CASE_HOME/.swarm-code/sessions/.active" 2>/dev/null; }
 
 # ------------------------------------------------------------
 # T1 — plain prompt, final JSON line carries the scripted text
@@ -400,19 +411,96 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T11 — a tool call cut off at the output-token limit (finish_reason
+#       "length", arguments ending mid-string) is NOT run: the file is never
+#       written, the model is told why and asked to reissue, and history
+#       keeps "{}" instead of the cut-off blob.
+# ------------------------------------------------------------
+t11() {
+    new_case t11
+    python3 - "$CASE/scenario.json" "$WORK" <<'PYEOF'
+import json, sys
+out, work = sys.argv[1], sys.argv[2]
+full = json.dumps({"path": work + "/config.py",
+                   "content": "SETTINGS = {\n  'debug': False,\n  'db_url': 'postgres://prod-db/app'\n}\n"})
+cut = full[:full.index("postgres://prod") + len("postgres://prod")]
+json.dump({"responses": [
+    {"type": "tool_calls", "finish": "length",
+     "calls": [{"id": "call_cut", "name": "write", "arguments": cut}]},
+    {"type": "text", "content": "REISSUE_ACK_T11"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T11 "mock failed to start"; return; }
+    run_swarm -p "write the config" --no-resume --json
+    cleanup
+    local out; out="$(final_json)"
+    if [ -e "$WORK/config.py" ]; then fail T11 "truncated write was executed: $(cat "$WORK/config.py")"
+    elif [ "$RC" -ne 0 ]; then fail T11 "exit code $RC"
+    elif ! req_has 1 "error: not executed"; then fail T11 "model never told the cut-off call did not run"
+    elif ! req_has 1 "none of them ran"; then fail T11 "truncation nudge missing"
+    elif req_has 1 "postgres://prod"; then fail T11 "cut-off arguments were sent back verbatim"
+    elif ! echo "$out" | grep -q "REISSUE_ACK_T11"; then fail T11 "final text missing: $out"
+    else pass T11; fi
+}
+
+# ------------------------------------------------------------
+# T12 — arguments cut mid-string WITHOUT a length finish_reason (the lenient
+#       json_decode accepts them) are caught by the strict JSON check.
+# ------------------------------------------------------------
+t12() {
+    new_case t12
+    local sentinel="$WORK/SENTINEL_T12"
+    python3 - "$CASE/scenario.json" "$sentinel" <<'PYEOF'
+import json, sys
+out, sentinel = sys.argv[1], sys.argv[2]
+json.dump({"responses": [
+    {"type": "tool_calls",
+     "calls": [{"id": "call_m", "name": "bash",
+                "arguments": '{"command": "touch ' + sentinel}]},
+    {"type": "text", "content": "MALFORMED_ACK_T12"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T12 "mock failed to start"; return; }
+    run_swarm -p "touch it" --no-resume --json
+    cleanup
+    if [ -e "$sentinel" ]; then fail T12 "malformed (cut) command was executed"
+    elif [ "$RC" -ne 0 ]; then fail T12 "exit code $RC"
+    elif ! req_has 1 "were not valid JSON"; then fail T12 "model never told the arguments were malformed"
+    else pass T12; fi
+}
+
+# ------------------------------------------------------------
+# T13 — a stream the user interrupted (the runtime's "[Request interrupted
+#       by user]" marker) never runs the tool calls it carried, and the turn
+#       ends without calling the model again.
+# ------------------------------------------------------------
+t13() {
+    new_case t13
+    local sentinel="$WORK/SENTINEL_T13"
+    python3 - "$CASE/scenario.json" "$sentinel" <<'PYEOF'
+import json, sys
+out, sentinel = sys.argv[1], sys.argv[2]
+json.dump({"responses": [
+    {"type": "tool_calls", "content": "Creating the file.\n\n[Request interrupted by user]",
+     "calls": [{"id": "call_i", "name": "bash", "arguments": {"command": "touch " + sentinel}}]},
+    {"type": "text", "content": "SHOULD_NOT_BE_CALLED_T13"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T13 "mock failed to start"; return; }
+    run_swarm -p "make the file" --json
+    cleanup
+    local journal; journal="$(journal_file)"
+    if [ -e "$sentinel" ]; then fail T13 "tool call from an interrupted stream was executed"
+    elif [ "$(req_count)" -ne 1 ]; then fail T13 "expected 1 request (turn ends), got $(req_count)"
+    elif ! grep -q 'call_i' "$journal" || ! grep -q '\[interrupted\]' "$journal"; then
+        fail T13 "journal lacks the [interrupted] result for the call"
+    else pass T13; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
-t1
-t2
-t3
-t4
-t5
-t6
-t7
-t8
-t9
-t10
+# `run.sh t11 t12` runs just those cases; no arguments runs them all.
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13"
+for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

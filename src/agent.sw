@@ -47,7 +47,8 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         looks_like_slash_command, is_known_slash_command, bg_normalize_id,
         get_session_mode, set_session_mode, next_mode, resolve_permission,
         show_expand, handle_bg_command, route_input,
-        skip_remaining_tools, turn_interrupted]
+        skip_remaining_tools, turn_interrupted,
+        args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -304,17 +305,43 @@ fun drop_trailing_tool_turn(msgs) {
     drop_last(msgs, tools_run + 1)
 }
 
-# True when any tool_call carries a non-empty arguments blob that fails to
-# json_decode (truncated mid-string) — the turn is poisoned and unsendable.
+# True when any tool_call carries a non-empty arguments blob that is not one
+# complete JSON value (truncated mid-string) — the turn is poisoned and unsendable.
 fun tcs_args_malformed(tcs) {
     if (length(tcs) == 0) { 'false' }
     else {
         tc = hd(tcs)
-        raw = to_string(map_get(tc, 'arguments'))
-        trimmed = string_trim(raw)
-        bad = if (trimmed == "" || trimmed == "{}" || trimmed == "null") { 'false' }
-              else { if (json_decode(raw) == nil) { 'true' } else { 'false' } }
-        if (bad == 'true') { 'true' } else { tcs_args_malformed(tl(tcs)) }
+        if (args_malformed(map_get(tc, 'arguments')) == 'true') { 'true' }
+        else { tcs_args_malformed(tl(tcs)) }
+    }
+}
+
+# A NON-EMPTY arguments blob that is not one complete JSON object/array.
+# json_decode alone can't tell: it is lenient and happily decodes
+# `{"command":"echo hi` (cut mid-string) into %{command: "echo hi"}, so a
+# truncated call used to pass as well-formed and run. The strict structural
+# check (Util.json_args_well_formed) catches the unclosed string/container a
+# truncation always leaves — even when no finish_reason says so. Empty / "{}"
+# / "null" mean "no arguments", not malformed.
+fun args_malformed(raw) {
+    trimmed = string_trim(to_string(raw))
+    if (trimmed == "" || trimmed == "{}" || trimmed == "null") { 'false' }
+    else { if (json_decode(trimmed) == nil) { 'true' }
+    else { if (Util.json_args_well_formed(trimmed) == 'true') { 'false' } else { 'true' } } }
+}
+
+# History copy of a turn's tool_calls with malformed arguments replaced by
+# "{}". Servers that parse assistant tool_call arguments when rendering the
+# chat template (vLLM does) reject every later request that still carries a
+# cut-off blob, wedging the session. Dispatch uses the RAW calls, so the model
+# is still told exactly what was wrong with each one.
+fun sanitize_tool_calls(tcs, acc) {
+    if (length(tcs) == 0) { acc }
+    else {
+        tc = hd(tcs)
+        clean = if (args_malformed(map_get(tc, 'arguments')) == 'true') { map_put(tc, 'arguments', "{}") }
+                else { tc }
+        sanitize_tool_calls(tl(tcs), list_append(acc, clean))
     }
 }
 
@@ -2011,8 +2038,13 @@ fun run_turn(history, opts, step) {
             tool_calls_v = map_get(result, 'tool_calls')
             reasoning = map_get(result, 'reasoning')
             tool_calls = if (tool_calls_v == nil) { [] } else { tool_calls_v }
+            # Was the turn cut off — ESC mid-stream, or the output-token limit?
+            cut = turn_cut_reason(result)
 
-            asst_msg = LLM.new_message_assistant(content, tool_calls, reasoning)
+            # History keeps a wire-safe copy of the calls (cut-off arguments
+            # stored as "{}", see sanitize_tool_calls); dispatch below uses the
+            # raw ones.
+            asst_msg = LLM.new_message_assistant(content, sanitize_tool_calls(tool_calls, []), reasoning)
             with_assistant = list_append(working_hist, asst_msg)
             journal_sync(opts, with_assistant)
             # F2: a turn completed cleanly — clear any poison flag a PRIOR turn in
@@ -2022,17 +2054,35 @@ fun run_turn(history, opts, step) {
             # the good work. clear_poison() is a cheap stat+unlink, idempotent.
             clear_poison()
 
+            # A cut-off turn's tool calls are NEVER dispatched. Their arguments
+            # may end mid-string, and the lenient json_decode turns that into a
+            # plausible call — a `write` of half a config file ("ok: wrote 59
+            # bytes"), a `bash` command missing its tail. Each call gets a result
+            # saying it was not run (every tool_call id still needs its tool
+            # message), then:
+            #   interrupted — the user pressed ESC while it streamed: the turn
+            #                 ends, exactly like ESC on a running tool.
+            #   truncated   — F4 recovery below (raise max_tokens, then the
+            #                 smaller-edits nudge), which tells the model to
+            #                 reissue the calls.
             # F4: length-truncation recovery (finish_reason=length / truncation
-            # marker) — ONLY when the turn carried no tool_calls. A truncated turn
-            # that still emitted tool_calls is actionable: fall through and execute
-            # them normally (appending a user nudge after an assistant-with-open-
-            # tool_calls would be an invalid native sequence and would skip the
-            # work). Stage 0: retry ONCE with a raised per-turn max_tokens. Stage 1:
-            # inject a "continue in smaller append-mode edits" user-message while
-            # KEEPING the partial assistant output. Stage 2+: give up gracefully.
-            # Guarded by the 'trunc_retry' counter so we never loop unbounded.
-            truncated = map_get(result, 'truncated')
-            if (truncated == 'true' && length(tool_calls) == 0) {
+            # marker). Stage 0: retry ONCE with a raised per-turn max_tokens.
+            # Stage 1: inject a "continue in smaller append-mode edits"
+            # user-message while KEEPING the partial assistant output. Stage 2+:
+            # give up gracefully. Guarded by the 'trunc_retry' counter so we never
+            # loop unbounded. The nudge follows the tool results, so the native
+            # sequence stays valid.
+            if (length(tool_calls) > 0 && cut != 'complete') {
+                refused = refuse_tool_calls(tool_calls, with_assistant, cut, opts)
+                if (cut == 'interrupted') {
+                    journal_sync(opts, refused)
+                    turn_print(opts, "  " ++ UI.dim_text("⎿ interrupted · tell the agent what to do instead"))
+                    turn_print(opts, "")
+                    refused
+                } else {
+                    handle_truncation(refused, tool_calls, opts, step)
+                }
+            } else { if (cut == 'truncated') {
                 handle_truncation(with_assistant, tool_calls, opts, step)
             } else {
 
@@ -2093,7 +2143,7 @@ fun run_turn(history, opts, step) {
                     run_turn(post_exec, meter_opts, step + 1)
                 }
             }
-            }
+            }}
         }
         }
     }
@@ -2118,6 +2168,9 @@ fun raised_max_tokens(opts) {
     if (doubled > ceil) { ceil } else { doubled }
 }
 
+# `tool_calls` non-empty: the cut came while the model was still writing
+# tool calls — refuse_tool_calls already answered each one "not run", so the
+# nudge asks for them again instead of "continue where you left off".
 fun handle_truncation(with_assistant, tool_calls, opts, step) {
     stage = map_get(opts, 'trunc_retry')
     stage_n = if (stage == nil) { 0 } else { stage }
@@ -2129,8 +2182,14 @@ fun handle_truncation(with_assistant, tool_calls, opts, step) {
               "max_tokens=" ++ to_string(raised) ++ ")"))
         retry_opts0 = map_put(opts, 'max_tokens', raised)
         retry_opts = map_put(retry_opts0, 'trunc_retry', 1)
-        cont = "Your previous response was cut off at the output token limit. " ++
-               "Continue exactly where you left off."
+        cont = if (length(tool_calls) > 0) {
+            "Your previous response was cut off at the output token limit while it " ++
+            "was still writing tool calls, so none of them ran. Reissue them with " ++
+            "complete arguments."
+        } else {
+            "Your previous response was cut off at the output token limit. " ++
+            "Continue exactly where you left off."
+        }
         with_nudge = list_append(with_assistant, LLM.new_message_user(cont))
         journal_sync(opts, with_nudge)
         run_turn(with_nudge, retry_opts, step + 1)
@@ -2551,9 +2610,12 @@ fun run_subagent_loop(history, opts, step) {
             if (length(tool_calls) == 0) {
                 content
             } else {
-                asst = LLM.new_message_assistant(content, tool_calls, reasoning)
+                asst = LLM.new_message_assistant(content, sanitize_tool_calls(tool_calls, []), reasoning)
                 with_assistant = list_append(history, asst)
-                post_tools = subagent_exec_all(tool_calls, with_assistant, opts)
+                # A cut-off turn's calls are answered, not run (see run_turn).
+                cut = turn_cut_reason(result)
+                post_tools = if (cut != 'complete') { refuse_tool_calls(tool_calls, with_assistant, cut, opts) }
+                             else { subagent_exec_all(tool_calls, with_assistant, opts) }
                 run_subagent_loop(post_tools, opts, step + 1)
             }
         }
@@ -2589,7 +2651,10 @@ fun subagent_exec_all(tool_calls, history, opts) {
             args_raw = to_string(map_get(tc, 'arguments'))
             args_map = json_decode(args_raw)
             args_map_safe = if (args_map == nil) { map_new() } else { args_map }
-            sub_result = dispatch_tool(name_atom, args_map_safe, opts)
+            # Same F5 guard as execute_all: never run a cut-off call.
+            sub_result = if (args_malformed(args_raw) == 'true') {
+                "error: the arguments for '" ++ name_str ++ "' were not valid JSON (likely truncated mid-string). Reissue this single tool call with complete, valid JSON arguments."
+            } else { dispatch_tool(name_atom, args_map_safe, opts) }
             tool_msg = LLM.new_message_tool(id, sub_result)
             new_hist = list_append(history, tool_msg)
             subagent_exec_all(tl(tool_calls), new_hist, opts)
@@ -2633,11 +2698,12 @@ fun execute_all(tool_calls, history, opts) {
         name_atom = string_to_atom(name_str)
         args_raw = to_string(map_get(tc, 'arguments'))
         args_map = json_decode(args_raw)
-        # F5: a NON-EMPTY args blob that fails to parse is a truncated/malformed
-        # tool call. Don't silently dispatch with empty args (which yields a
-        # confusing "missing X" for an arg the model DID supply) — tell it to reissue.
-        args_trim = string_trim(args_raw)
-        malformed = if (args_map == nil && args_trim != "" && args_trim != "{}" && args_trim != "null") { 'true' } else { 'false' }
+        # F5: a NON-EMPTY args blob that isn't one complete JSON value is a
+        # truncated/malformed tool call. Don't dispatch it — with empty args
+        # (a confusing "missing X" for an arg the model DID supply) or, worse,
+        # with the lenient decoder's partial value (a command / file content
+        # cut mid-string) — tell the model to reissue.
+        malformed = args_malformed(args_raw)
         result = if (malformed == 'true') {
             turn_print(opts, "")
             turn_print(opts, UI.tool_header_str(name_atom, "(malformed / truncated arguments)"))
@@ -2689,6 +2755,63 @@ fun execute_all(tool_calls, history, opts) {
 }
 
 fun INTERRUPT_SKIPPED() { "[skipped] the user interrupted this turn before this tool ran." }
+
+# ------------------------------------------------------------
+# Cut-off turns — a tool call the model didn't finish is never run.
+# ------------------------------------------------------------
+# The runtime appends this to the content when ESC/Ctrl-C lands mid-stream
+# (and routed mode's interrupted_stream_result mirrors it).
+fun INTERRUPT_MARKER() { "[Request interrupted by user]" }
+
+# 'interrupted' (the user stopped the stream), 'truncated' (output-token
+# limit) or 'complete'. llm.sw flags both on the RAW content — inband
+# parsing strips everything after the first call marker, marker included —
+# the content test is the fallback for a result built elsewhere.
+fun turn_cut_reason(result) {
+    if (map_get(result, 'interrupted') == 'true') { 'interrupted' }
+    else { if (string_ends_with(string_trim(to_string(map_get(result, 'content'))),
+                                INTERRUPT_MARKER()) == 'true') { 'interrupted' }
+    else { if (map_get(result, 'truncated') == 'true') { 'truncated' }
+    else { 'complete' } } }
+}
+
+fun refused_tool_result(reason, raw_args) {
+    if (reason == 'interrupted') {
+        "[interrupted] the user pressed ESC while this tool call was still streaming — it was NOT run."
+    } else {
+        cut = if (args_malformed(raw_args) == 'true') {
+            " Its arguments were cut off after " ++ to_string(string_length(to_string(raw_args))) ++ " bytes."
+        } else { "" }
+        "error: not executed — your response hit the output token limit before this tool " ++
+        "call was complete, so it was NOT run." ++ cut ++ " Reissue it with complete " ++
+        "arguments; for large content write a short stub first, then append the rest " ++
+        "with `edit` in smaller pieces."
+    }
+}
+
+# Answer every call of a cut-off turn with a not-run result instead of
+# dispatching it (history stays valid: each tool_call id gets its tool
+# message). No journal_sync here — a subagent's opts carry the PARENT's
+# journal_path; run_turn journals the result itself.
+fun refuse_tool_calls(tool_calls, history, reason, opts) {
+    if (length(tool_calls) == 0) { history }
+    else {
+        tc = hd(tool_calls)
+        id = to_string(map_get(tc, 'id'))
+        name_atom = string_to_atom(to_string(map_get(tc, 'name')))
+        raw = to_string(map_get(tc, 'arguments'))
+        result = refused_tool_result(reason, raw)
+        if (map_get(opts, 'is_subagent') != 'true') {
+            what = if (reason == 'interrupted') { "interrupted while streaming — not run" }
+                   else { "cut off at the output limit — not run" }
+            turn_print(opts, "")
+            turn_print(opts, UI.tool_header_str(name_atom, what))
+        }
+        Log.tool_call(name_atom, raw)
+        Log.tool_result(name_atom, string_length(result), 'true')
+        refuse_tool_calls(tl(tool_calls), list_append(history, LLM.new_message_tool(id, result)), reason, opts)
+    }
+}
 
 # Result markers for a tool the user stopped: shell_managed's ESC/Ctrl-C
 # kill, and collect_tool_result's interrupt of a non-shell tool.
