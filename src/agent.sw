@@ -47,7 +47,10 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         looks_like_slash_command, is_known_slash_command, bg_normalize_id,
         get_session_mode, set_session_mode, next_mode, resolve_permission,
         show_expand, handle_bg_command, route_input,
-        skip_remaining_tools, turn_interrupted]
+        skip_remaining_tools, turn_interrupted,
+        args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls,
+        headless_answer, compact_history, compact_split, mechanical_trim_ex,
+        profile_to_override]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -55,13 +58,12 @@ fun max_steps() { 200 }
 # ------------------------------------------------------------
 # Context budget — token-based, sourced from server usage
 # ------------------------------------------------------------
-fun max_tokens_env()      { parse_env_int("SWARM_CODE_MAX_TOKENS",      262144) }
-fun output_reserve_env()  { parse_env_int("SWARM_CODE_OUTPUT_RESERVE",   16384) }
-fun compact_buffer_env()  { parse_env_int("SWARM_CODE_COMPACT_BUFFER",   52000) }
-
-fun context_budget_tokens() {
-    max_tokens_env() - output_reserve_env() - compact_buffer_env()
-}
+# ONE definition, in llm.sw (LLM.context_budget_tokens), shared with the
+# context meter: the output reserve and compaction buffer scale down with
+# the window, so a small SWARM_CODE_MAX_TOKENS no longer yields a NEGATIVE
+# budget (32768 - 16384 - 52000 = -35616 compacted on every step).
+fun max_tokens_env()        { LLM.context_window_tokens() }
+fun context_budget_tokens() { LLM.context_budget_tokens() }
 
 # When a compaction fires (over context_budget_tokens), trim/summarize down to
 # THIS lower level — not just barely under the trigger — so the next several tool
@@ -73,15 +75,6 @@ fun compact_target_tokens() { context_budget_tokens() * 70 / 100 }
 
 fun context_budget_chars_fallback() {
     context_budget_tokens() * 4
-}
-
-fun parse_env_int(name, fallback) {
-    env = getenv(name)
-    if (env == nil) { fallback }
-    else {
-        parsed = parse_budget_env(env, 0, 0, 'false')
-        if (parsed < 0) { fallback } else { parsed }
-    }
 }
 
 fun parse_budget_env(s, i, acc, saw_digit) {
@@ -304,17 +297,43 @@ fun drop_trailing_tool_turn(msgs) {
     drop_last(msgs, tools_run + 1)
 }
 
-# True when any tool_call carries a non-empty arguments blob that fails to
-# json_decode (truncated mid-string) — the turn is poisoned and unsendable.
+# True when any tool_call carries a non-empty arguments blob that is not one
+# complete JSON value (truncated mid-string) — the turn is poisoned and unsendable.
 fun tcs_args_malformed(tcs) {
     if (length(tcs) == 0) { 'false' }
     else {
         tc = hd(tcs)
-        raw = to_string(map_get(tc, 'arguments'))
-        trimmed = string_trim(raw)
-        bad = if (trimmed == "" || trimmed == "{}" || trimmed == "null") { 'false' }
-              else { if (json_decode(raw) == nil) { 'true' } else { 'false' } }
-        if (bad == 'true') { 'true' } else { tcs_args_malformed(tl(tcs)) }
+        if (args_malformed(map_get(tc, 'arguments')) == 'true') { 'true' }
+        else { tcs_args_malformed(tl(tcs)) }
+    }
+}
+
+# A NON-EMPTY arguments blob that is not one complete JSON object/array.
+# json_decode alone can't tell: it is lenient and happily decodes
+# `{"command":"echo hi` (cut mid-string) into %{command: "echo hi"}, so a
+# truncated call used to pass as well-formed and run. The strict structural
+# check (Util.json_args_well_formed) catches the unclosed string/container a
+# truncation always leaves — even when no finish_reason says so. Empty / "{}"
+# / "null" mean "no arguments", not malformed.
+fun args_malformed(raw) {
+    trimmed = string_trim(to_string(raw))
+    if (trimmed == "" || trimmed == "{}" || trimmed == "null") { 'false' }
+    else { if (json_decode(trimmed) == nil) { 'true' }
+    else { if (Util.json_args_well_formed(trimmed) == 'true') { 'false' } else { 'true' } } }
+}
+
+# History copy of a turn's tool_calls with malformed arguments replaced by
+# "{}". Servers that parse assistant tool_call arguments when rendering the
+# chat template (vLLM does) reject every later request that still carries a
+# cut-off blob, wedging the session. Dispatch uses the RAW calls, so the model
+# is still told exactly what was wrong with each one.
+fun sanitize_tool_calls(tcs, acc) {
+    if (length(tcs) == 0) { acc }
+    else {
+        tc = hd(tcs)
+        clean = if (args_malformed(map_get(tc, 'arguments')) == 'true') { map_put(tc, 'arguments', "{}") }
+                else { tc }
+        sanitize_tool_calls(tl(tcs), list_append(acc, clean))
     }
 }
 
@@ -326,11 +345,11 @@ fun nth_at(lst, i) {
 # ------------------------------------------------------------
 # F2 — poison / clean-exit markers beside .active
 # ------------------------------------------------------------
-# A turn that ends on an UNRECOVERED llm error writes .poison (holding the
-# journal path) so the next launch knows the recorded session died mid-turn
-# and trims the failing turn back to the last clean user message instead of
-# replaying the poisoned tool_call. A clean /quit writes .clean_exit. Both
-# are cleared when a fresh session starts.
+# A turn that ends on an UNRECOVERED fatal llm error writes .poison (holding
+# the journal path) so the next launch can say the recorded session ended on
+# a request error. (It used to also cut the resumed history back to the last
+# user message, losing completed tool results — see run.) A clean /quit
+# writes .clean_exit. Both are cleared when a fresh session starts.
 fun journal_poison_ptr()      { session_dir() ++ "/.poison" }
 fun journal_clean_exit_ptr()  { session_dir() ++ "/.clean_exit" }
 
@@ -370,9 +389,10 @@ fun journal_is_poisoned(journal_path) {
 }
 
 # Drop trailing assistant/tool records back to (and including) the last
-# role:'user' message — the last clean point. Used on resume of a poisoned
-# session so the failing turn never re-fires. Keeps system + everything up
-# to and including the last user message.
+# role:'user' message — the last clean point. Keeps system + everything up
+# to and including the last user message. (No longer applied on a fatal
+# error or on resume: it threw away completed tool results whose effects
+# were real — both keep completed pairs and trim only the dangling tail.)
 fun drop_to_last_clean_user(msgs) {
     idx = last_user_index(msgs, length(msgs) - 1)
     if (idx < 0) { msgs }
@@ -422,12 +442,12 @@ fun run(opts, system_prompt_text) {
                           replay_journal(prev_path)
                       } else { [] }
                   }
-    # F2: on a poisoned session, trim the failing turn back to the last clean
-    # user message (drop the poisoned tool_call) BEFORE the usual incomplete
-    # trim, so resume never re-fires the call that killed the prior session.
-    resumed_clean = if (prev_poisoned == 'true') { drop_to_last_clean_user(resumed_raw) }
-                    else { resumed_raw }
-    resumed = trim_incomplete(resumed_clean)
+    # F2: a poisoned session (it ended on a fatal request error) resumes like
+    # any other — trim_incomplete drops only the dangling tail. It used to be
+    # cut back to the last user message, throwing away tool results whose
+    # effects (written files) are real; nothing in a completed pair can
+    # re-fire on resume, and cut-off tool arguments are stored as "{}".
+    resumed = trim_incomplete(resumed_raw)
 
     journal_path = if (length(resumed) > 0) {
         prev_path
@@ -446,8 +466,9 @@ fun run(opts, system_prompt_text) {
     history = if (length(resumed) > 0) {
         print("")
         if (prev_poisoned == 'true') {
-            print(UI.grey_text() ++ "  ⏺ previous session ended on an error — trimmed the " ++
-                  "failing turn; resumed " ++ to_string(length(resumed)) ++ " messages" ++ UI.reset())
+            print(UI.grey_text() ++ "  ⏺ previous session ended on a request error — resumed " ++
+                  to_string(length(resumed)) ++ " messages (completed tool results kept; " ++
+                  "/compact or /reset if the error repeats)" ++ UI.reset())
         } else {
             print(UI.grey_text() ++ "  ⏺ resumed crashed session — " ++
                   to_string(length(resumed)) ++ " messages recovered" ++ UI.reset())
@@ -521,14 +542,23 @@ fun run_headless(opts, system_prompt_text, prompt, json_mode) {
     journal_sync(opts_journal, history)
 
     # Headless: no Reader to ask — an 'ask' is denied unless
-    # SWARM_CODE_HEADLESS_APPROVE=1 (see resolve_permission).
-    opts_h = map_put(opts_journal, 'headless', 'true')
+    # SWARM_CODE_HEADLESS_APPROVE=1 (see resolve_permission). run_id stamps
+    # every assistant message this run appends (run_turn), so the result can
+    # only ever be THIS run's answer: resume is the headless default, and the
+    # resumed history already holds earlier runs' answers — a run whose LLM
+    # call failed (400, server down) used to report the previous run's reply
+    # as {"status":"ok"}, exit 0.
+    run_id = uuid()
+    opts_h = map_put(map_put(opts_journal, 'headless', 'true'), 'run_id', run_id)
 
     final_history = route_input(prompt, history, opts_h)
     journal_sync(opts_h, final_history)
 
-    last_text = last_assistant_text(final_history)
-    ok = if (string_length(last_text) > 0) { 'true' } else { 'false' }
+    last_text = headless_answer(final_history, run_id)
+    # A slash command (/compact, /profile …) is a successful run with no model
+    # answer — not a failure.
+    ok = if (string_length(last_text) > 0) { 'true' }
+         else { if (is_slash_prompt(prompt) == 'true') { 'true' } else { 'false' } }
     result_fd = map_get(opts, 'result_fd')
     if (json_mode == 'true') {
         status = if (ok == 'true') { "ok" } else { "error" }
@@ -549,18 +579,28 @@ fun emit_result(result_fd, s) {
     else { print(s) }
 }
 
-fun last_assistant_text(history) {
-    last_assistant_loop(history, "")
+# The headless result: the content of the history's FINAL message when it is
+# an assistant reply this run produced (stamped with run_id by run_turn) that
+# asks for no further tools. Anything else — the turn ended on an LLM failure
+# (history ends at the user message or a tool result), hit max steps, or
+# appended nothing — is "" (status error), never an earlier run's answer.
+# (Was: the last assistant message ANYWHERE in the resumed history.)
+fun headless_answer(history, run_id) {
+    if (length(history) == 0 || run_id == nil) { "" }
+    else {
+        last = hd(take_last(history, 1))
+        tcs = map_get(last, 'tool_calls')
+        if (map_get(last, 'role') == 'assistant' && map_get(last, 'run_id') == run_id &&
+            (tcs == nil || length(tcs) == 0)) {
+            to_string(map_get(last, 'content'))
+        } else { "" }
+    }
 }
 
-fun last_assistant_loop(msgs, acc) {
-    if (length(msgs) == 0) { acc }
-    else {
-        msg = hd(msgs)
-        role = map_get(msg, 'role')
-        na = if (role == 'assistant') { to_string(map_get(msg, 'content')) } else { acc }
-        last_assistant_loop(tl(msgs), na)
-    }
+fun is_slash_prompt(prompt) {
+    t = string_trim(to_string(prompt))
+    if (string_starts_with(t, "/") == 'true' && is_known_slash_command(first_token(t)) == 'true') { 'true' }
+    else { 'false' }
 }
 
 # ------------------------------------------------------------
@@ -953,14 +993,17 @@ fun slash_dispatch(cmd, history, opts) {
     else { if (cmd == "/model") { show_model_info(opts) ; history }
     else { if (string_starts_with(cmd, "/model ") == 'true') {
         new_model = string_trim(string_sub(cmd, 7, string_length(cmd) - 7))
-        apply_model_override(new_model)
+        apply_model_override(new_model, opts)
         history
     }
-    else { if (cmd == "/profile") { show_active_profile() ; history }
+    else { if (cmd == "/profile") { show_active_profile(opts) ; history }
     else { if (cmd == "/profiles") { list_profiles() ; history }
     else { if (string_starts_with(cmd, "/profile ") == 'true') {
         name = string_trim(string_sub(cmd, 9, string_length(cmd) - 9))
-        apply_profile_override(name)
+        # "/profile clear" is the documented alias of /profile-clear (this
+        # prefix branch used to swallow it as a profile named "clear").
+        if (name == "clear") { clear_profile_override() }
+        else { apply_profile_override(name, opts) }
         history
     }
     else { if (cmd == "/profile-clear" || cmd == "/profile clear") {
@@ -1073,8 +1116,11 @@ fun slash_dispatch(cmd, history, opts) {
     }
     else { if (cmd == "/compact") {
         compacted = compact_history(history, opts)
-        print("\e[2m[history compacted: " ++ to_string(length(history)) ++
-              " → " ++ to_string(length(compacted)) ++ " messages]\e[0m")
+        # Unchanged (nothing old enough / summarizer failed) already said why.
+        if (length(compacted) != length(history)) {
+            print("\e[2m[history compacted: " ++ to_string(length(history)) ++
+                  " → " ++ to_string(length(compacted)) ++ " messages]\e[0m")
+        }
         compacted
     }
     else { if (cmd == "/save") {
@@ -1362,14 +1408,16 @@ fun show_debug_tools() {
 
 # ------------------------------------------------------------
 # Profile / model swap — writes ~/.swarm-code/.profile_override which
-# LLM.apply_override consults before every request. No opts threading
-# required; the change takes effect on the next LLM call.
+# LLM.apply_override consults before every request; the change takes effect
+# on the next LLM call. Each write is stamped with this launch's session_id:
+# in THIS session the override beats env vars, in a later one an env var
+# that is set wins (see LLM.apply_override).
 # ------------------------------------------------------------
 fun profile_override_path() {
     getenv("HOME") ++ "/.swarm-code/.profile_override"
 }
 
-fun apply_profile_override(name) {
+fun apply_profile_override(name, opts) {
     if (string_length(name) == 0) {
         print(UI.warn_text("usage: /profile NAME  (try /profiles to list)"))
     }
@@ -1385,7 +1433,7 @@ fun apply_profile_override(name) {
                 print(UI.warn_text("no profile named '" ++ name ++ "' — try /profiles"))
             }
             else {
-                ov = profile_to_override(p)
+                ov = stamp_override(map_put(profile_to_override(p), 'profile', name), opts)
                 file_write(profile_override_path(), json_encode(ov))
                 print(UI.brand_color() ++ "✓ profile swapped to " ++ name ++ UI.reset())
                 print(UI.grey_text() ++ "  model    : " ++ to_string(map_get(ov, 'model')) ++ UI.reset())
@@ -1396,16 +1444,26 @@ fun apply_profile_override(name) {
     }
 }
 
-fun apply_model_override(model_name) {
+# Changes ONLY the model: whatever part of an existing override is in effect
+# (a /profile's endpoint, api_key, tool_format, chat_template_kwargs) is
+# carried over — it used to be overwritten with {model}, silently reverting
+# the profile while printing "endpoint/api_key unchanged".
+fun apply_model_override(model_name, opts) {
     if (string_length(model_name) == 0) {
         print(UI.warn_text("usage: /model NAME"))
     }
     else {
-        ov = %{ model: model_name }
+        kept = LLM.effective_override(LLM.read_override(), opts)
+        ov = stamp_override(map_put(kept, 'model', model_name), opts)
         file_write(profile_override_path(), json_encode(ov))
         print(UI.brand_color() ++ "✓ model swapped to " ++ model_name ++ UI.reset())
         print(UI.grey_text() ++ "  endpoint/api_key unchanged. /profile-clear to revert." ++ UI.reset())
     }
+}
+
+fun stamp_override(ov, opts) {
+    sid = map_get(opts, 'session_id')
+    if (sid == nil) { ov } else { map_put(ov, 'session_id', to_string(sid)) }
 }
 
 fun clear_profile_override() {
@@ -1418,32 +1476,38 @@ fun clear_profile_override() {
     }
 }
 
-fun show_active_profile() {
+fun show_active_profile(opts) {
     p = profile_override_path()
     if (file_exists(p) == 'false') {
         print("\e[2m(no override active — using launch profile)\e[0m")
     } else {
-        raw = file_read(p)
-        ov = if (raw == nil) { nil } else { json_decode(raw) }
+        ov = LLM.read_override()
         if (ov == nil) {
             print(UI.warn_text("(override file present but unreadable: " ++ p ++ ")"))
         } else {
-            print("\e[1mactive override\e[0m")
-            show_override_field(ov, 'endpoint')
-            show_override_field(ov, 'model')
-            show_override_field(ov, 'api_key')
-            show_override_field(ov, 'tool_format')
+            prof = map_get(ov, 'profile')
+            print("\e[1mactive override\e[0m" ++ (if (prof == nil) { "" } else { " (profile " ++ to_string(prof) ++ ")" }))
+            show_override_field(ov, 'endpoint', opts)
+            show_override_field(ov, 'model', opts)
+            show_override_field(ov, 'api_key', opts)
+            show_override_field(ov, 'tool_format', opts)
+            show_override_field(ov, 'chat_template_kwargs', opts)
             print(UI.grey_text() ++ "  (use /profile-clear to revert)" ++ UI.reset())
         }
     }
 }
 
-fun show_override_field(ov, key) {
+# A field an env var pins (override left by an earlier session) is shown as
+# not applied, so /profile tells the truth about what gets sent.
+fun show_override_field(ov, key, opts) {
     v = map_get(ov, key)
     if (v == nil) { 'skip' }
     else {
         shown = if (key == 'api_key') { "(set)" } else { to_string(v) }
-        print("  " ++ to_string(key) ++ " : " ++ shown)
+        applied = LLM.override_applies(opts, ov, key, fn(name) { getenv(name) })
+        note = if (applied == 'true') { "" }
+               else { UI.grey_text() ++ "  (not applied — the environment sets it)" ++ UI.reset() }
+        print("  " ++ to_string(key) ++ " : " ++ shown ++ note)
     }
 }
 
@@ -1497,14 +1561,17 @@ fun lookup_profile_loop(keys, values, name) {
 
 # Convert a settings.json profile entry into the override-file shape.
 # Only includes fields actually present in the profile — `apply_override`
-# will leave unset fields alone.
+# will leave unset fields alone. chat_template_kwargs is a map and is kept
+# as one (it used to be omitted, and apply_override then cleared the launch
+# value — `/profile qwen2` lost enable_thinking:false).
 fun profile_to_override(p) {
     a = profile_field(map_new(), p, 'endpoint')
     b = profile_field(a, p, 'model')
     c = profile_field(b, p, 'api_key')
     d = profile_field(c, p, 'tool_format')
     e = profile_field(d, p, 'vision')
-    e
+    ct = map_get(p, 'chat_template_kwargs')
+    if (ct == nil) { e } else { map_put(e, 'chat_template_kwargs', ct) }
 }
 
 fun profile_field(acc, p, key) {
@@ -1597,42 +1664,117 @@ fun approx_tokens(history) {
 fun sum_msg_chars(msgs, acc) { history_chars_loop(msgs, acc) }
 
 # ------------------------------------------------------------
-# Compaction — summarize oldest messages, keep system + last 16.
+# Compaction — summarize the old part, keep the live turn verbatim.
 # ------------------------------------------------------------
+# Result: [system, summary, ...tail]. The tail is kept verbatim: at most the
+# last COMPACT_KEEP_TAIL() messages, pulled back so it always starts at or
+# before the MOST RECENT user message (mid-turn compaction used to summarize
+# the live request away — requests then went out with no user message at
+# all) and never on a role:'tool' result cut off from its assistant.
+# Invariants (each was a bug):
+#   - nothing old enough to summarize → history unchanged, NO LLM call (it
+#     used to summarize an empty transcript and prepend yet another summary);
+#   - summarizer failed / said nothing → history unchanged (it used to delete
+#     the old messages anyway and journal "[compaction failed, messages
+#     elided]");
+#   - an earlier summary is folded into the new one, not stacked.
+fun SUMMARY_PREFIX() { "Summary of earlier conversation: " }
+fun COMPACT_KEEP_TAIL() { 16 }
+
 fun compact_history(history, opts) {
-    if (length(history) < 10) { history }
-    else {
-        sys_msg = hd(history)
-        rest = tl(history)
-        keep_tail = take_last(rest, 16)
-        to_summarize = drop_last(rest, 16)
-
-        summary_prompt =
-            "Summarize the conversation below to save context. Output EXACTLY " ++
-            "these four sections, each 1-3 sentences:\n\n" ++
-            "**Current State**: What has been accomplished so far.\n" ++
-            "**Working State**: Files modified, commands run, tools used.\n" ++
-            "**Key Details**: Important technical decisions, paths, names, configs.\n" ++
-            "**Pending**: What still needs to be done, open questions.\n\n" ++
-            "Be dense and precise. Preserve exact file paths, function names, " ++
-            "and error messages — they are needed for continuity. Under 500 words total.\n\n" ++
-            format_for_summary(to_summarize, "")
-
+    has_sys = if (length(history) > 0 && map_get(hd(history), 'role') == 'system') { 'true' } else { 'false' }
+    head = if (has_sys == 'true') { [hd(history)] } else { [] }
+    rest = if (has_sys == 'true') { tl(history) } else { history }
+    k = compact_split(rest)
+    old = take_first(rest, k, [])
+    keep_tail = drop_first_n(rest, k)
+    prev_summary = summary_texts(old, "")
+    fresh = non_summary_msgs(old, [])
+    if (length(fresh) == 0) {
+        turn_print(opts, "  " ++ UI.dim_text("(nothing old enough to compact — the current turn is kept verbatim)"))
+        history
+    } else {
         ask_msgs = [
             LLM.new_message_system("You are a concise summarizer."),
-            LLM.new_message_user(summary_prompt)
+            LLM.new_message_user(compact_prompt(prev_summary, fresh))
         ]
         summary = LLM.chat_silent(ask_msgs, opts)
-        summary_text = if (summary == nil) {
-            "[compaction failed, messages elided]"
-        } else { to_string(summary) }
-
-        synth = LLM.new_message_assistant(
-            "Summary of earlier conversation: " ++ summary_text,
-            nil, nil)
-
-        prepend([sys_msg, synth], keep_tail)
+        summary_text = if (summary == nil) { "" } else { string_trim(to_string(summary)) }
+        if (string_length(summary_text) == 0) {
+            turn_print(opts, "  " ++ UI.warn_text("(compaction failed — the summarizer returned nothing; history kept as is)"))
+            history
+        } else {
+            synth = LLM.new_message_assistant(SUMMARY_PREFIX() ++ summary_text, nil, nil)
+            head ++ [synth] ++ keep_tail
+        }
     }
+}
+
+fun compact_prompt(prev_summary, fresh) {
+    earlier = if (string_length(prev_summary) == 0) { "" }
+              else {
+        "An EARLIER SUMMARY covers what came before the messages below. Fold " ++
+        "its facts into your new summary — do not drop them:\n" ++ prev_summary ++ "\n\n" ++
+        "Messages since that summary:\n"
+    }
+    "Summarize the conversation below to save context. Output EXACTLY " ++
+    "these four sections, each 1-3 sentences:\n\n" ++
+    "**Current State**: What has been accomplished so far.\n" ++
+    "**Working State**: Files modified, commands run, tools used.\n" ++
+    "**Key Details**: Important technical decisions, paths, names, configs.\n" ++
+    "**Pending**: What still needs to be done, open questions.\n\n" ++
+    "Be dense and precise. Preserve exact file paths, function names, " ++
+    "and error messages — they are needed for continuity. Under 500 words total.\n\n" ++
+    earlier ++ format_for_summary(fresh, "")
+}
+
+# Index in `rest` (history minus the system message) where the verbatim tail
+# starts; everything before it gets summarized. 0 = nothing to summarize.
+fun compact_split(rest) {
+    n = length(rest)
+    k0 = if (n > COMPACT_KEEP_TAIL()) { n - COMPACT_KEEP_TAIL() } else { 0 }
+    lu = last_user_index(rest, n - 1)
+    k1 = if (lu >= 0 && lu < k0) { lu } else { k0 }
+    pair_start(rest, k1)
+}
+
+# Step back over role:'tool' results so the tail opens on the assistant that
+# issued them (a tool message without its tool_call is invalid on the wire).
+fun pair_start(rest, k) {
+    if (k <= 0) { 0 }
+    else { if (map_get(nth_at(rest, k), 'role') == 'tool') { pair_start(rest, k - 1) } else { k } }
+}
+
+fun is_summary_msg(m) {
+    if (map_get(m, 'role') == 'assistant' &&
+        string_starts_with(to_string(map_get(m, 'content')), SUMMARY_PREFIX()) == 'true') { 'true' }
+    else { 'false' }
+}
+
+# The text of every earlier summary in `msgs` (older builds stacked several).
+fun summary_texts(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        if (is_summary_msg(m) == 'true') {
+            c = to_string(map_get(m, 'content'))
+            t = string_sub(c, string_length(SUMMARY_PREFIX()), string_length(c) - string_length(SUMMARY_PREFIX()))
+            summary_texts(tl(msgs), if (string_length(acc) == 0) { t } else { acc ++ "\n\n" ++ t })
+        } else { summary_texts(tl(msgs), acc) }
+    }
+}
+
+fun non_summary_msgs(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        non_summary_msgs(tl(msgs), if (is_summary_msg(m) == 'true') { acc } else { list_append(acc, m) })
+    }
+}
+
+fun drop_first_n(lst, n) {
+    if (n <= 0 || length(lst) == 0) { lst }
+    else { drop_first_n(tl(lst), n - 1) }
 }
 
 fun take_last(lst, n) {
@@ -1877,17 +2019,28 @@ fun tcs_chars(tcs, acc) {
 # → snip before any LLM auto-compaction. Walk OLDEST-first; for each role:'tool'
 # or role:'user' message whose content exceeds ~8KB, replace the body with a
 # "[N chars elided]" stub. Stop as soon as approx_tokens(history) < budget.
-# Never touches system, assistant prose, tool_calls, or the LAST message (the
-# live user turn). Needs no network — works even when the LLM is unreachable.
+# Never touches system, assistant prose, tool_calls, the MOST RECENT user
+# message (the live request — mid-turn it is no longer the last message, and a
+# pasted 10KB request used to get stubbed), or the LAST message (the result the
+# model is about to read). Needs no network — works even when the LLM is
+# unreachable.
 fun MECH_TRIM_THRESHOLD_CHARS() { 8000 }
 
-fun mechanical_trim(history, budget_t) {
+fun mechanical_trim(history, budget_t) { mechanical_trim_ex(history, budget_t, 'true') }
+
+# protect_last 'false': the overflow retry (shrink_for_overflow) — the server
+# already refused a request containing that last result (a giant `read`), so
+# it may be stubbed too; the live user request stays protected.
+fun mechanical_trim_ex(history, budget_t, protect_last) {
     n = length(history)
     if (n == 0) { history }
-    else { mech_trim_loop(history, 0, n, budget_t, []) }
+    else {
+        live_user = last_user_index(history, n - 1)
+        mech_trim_loop(history, 0, n, budget_t, [], live_user, protect_last)
+    }
 }
 
-fun mech_trim_loop(msgs, i, total, budget_t, acc) {
+fun mech_trim_loop(msgs, i, total, budget_t, acc, live_user, protect_last) {
     if (length(msgs) == 0) { acc }
     else {
         m = hd(msgs)
@@ -1899,13 +2052,25 @@ fun mech_trim_loop(msgs, i, total, budget_t, acc) {
             acc ++ msgs
         } else {
             role = map_get(m, 'role')
-            is_last = if (i == total - 1) { 'true' } else { 'false' }
-            stubbable = if (is_last == 'true') { 'false' }
+            protected = if (i == live_user) { 'true' }
+                        else { if (protect_last == 'true' && i == total - 1) { 'true' } else { 'false' } }
+            stubbable = if (protected == 'true') { 'false' }
                         else { if (role == 'tool' || role == 'user') { 'true' } else { 'false' }}
             new_m = if (stubbable == 'true') { stub_if_large(m) } else { m }
-            mech_trim_loop(tl(msgs), i + 1, total, budget_t, list_append(acc, new_m))
+            mech_trim_loop(tl(msgs), i + 1, total, budget_t, list_append(acc, new_m), live_user, protect_last)
         }
     }
+}
+
+# The server rejected the request as longer than its context. Aim well below
+# what was sent — half of it (or the usual compaction target, if lower):
+# mechanical trim first (no LLM call; the last result may go too), then
+# summarize whatever is old enough if that wasn't enough.
+fun shrink_for_overflow(history, opts) {
+    half = approx_tokens(history) / 2
+    target = if (half < compact_target_tokens()) { half } else { compact_target_tokens() }
+    trimmed = mechanical_trim_ex(history, target, 'false')
+    if (approx_tokens(trimmed) > target) { compact_history(trimmed, opts) } else { trimmed }
 }
 
 # Replace an oversized string body with a stub; small or non-string (multimodal
@@ -1990,30 +2155,53 @@ fun run_turn(history, opts, step) {
             # is signalled by exit 1 / the --json status. (Transport detail is
             # on stderr via the runtime.) Interactive keeps the inline error.
             if (map_get(opts, 'headless') != 'true') { turn_print(opts, UI.err_text("[error] llm call failed")) }
-            # F2/F1: distinguish a POISONED context from a TRANSIENT failure.
-            #  - FATAL (a 4xx request rejection or an unparseable body — re-sending
-            #    the identical bytes can't fix it): drop back to the last clean user
-            #    message so the offending tool_call is never journaled/re-fired, and
-            #    flag the journal poisoned so even an immediate resume trims it.
-            #  - TRANSIENT (network blip / 5xx after the retry budget): the context
-            #    is fine, the wire failed. KEEP all completed work; only trim a
-            #    dangling unsendable tail. Do NOT poison — a later resume is valid.
+            # KEEP every completed assistant+tool pair; only the dangling tail the
+            # API can't take (a trailing assistant with unanswered tool_calls, a
+            # partial result set) is dropped — fatal and transient alike. A FATAL
+            # rejection (4xx / unparseable body) used to drop the turn back to its
+            # user message: two writes landed on disk, a 400 followed, and after
+            # resume the model had no record of them. (Cut-off tool arguments —
+            # the old reason to drop — are stored as "{}" now; see
+            # sanitize_tool_calls.) A fatal failure still flags the journal
+            # poisoned, which now only changes the resume notice.
+            #
+            # "The context is too long" (context_length_exceeded, "maximum context
+            # length", …) is recoverable: the server's window can be smaller than
+            # SWARM_CODE_MAX_TOKENS claims. Shrink — mechanical trim first, then
+            # summarize — and retry ONCE per turn ('ctx_retry'), if that actually
+            # made the history smaller.
             fatal = LLM.last_fail(opts)
-            recovered = if (fatal == 'fatal') {
-                mark_poison(opts)
-                drop_to_last_clean_user(working_hist)
+            recovered = trim_incomplete(working_hist)
+            overflow = if (fatal == 'fatal' && map_get(opts, 'ctx_retry') != 'true') {
+                LLM.last_fail_context_overflow(opts)
+            } else { 'false' }
+            shrunk = if (overflow == 'true') { shrink_for_overflow(recovered, opts) } else { recovered }
+            if (overflow == 'true' && approx_tokens(shrunk) < approx_tokens(recovered)) {
+                turn_print(opts, "  " ++ UI.dim_text("(the server says the context is too long — trimmed to ~" ++
+                      to_string(approx_tokens(shrunk)) ++ " tokens, retrying once)"))
+                journal_sync(opts, shrunk)
+                run_turn(shrunk, map_put(opts, 'ctx_retry', 'true'), step + 1)
             } else {
-                trim_incomplete(working_hist)
+                if (fatal == 'fatal') { mark_poison(opts) }
+                journal_sync(opts, recovered)
+                recovered
             }
-            journal_sync(opts, recovered)
-            recovered
         } else {
             content = to_string(map_get(result, 'content'))
             tool_calls_v = map_get(result, 'tool_calls')
             reasoning = map_get(result, 'reasoning')
             tool_calls = if (tool_calls_v == nil) { [] } else { tool_calls_v }
+            # Was the turn cut off — ESC mid-stream, or the output-token limit?
+            cut = turn_cut_reason(result)
 
-            asst_msg = LLM.new_message_assistant(content, tool_calls, reasoning)
+            # History keeps a wire-safe copy of the calls (cut-off arguments
+            # stored as "{}", see sanitize_tool_calls); dispatch below uses the
+            # raw ones.
+            # A headless run stamps its replies with run_id (see run_headless;
+            # the journal doesn't keep the field).
+            asst_msg0 = LLM.new_message_assistant(content, sanitize_tool_calls(tool_calls, []), reasoning)
+            run_id = map_get(opts, 'run_id')
+            asst_msg = if (run_id == nil) { asst_msg0 } else { map_put(asst_msg0, 'run_id', run_id) }
             with_assistant = list_append(working_hist, asst_msg)
             journal_sync(opts, with_assistant)
             # F2: a turn completed cleanly — clear any poison flag a PRIOR turn in
@@ -2023,17 +2211,35 @@ fun run_turn(history, opts, step) {
             # the good work. clear_poison() is a cheap stat+unlink, idempotent.
             clear_poison()
 
+            # A cut-off turn's tool calls are NEVER dispatched. Their arguments
+            # may end mid-string, and the lenient json_decode turns that into a
+            # plausible call — a `write` of half a config file ("ok: wrote 59
+            # bytes"), a `bash` command missing its tail. Each call gets a result
+            # saying it was not run (every tool_call id still needs its tool
+            # message), then:
+            #   interrupted — the user pressed ESC while it streamed: the turn
+            #                 ends, exactly like ESC on a running tool.
+            #   truncated   — F4 recovery below (raise max_tokens, then the
+            #                 smaller-edits nudge), which tells the model to
+            #                 reissue the calls.
             # F4: length-truncation recovery (finish_reason=length / truncation
-            # marker) — ONLY when the turn carried no tool_calls. A truncated turn
-            # that still emitted tool_calls is actionable: fall through and execute
-            # them normally (appending a user nudge after an assistant-with-open-
-            # tool_calls would be an invalid native sequence and would skip the
-            # work). Stage 0: retry ONCE with a raised per-turn max_tokens. Stage 1:
-            # inject a "continue in smaller append-mode edits" user-message while
-            # KEEPING the partial assistant output. Stage 2+: give up gracefully.
-            # Guarded by the 'trunc_retry' counter so we never loop unbounded.
-            truncated = map_get(result, 'truncated')
-            if (truncated == 'true' && length(tool_calls) == 0) {
+            # marker). Stage 0: retry ONCE with a raised per-turn max_tokens.
+            # Stage 1: inject a "continue in smaller append-mode edits"
+            # user-message while KEEPING the partial assistant output. Stage 2+:
+            # give up gracefully. Guarded by the 'trunc_retry' counter so we never
+            # loop unbounded. The nudge follows the tool results, so the native
+            # sequence stays valid.
+            if (length(tool_calls) > 0 && cut != 'complete') {
+                refused = refuse_tool_calls(tool_calls, with_assistant, cut, opts)
+                if (cut == 'interrupted') {
+                    journal_sync(opts, refused)
+                    turn_print(opts, "  " ++ UI.dim_text("⎿ interrupted · tell the agent what to do instead"))
+                    turn_print(opts, "")
+                    refused
+                } else {
+                    handle_truncation(refused, tool_calls, opts, step)
+                }
+            } else { if (cut == 'truncated') {
                 handle_truncation(with_assistant, tool_calls, opts, step)
             } else {
 
@@ -2094,7 +2300,7 @@ fun run_turn(history, opts, step) {
                     run_turn(post_exec, meter_opts, step + 1)
                 }
             }
-            }
+            }}
         }
         }
     }
@@ -2119,6 +2325,9 @@ fun raised_max_tokens(opts) {
     if (doubled > ceil) { ceil } else { doubled }
 }
 
+# `tool_calls` non-empty: the cut came while the model was still writing
+# tool calls — refuse_tool_calls already answered each one "not run", so the
+# nudge asks for them again instead of "continue where you left off".
 fun handle_truncation(with_assistant, tool_calls, opts, step) {
     stage = map_get(opts, 'trunc_retry')
     stage_n = if (stage == nil) { 0 } else { stage }
@@ -2130,8 +2339,14 @@ fun handle_truncation(with_assistant, tool_calls, opts, step) {
               "max_tokens=" ++ to_string(raised) ++ ")"))
         retry_opts0 = map_put(opts, 'max_tokens', raised)
         retry_opts = map_put(retry_opts0, 'trunc_retry', 1)
-        cont = "Your previous response was cut off at the output token limit. " ++
-               "Continue exactly where you left off."
+        cont = if (length(tool_calls) > 0) {
+            "Your previous response was cut off at the output token limit while it " ++
+            "was still writing tool calls, so none of them ran. Reissue them with " ++
+            "complete arguments."
+        } else {
+            "Your previous response was cut off at the output token limit. " ++
+            "Continue exactly where you left off."
+        }
         with_nudge = list_append(with_assistant, LLM.new_message_user(cont))
         journal_sync(opts, with_nudge)
         run_turn(with_nudge, retry_opts, step + 1)
@@ -2647,9 +2862,12 @@ fun run_subagent_loop(history, opts, step) {
             if (length(tool_calls) == 0) {
                 content
             } else {
-                asst = LLM.new_message_assistant(content, tool_calls, reasoning)
+                asst = LLM.new_message_assistant(content, sanitize_tool_calls(tool_calls, []), reasoning)
                 with_assistant = list_append(history, asst)
-                post_tools = subagent_exec_all(tool_calls, with_assistant, opts)
+                # A cut-off turn's calls are answered, not run (see run_turn).
+                cut = turn_cut_reason(result)
+                post_tools = if (cut != 'complete') { refuse_tool_calls(tool_calls, with_assistant, cut, opts) }
+                             else { subagent_exec_all(tool_calls, with_assistant, opts) }
                 # The subagent's OWN guardrail (fresh table, see
                 # handle_task_tool): a runaway failure streak stops the
                 # subagent, never the parent's turn.
@@ -2819,7 +3037,10 @@ fun subagent_exec_all(tool_calls, history, opts) {
             args_raw = to_string(map_get(tc, 'arguments'))
             args_map = json_decode(args_raw)
             args_map_safe = if (args_map == nil) { map_new() } else { args_map }
-            sub_result = dispatch_tool(name_atom, args_map_safe, opts)
+            # Same F5 guard as execute_all: never run a cut-off call.
+            sub_result = if (args_malformed(args_raw) == 'true') {
+                "error: the arguments for '" ++ name_str ++ "' were not valid JSON (likely truncated mid-string). Reissue this single tool call with complete, valid JSON arguments."
+            } else { dispatch_tool(name_atom, args_map_safe, opts) }
             tool_msg = LLM.new_message_tool(id, sub_result)
             new_hist = list_append(history, tool_msg)
             subagent_exec_all(tl(tool_calls), new_hist, opts)
@@ -2863,11 +3084,12 @@ fun execute_all(tool_calls, history, opts) {
         name_atom = string_to_atom(name_str)
         args_raw = to_string(map_get(tc, 'arguments'))
         args_map = json_decode(args_raw)
-        # F5: a NON-EMPTY args blob that fails to parse is a truncated/malformed
-        # tool call. Don't silently dispatch with empty args (which yields a
-        # confusing "missing X" for an arg the model DID supply) — tell it to reissue.
-        args_trim = string_trim(args_raw)
-        malformed = if (args_map == nil && args_trim != "" && args_trim != "{}" && args_trim != "null") { 'true' } else { 'false' }
+        # F5: a NON-EMPTY args blob that isn't one complete JSON value is a
+        # truncated/malformed tool call. Don't dispatch it — with empty args
+        # (a confusing "missing X" for an arg the model DID supply) or, worse,
+        # with the lenient decoder's partial value (a command / file content
+        # cut mid-string) — tell the model to reissue.
+        malformed = args_malformed(args_raw)
         result = if (malformed == 'true') {
             turn_print(opts, "")
             turn_print(opts, UI.tool_header_str(name_atom, "(malformed / truncated arguments)"))
@@ -2919,6 +3141,63 @@ fun execute_all(tool_calls, history, opts) {
 }
 
 fun INTERRUPT_SKIPPED() { "[skipped] the user interrupted this turn before this tool ran." }
+
+# ------------------------------------------------------------
+# Cut-off turns — a tool call the model didn't finish is never run.
+# ------------------------------------------------------------
+# The runtime appends this to the content when ESC/Ctrl-C lands mid-stream
+# (and routed mode's interrupted_stream_result mirrors it).
+fun INTERRUPT_MARKER() { "[Request interrupted by user]" }
+
+# 'interrupted' (the user stopped the stream), 'truncated' (output-token
+# limit) or 'complete'. llm.sw flags both on the RAW content — inband
+# parsing strips everything after the first call marker, marker included —
+# the content test is the fallback for a result built elsewhere.
+fun turn_cut_reason(result) {
+    if (map_get(result, 'interrupted') == 'true') { 'interrupted' }
+    else { if (string_ends_with(string_trim(to_string(map_get(result, 'content'))),
+                                INTERRUPT_MARKER()) == 'true') { 'interrupted' }
+    else { if (map_get(result, 'truncated') == 'true') { 'truncated' }
+    else { 'complete' } } }
+}
+
+fun refused_tool_result(reason, raw_args) {
+    if (reason == 'interrupted') {
+        "[interrupted] the user pressed ESC while this tool call was still streaming — it was NOT run."
+    } else {
+        cut = if (args_malformed(raw_args) == 'true') {
+            " Its arguments were cut off after " ++ to_string(string_length(to_string(raw_args))) ++ " bytes."
+        } else { "" }
+        "error: not executed — your response hit the output token limit before this tool " ++
+        "call was complete, so it was NOT run." ++ cut ++ " Reissue it with complete " ++
+        "arguments; for large content write a short stub first, then append the rest " ++
+        "with `edit` in smaller pieces."
+    }
+}
+
+# Answer every call of a cut-off turn with a not-run result instead of
+# dispatching it (history stays valid: each tool_call id gets its tool
+# message). No journal_sync here — a subagent's opts carry the PARENT's
+# journal_path; run_turn journals the result itself.
+fun refuse_tool_calls(tool_calls, history, reason, opts) {
+    if (length(tool_calls) == 0) { history }
+    else {
+        tc = hd(tool_calls)
+        id = to_string(map_get(tc, 'id'))
+        name_atom = string_to_atom(to_string(map_get(tc, 'name')))
+        raw = to_string(map_get(tc, 'arguments'))
+        result = refused_tool_result(reason, raw)
+        if (map_get(opts, 'is_subagent') != 'true') {
+            what = if (reason == 'interrupted') { "interrupted while streaming — not run" }
+                   else { "cut off at the output limit — not run" }
+            turn_print(opts, "")
+            turn_print(opts, UI.tool_header_str(name_atom, what))
+        }
+        Log.tool_call(name_atom, raw)
+        Log.tool_result(name_atom, string_length(result), 'true')
+        refuse_tool_calls(tl(tool_calls), list_append(history, LLM.new_message_tool(id, result)), reason, opts)
+    }
+}
 
 # Result markers for a tool the user stopped: shell_managed's ESC/Ctrl-C
 # kill, and collect_tool_result's interrupt of a non-shell tool.

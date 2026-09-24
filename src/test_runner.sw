@@ -44,6 +44,8 @@ import Background
 import PathGuard
 import Hooks
 import ToolSchemas
+import Util
+import Prompts
 
 fun main() {
     print("")
@@ -295,7 +297,30 @@ fun main() {
         t_edit_create_makes_parents(),
         t_tilde_paths_expand(),
         t_guardrail_counts_bash_exit_codes(),
-        t_schema_text_matches_code()
+        t_schema_text_matches_code(),
+        # --- cut-off tool calls are never dispatched ---
+        t_json_args_well_formed(),
+        t_args_malformed_despite_lenient_decode(),
+        t_cut_turn_reason(),
+        t_cut_turn_calls_refused(),
+        t_sanitize_cut_tool_calls(),
+        # --- headless reports only this run's answer ---
+        t_headless_answer_this_run_only(),
+        # --- context budget scales with the window ---
+        t_context_budget_scales_with_window(),
+        # --- compaction keeps the live turn, never loses history ---
+        t_compact_split_keeps_live_user(),
+        t_compact_split_pair_boundary(),
+        t_compact_nothing_old_is_noop(),
+        t_compact_failed_summary_keeps_history(),
+        # --- a fatal 4xx keeps completed work; context overflow retries ---
+        t_context_overflow_detection(),
+        t_mech_trim_protects_live_user(),
+        # --- profile override: env precedence, kwargs, /model, tool format ---
+        t_override_env_beats_stale_override(),
+        t_profile_override_keeps_chat_template_kwargs(),
+        t_model_override_keeps_active_profile(),
+        t_system_prompt_follows_wire_format()
     ]
 
     passed = sum_list(results, 0)
@@ -658,11 +683,10 @@ fun t_drop_to_last_clean_user() {
 
 # F2: trailing_turn_incomplete keeps a COMPLETE tool turn (every tool_call
 # answered) and flags a PARTIAL one (a tool_call left unanswered) — the robust
-# detection that doesn't depend on json_decode. (NB: the args-malformed sub-check
-# is only a weak backup: sw's json_decode is lenient and recovers truncated JSON
-# into a partial map rather than nil, so a mid-string-truncated tool_call is
-# caught by F4's finish_reason/marker path and this partial-tool-set check, not
-# by json_decode==nil.)
+# detection that doesn't depend on json_decode. (NB: sw's json_decode is lenient
+# and recovers truncated JSON into a partial map rather than nil; the
+# args-malformed sub-check uses the strict Util.json_args_well_formed for that —
+# see t_args_malformed_despite_lenient_decode.)
 fun t_trailing_turn_incomplete_detection() {
     complete = [%{role: 'user', content: "u"},
                 %{role: 'assistant', content: "", tool_calls: [%{id: "1", arguments: "{}"}]},
@@ -3930,4 +3954,276 @@ fun t_schema_text_matches_code() {
           bool_and3(if (string_contains(g, "file paths by default") == 'false') { 'true' } else { 'false' },
                     string_contains(g, "matching lines"),
                     if (string_contains(f, "modification time") == 'false') { 'true' } else { 'false' }))
+}
+
+# ------------------------------------------------------------
+# Cut-off tool calls are never dispatched
+# ------------------------------------------------------------
+fun wf(s) { Util.json_args_well_formed(s) }
+
+# The strict structural check the lenient json_decode doesn't do.
+fun t_json_args_well_formed() {
+    good = bool_and3(wf("{\"command\":\"echo hi\"}"),
+                     wf("  {\"a\":[1,{\"b\":\"}]\\\"\"}],\"c\":\"\"}\n"),
+                     wf("{\"x\":\"café 漢 \\\\\"}"))
+    bad = bool_and3(bool_not(wf("{\"command\":\"echo hi")),
+                    bool_not(wf("{\"a\":[1,2}")),
+                    bool_and3(bool_not(wf("{\"a\":1}{\"b\":2}")),
+                              bool_not(wf("{\"a\":\"q\\\"}")),
+                              bool_not(wf("\"just a string\""))))
+    check("json_args_well_formed: complete objects pass; cut strings/containers, trailing values fail",
+          bool_and(good, bad))
+}
+
+# The reviewer's repro: json_decode accepts a write cut mid-string, so the
+# old `json_decode == nil` test let it run and wrote half a config file.
+fun t_args_malformed_despite_lenient_decode() {
+    cut = "{\"path\": \"config.py\", \"content\": \"SETTINGS = {\\n  'db_url': 'postgres://prod"
+    # Older runtimes' json_decode accepted `cut` as a complete map (current
+    # swarmrt returns nil); the check must not depend on which one runs.
+    check("args_malformed: a write cut mid-string is malformed, whatever json_decode says",
+          bool_and(Agent.args_malformed(cut),
+                   bool_and3(bool_not(Agent.args_malformed("{\"command\":\"ls\"}")),
+                             bool_not(Agent.args_malformed("")),
+                             bool_not(Agent.args_malformed("{}")))))
+}
+
+fun t_cut_turn_reason() {
+    tr = Agent.turn_cut_reason(%{content: "x", truncated: 'true'})
+    it = Agent.turn_cut_reason(%{content: "x", truncated: 'false', interrupted: 'true'})
+    im = Agent.turn_cut_reason(%{content: "Creating file.\n\n[Request interrupted by user]"})
+    ok = Agent.turn_cut_reason(%{content: "done", truncated: 'false', interrupted: 'false'})
+    check("turn_cut_reason: truncated / interrupted (flag or marker) / complete",
+          bool_and(bool_and(eqs(tr, 'truncated'), eqs(it, 'interrupted')),
+                   bool_and(eqs(im, 'interrupted'), eqs(ok, 'complete'))))
+}
+
+# Every call of a cut-off turn gets a not-run result (history stays valid);
+# an interrupted one reads as a user interrupt so the turn ends.
+fun t_cut_turn_calls_refused() {
+    calls = [%{id: "w1", name: "write", arguments: "{\"path\": \"c.py\", \"content\": \"x = 'pro"},
+             %{id: "b1", name: "bash", arguments: "{\"command\":\"ls\"}"}]
+    base = [LLM.new_message_user("go"), LLM.new_message_assistant("", calls, nil)]
+    tr = Agent.refuse_tool_calls(calls, base, 'truncated', %{is_subagent: 'true'})
+    it = Agent.refuse_tool_calls(calls, base, 'interrupted', %{is_subagent: 'true'})
+    t3 = hd(tl(tl(tr)))
+    t4 = hd(tl(tl(tl(tr))))
+    ids_ok = if (length(tr) == 4 && map_get(t3, 'tool_call_id') == "w1" &&
+                 map_get(t4, 'tool_call_id') == "b1") { 'true' } else { 'false' }
+    tr_ok = bool_and(string_starts_with(to_string(map_get(t3, 'content')), "error: not executed"),
+                     string_contains(to_string(map_get(t3, 'content')), "cut off after"))
+    check("refuse_tool_calls: one not-run result per call; interrupted ends the turn",
+          bool_and3(ids_ok, tr_ok,
+                    bool_and(Agent.turn_interrupted(it, 2),
+                             bool_not(Agent.turn_interrupted(tr, 2)))))
+}
+
+# History keeps "{}" for cut-off arguments (servers that parse them reject
+# every later request); complete arguments are kept verbatim.
+fun t_sanitize_cut_tool_calls() {
+    calls = [%{id: "a", name: "bash", arguments: "{\"command\": \"touch /tmp/x"},
+             %{id: "b", name: "bash", arguments: "{\"command\":\"ls\"}"}]
+    out = Agent.sanitize_tool_calls(calls, [])
+    check("sanitize_tool_calls: cut-off arguments stored as {}, complete ones untouched",
+          bool_and3(eqs(map_get(hd(out), 'arguments'), "{}"),
+                    eqs(map_get(hd(tl(out)), 'arguments'), "{\"command\":\"ls\"}"),
+                    eqs(map_get(hd(out), 'id'), "a")))
+}
+
+# ------------------------------------------------------------
+# Headless reports only THIS run's answer
+# ------------------------------------------------------------
+# Resume is the headless default: the history already holds earlier runs'
+# replies. A run whose LLM call failed ends on its user message (or a tool
+# result) and must not report the previous run's answer as success.
+fun t_headless_answer_this_run_only() {
+    prev = [LLM.new_message_system("s"), LLM.new_message_user("first"),
+            map_put(LLM.new_message_assistant("FIRST_RUN_ANSWER", [], nil), 'run_id', "run-1")]
+    failed = list_append(prev, LLM.new_message_user("second"))
+    answered = list_append(failed, map_put(LLM.new_message_assistant("SECOND", [], nil), 'run_id', "run-2"))
+    mid_tools = list_append(failed, map_put(LLM.new_message_assistant("let me look",
+                    [%{id: "c", name: "bash", arguments: "{}"}], nil), 'run_id', "run-2"))
+    check("headless_answer: this run's final reply only — never an earlier run's",
+          bool_and3(eqs(Agent.headless_answer(failed, "run-2"), ""),
+                    eqs(Agent.headless_answer(prev, "run-2"), ""),
+                    bool_and(eqs(Agent.headless_answer(answered, "run-2"), "SECOND"),
+                             eqs(Agent.headless_answer(mid_tools, "run-2"), ""))))
+}
+
+# ------------------------------------------------------------
+# Context budget scales with the window
+# ------------------------------------------------------------
+# window − reserve − buffer with the 262K-sized defaults (16384 / 52000) went
+# negative below 68,385 tokens (32K → −35,616: compaction on every step).
+# Reserve and buffer are capped at window/4, so the budget is ≥ window/2.
+fun t_context_budget_scales_with_window() {
+    b8 = LLM.budget_for_window(8192, 16384, 52000)
+    b32 = LLM.budget_for_window(32768, 16384, 52000)
+    b128 = LLM.budget_for_window(131072, 16384, 52000)
+    b262 = LLM.budget_for_window(262144, 16384, 52000)
+    explicit_big = LLM.budget_for_window(32768, 30000, 30000)
+    degenerate = LLM.budget_for_window(0, 16384, 52000)
+    check("context budget: 8K→4096, 32K→16384, 128K→81920, 262K→193760; never below 1",
+          bool_and3(bool_and(eqs(b8, 4096), eqs(b32, 16384)),
+                    bool_and(eqs(b128, 81920), eqs(b262, 193760)),
+                    bool_and(eqs(explicit_big, 16384), eqs(degenerate, 1))))
+}
+
+# ------------------------------------------------------------
+# Compaction keeps the live turn verbatim and never loses history
+# ------------------------------------------------------------
+fun pairs(n, tag, acc) {
+    if (n <= 0) { acc }
+    else {
+        id = tag ++ to_string(n)
+        pairs(n - 1, tag, acc ++ [LLM.new_message_assistant("", [%{id: id, name: "bash", arguments: "{}"}], nil),
+                                  LLM.new_message_tool(id, "out " ++ id)])
+    }
+}
+
+fun chat_msgs(n, acc) {
+    if (n <= 0) { acc }
+    else { chat_msgs(n - 1, acc ++ [LLM.new_message_user("q" ++ to_string(n)),
+                                    LLM.new_message_assistant("a" ++ to_string(n), [], nil)]) }
+}
+
+# Mid-turn: the live request is followed by 20 tool messages. "Keep the last
+# 16" used to summarize the request away, so the next request carried no
+# user message at all.
+fun t_compact_split_keeps_live_user() {
+    rest = [LLM.new_message_user("old q"), LLM.new_message_assistant("old a", [], nil),
+            LLM.new_message_user("LIVE REQUEST")] ++ pairs(10, "c", [])
+    k = Agent.compact_split(rest)
+    check("compact_split: the tail starts at the live user request (2), not 16 from the end",
+          eqs(k, 2))
+}
+
+# The tail never opens on a tool result whose assistant got summarized.
+fun t_compact_split_pair_boundary() {
+    rest = [LLM.new_message_user("u1")] ++ pairs(10, "p", []) ++
+           [LLM.new_message_user("u2")] ++ pairs(1, "z", [])
+    k = Agent.compact_split(rest)
+    check("compact_split: tail opens on the assistant of a tool pair, not its result",
+          bool_and(eqs(k, 7), eqs(map_get(hd(drop_n(rest, k)), 'role'), 'assistant')))
+}
+
+fun drop_n(lst, n) {
+    if (n <= 0 || length(lst) == 0) { lst } else { drop_n(tl(lst), n - 1) }
+}
+
+fun dead_llm_opts() {
+    %{endpoint: "http://127.0.0.1:9", model: "test", tool_format: 'native', max_tokens: 256}
+}
+
+# 12 messages: nothing is old enough to summarize — no LLM call, no extra
+# summary prepended (it used to grow the history by one summary per call).
+fun t_compact_nothing_old_is_noop() {
+    h = [LLM.new_message_system("s")] ++ chat_msgs(6, [])
+    out = Agent.compact_history(h, dead_llm_opts())
+    check("compact_history: nothing old enough → history unchanged",
+          bool_and(eqs(length(out), 13), eqs(out, h)))
+}
+
+# The summarizer is down: keep everything (it used to delete the old
+# messages and journal "[compaction failed, messages elided]").
+fun t_compact_failed_summary_keeps_history() {
+    h = [LLM.new_message_system("s")] ++ chat_msgs(15, [])
+    out = Agent.compact_history(h, dead_llm_opts())
+    check("compact_history: failed summarizer → history unchanged, nothing elided",
+          bool_and(eqs(length(out), 31), eqs(out, h)))
+}
+
+# ------------------------------------------------------------
+# A fatal 4xx keeps completed work; "context too long" is recoverable
+# ------------------------------------------------------------
+fun t_context_overflow_detection() {
+    yes = bool_and3(LLM.is_context_overflow_msg("HTTP 400: This model's maximum context length is 8192 tokens"),
+                    LLM.is_context_overflow_msg("{\"code\":\"context_length_exceeded\"}"),
+                    bool_and(LLM.is_context_overflow_msg("prompt is too long: 250000 tokens > 200000 maximum"),
+                             LLM.is_context_overflow_msg("Too many tokens in request")))
+    no = bool_and(bool_not(LLM.is_context_overflow_msg("bad request")),
+                  bool_not(LLM.is_context_overflow_msg("invalid api key")))
+    check("context-overflow wording detected (4 phrasings); other 4xx messages are not", bool_and(yes, no))
+}
+
+# The live user request is never stubbed (mid-turn it isn't the last message);
+# the overflow path may stub the LAST result, the normal pre-flight may not.
+fun t_mech_trim_protects_live_user() {
+    big = rep_tail("xxxxxxxxxx", 1000, "")
+    h = [LLM.new_message_system("s"), LLM.new_message_user(big),
+         LLM.new_message_assistant("", [%{id: "a", name: "read", arguments: "{}"}], nil),
+         LLM.new_message_tool("a", big)]
+    normal = Agent.mechanical_trim_ex(h, 10, 'true')
+    overflow = Agent.mechanical_trim_ex(h, 10, 'false')
+    user_kept = bool_and(eqs(map_get(hd(tl(normal)), 'content'), big),
+                         eqs(map_get(hd(tl(overflow)), 'content'), big))
+    last_n = to_string(map_get(hd(tl(tl(tl(normal)))), 'content'))
+    last_o = to_string(map_get(hd(tl(tl(tl(overflow)))), 'content'))
+    check("mechanical trim: live user request never stubbed; last result stubbed only on overflow",
+          bool_and3(user_kept, eqs(last_n, big), string_contains(last_o, "chars elided")))
+}
+
+fun rep_tail(s, n, acc) { if (n <= 0) { acc } else { rep_tail(s, n - 1, acc ++ s) } }
+
+# ------------------------------------------------------------
+# Profile override: env precedence, chat_template_kwargs, /model, format
+# ------------------------------------------------------------
+fun env_none() { fn(name) { nil } }
+fun env_model_test() { fn(name) { if (name == "SWARM_CODE_MODEL") { "test" } else { nil } } }
+
+# An override left by an EARLIER session no longer beats an env var that is
+# set (it silently sent a stale /profile's model with SWARM_CODE_MODEL=test);
+# this session's own override still does, and with no env var it applies.
+fun t_override_env_beats_stale_override() {
+    opts = %{model: "test", session_id: "sess-new"}
+    stale = %{model: "qwen3-b", session_id: "sess-old"}
+    mine = %{model: "qwen3-b", session_id: "sess-new"}
+    check("override: env beats a stale override; this session's override beats env",
+          bool_and3(eqs(map_get(LLM.apply_override_map(opts, stale, env_model_test()), 'model'), "test"),
+                    eqs(map_get(LLM.apply_override_map(opts, mine, env_model_test()), 'model'), "qwen3-b"),
+                    eqs(map_get(LLM.apply_override_map(opts, stale, env_none()), 'model'), "qwen3-b")))
+}
+
+# /profile qwen2 must carry the profile's chat_template_kwargs through the
+# override file (they were dropped, then cleared — enable_thinking lost).
+fun t_profile_override_keeps_chat_template_kwargs() {
+    prof = json_decode("{\"model\":\"qwen2-x\",\"chat_template_kwargs\":{\"enable_thinking\":false}}")
+    file_ov = json_decode(json_encode(map_put(map_put(Agent.profile_to_override(prof), 'profile', "qwen2"),
+                                              'session_id', "s1")))
+    eff = LLM.apply_override_map(%{model: "m", session_id: "s1"}, file_ov, env_none())
+    ct = map_get(eff, 'chat_template_kwargs')
+    body = LLM.build_request_body([LLM.new_message_user("hi")], map_put(map_put(native_opts(), 'chat_template_kwargs', ct), 'model', map_get(eff, 'model')))
+    check("/profile keeps the profile's chat_template_kwargs (enable_thinking:false reaches the body)",
+          bool_and(if (ct != nil) { 'true' } else { 'false' },
+                   string_contains(body, "\"enable_thinking\":false")))
+}
+
+# /model X carries forward what is in effect: a /profile's endpoint, api_key
+# and kwargs survive (it used to write {model} alone and revert them).
+fun t_model_override_keeps_active_profile() {
+    active = %{endpoint: "http://gpu-box:8000", api_key: "k-1", model: "qwen2-x", profile: "qwen2",
+               chat_template_kwargs: %{enable_thinking: 'false'}, session_id: "s1"}
+    kept = LLM.effective_override(active, %{session_id: "s1"})
+    ov = map_put(map_put(kept, 'model', "other-model"), 'session_id', "s1")
+    eff = LLM.apply_override_map(%{endpoint: "http://launch", model: "m", session_id: "s1"}, ov, env_none())
+    check("/model changes only the model: the active profile's endpoint/api_key/kwargs stay",
+          bool_and3(eqs(map_get(eff, 'model'), "other-model"),
+                    eqs(map_get(eff, 'endpoint'), "http://gpu-box:8000"),
+                    bool_and(eqs(map_get(eff, 'api_key'), "k-1"),
+                             if (map_get(eff, 'chat_template_kwargs') != nil) { 'true' } else { 'false' })))
+}
+
+# The system prompt is built once for the launch format; a request sent in
+# the other format (an override to inband has no tools array) must carry the
+# matching tool sections, or the model has no usable tools.
+fun t_system_prompt_follows_wire_format() {
+    native_sys = [LLM.new_message_system(Prompts.system_prompt("/tmp", "native")), LLM.new_message_user("hi")]
+    inband_sys = [LLM.new_message_system(Prompts.system_prompt("/tmp", "inband")), LLM.new_message_user("hi")]
+    as_inband = LLM.build_request_body(native_sys, map_put(native_opts(), 'tool_format', 'inband'))
+    as_native = LLM.build_request_body(inband_sys, native_opts())
+    check("system prompt tool sections follow the request's wire format (native <-> inband)",
+          bool_and(bool_and(string_contains(as_inband, "TOOL-CALLING PROTOCOL"),
+                            bool_not(string_contains(as_inband, "=== TOOL USE ==="))),
+                   bool_and(string_contains(as_native, "=== TOOL USE ==="),
+                            bool_not(string_contains(as_native, "TOOL-CALLING PROTOCOL")))))
 }

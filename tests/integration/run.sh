@@ -38,8 +38,19 @@
 #   T17 command-tool gate   — `background` gets the same hardline gate as bash
 #                             (denial names the pattern); a command merely
 #                             MENTIONING reboot/halt still runs
+#   T18 truncated tool call — finish_reason=length: the cut-off write never runs
+#   T19 malformed args      — cut mid-string, no finish_reason: strict check stops it
+#   T20 interrupted stream  — tool calls of an ESC-interrupted stream never run
+#   T21 stale headless ok   — a failed resumed run never reports the prior answer
+#   T22 small window        — SWARM_CODE_MAX_TOKENS=32768 keeps a positive budget
+#   T23 /compact safety     — no-op when nothing is old, merges summaries, 503 keeps all
+#   T24 mid-turn compaction — the live user request survives compaction
+#   T25 fatal 4xx           — completed tool pairs survive; context overflow retries once
+#   T26 escapes round-trip  — "<div>" / "\u003c" in args and prose, native + inband
+#   T27 profile override    — env beats a stale override; kwargs kept; /model keeps profile
+#   T28 -p prompt parsing   — -p --json "x", either order, "-x"/"-- x" prompts, stdin
 #
-# INTEG_ONLY="t4 t11" runs just those tests (default: all).
+# `run.sh t4 t11` or INTEG_ONLY="t4 t11" runs just those tests (default: all).
 #
 # Exit code: 0 iff every test passes.
 
@@ -113,7 +124,11 @@ new_case() {
 # Captures stdout/stderr into $CASE, sets RC.
 #   RUN_ENDPOINT  endpoint URL to export (default: the mock); "-" exports
 #                 none, so settings.json decides
-#   RUN_ENV       bash array of extra VAR=value pairs, applied last
+#   RUN_ENV       extra VAR=value words, applied last — a bash array
+#                 (RUN_ENV=(A=1 B=2)) or one string (RUN_ENV="A=1 B=2");
+#                 values must not contain spaces
+#   RUN_UNSET     "VAR ..." removes defaults (e.g. SWARM_CODE_MODEL)
+#   RUN_STDIN     file fed to stdin (default /dev/null)
 # Opt-in knobs a developer may have exported are cleared first so the
 # security cases below always see the defaults.
 RUN_ENV=()
@@ -125,16 +140,21 @@ run_swarm() {
               SWARM_CODE_HEADLESS_APPROVE SWARM_CODE_DEBUG
         endpoint="${RUN_ENDPOINT:-http://127.0.0.1:$PORT}"
         [ "$endpoint" = "-" ] && endpoint=""
-        env HOME="$CASE_HOME" \
-            SWARM_CODE_EXECUTION_CONTEXT="${RUN_EXECUTION_CONTEXT:-main}" \
-            ${endpoint:+"SWARM_CODE_ENDPOINT=$endpoint"} \
-            SWARM_CODE_MODEL=test \
-            SWARM_CODE_TOOL_FORMAT=native \
-            SWARM_CODE_PLAN=off \
-            SWARM_CODE_NO_RESUME=0 \
-            PWD="${RUN_PWD:-$PWD}" \
-            ${RUN_ENV[@]+"${RUN_ENV[@]}"} \
-            "$BIN" "$@" </dev/null >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
+        export HOME="$CASE_HOME" \
+               SWARM_CODE_EXECUTION_CONTEXT="${RUN_EXECUTION_CONTEXT:-main}" \
+               SWARM_CODE_MODEL=test \
+               SWARM_CODE_TOOL_FORMAT=native \
+               SWARM_CODE_PLAN=off \
+               SWARM_CODE_NO_RESUME=0 \
+               PWD="${RUN_PWD:-$PWD}"
+        if [ -n "$endpoint" ]; then export SWARM_CODE_ENDPOINT="$endpoint"; fi
+        set -f   # values like providers JSON contain [ ] — never glob them
+        # shellcheck disable=SC2068
+        for kv in ${RUN_ENV[@]+${RUN_ENV[@]}}; do export "$kv"; done
+        # shellcheck disable=SC2086
+        if [ -n "${RUN_UNSET:-}" ]; then unset $RUN_UNSET; fi
+        set +f
+        "$BIN" "$@" <"${RUN_STDIN:-/dev/null}" >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
     ) &
     local pid=$!
     ( sleep 90; kill -9 "$pid" 2>/dev/null ) &
@@ -148,21 +168,63 @@ run_swarm() {
 # final_json — last {"status":...} line the binary printed.
 final_json() { grep '"status"' "$CASE/stdout.txt" | tail -1; }
 
-# req_has <n> <substring> — assert request #n to the mock contains the
-# substring anywhere in its messages payload. Exit 0/1.
+# req_has <n> <substring> — assert streaming request #n (an agent turn) to
+# the mock contains the substring anywhere in its messages payload. Exit 0/1.
 req_has() {
     python3 - "$REQLOG" "$1" "$2" <<'PYEOF'
 import json, sys
 path, n, needle = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 for line in open(path):
     r = json.loads(line)
-    if r["n"] == n:
+    if r["n"] == n and r.get("kind", "stream") == "stream":
         sys.exit(0 if needle in json.dumps(r["body"].get("messages", [])) else 1)
 sys.exit(1)
 PYEOF
 }
 
+# req_count — requests of every kind; stream_count / silent_count split
+# agent turns from non-streaming ones (compaction's summarizer).
 req_count() { wc -l <"$REQLOG" | tr -d ' '; }
+stream_count() { grep -c '"kind": "stream"' "$REQLOG"; }
+silent_count() { grep -c '"kind": "silent"' "$REQLOG"; }
+
+# req_field <n> <key> — JSON of top-level field <key> of streaming request #n.
+req_field() {
+    python3 - "$REQLOG" "$1" "$2" <<'PYEOF'
+import json, sys
+path, n, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+for line in open(path):
+    r = json.loads(line)
+    if r["n"] == n and r.get("kind", "stream") == "stream":
+        print(json.dumps(r["body"].get(key), sort_keys=True))
+PYEOF
+}
+
+# journal_file — the session journal .active points at (for resume checks).
+journal_file() { cat "$CASE_HOME/.swarm-code/sessions/.active" 2>/dev/null; }
+
+# seed_journal <n_pairs> [summary_text] — pre-write a resumable session:
+# optional earlier-compaction summary, then n user/assistant pairs
+# ("q1".."qN" / "a1".."aN"), and point .active at it.
+seed_journal() {
+    local dir="$CASE_HOME/.swarm-code/sessions"
+    mkdir -p "$dir"
+    python3 - "$dir/journal-1000.jsonl" "$1" "${2:-}" <<'PYEOF'
+import json, sys
+path, n, summary = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(path, "w") as f:
+    if summary:
+        f.write(json.dumps({"role": "assistant",
+                            "content": "Summary of earlier conversation: " + summary}) + "\n")
+    for i in range(1, n + 1):
+        f.write(json.dumps({"role": "user", "content": "q%d" % i}) + "\n")
+        f.write(json.dumps({"role": "assistant", "content": "a%d" % i}) + "\n")
+PYEOF
+    printf '%s' "$dir/journal-1000.jsonl" >"$dir/.active"
+}
+
+# jcount <substring> — journal lines containing the substring.
+jcount() { grep -c -- "$1" "$(journal_file)"; }
 
 # ------------------------------------------------------------
 # T1 — plain prompt, final JSON line carries the scripted text
@@ -531,14 +593,23 @@ EOF
     if [ "$RC" -ne 1 ] || [ "$(req_count)" -ne 0 ]; then
         cleanup; fail T12 "an api_key bypassed the gate (rc $RC)"; return
     fi
-    # .profile_override is read at dial time — past the startup check.
+    # .profile_override is read at dial time — past the startup check. An
+    # override left by an earlier session loses to any env var that is set,
+    # so the harness's endpoint/model env is dropped and settings.json names
+    # a local (dead) endpoint that passes startup: the override then wins
+    # and is what the agent would dial, and the gate must refuse it.
     mkdir -p "$CASE_HOME/.swarm-code"
+    printf '{"endpoint": "http://127.0.0.1:1", "model": "test"}\n' \
+        >"$CASE_HOME/.swarm-code/settings.json"
     printf '{"endpoint": "http://0.0.0.0:%s", "model": "evil-override"}\n' "$PORT" \
         >"$CASE_HOME/.swarm-code/.profile_override"
-    run_swarm -p "t12 override" --no-resume --json
-    rm -f "$CASE_HOME/.swarm-code/.profile_override"
+    RUN_ENDPOINT=- RUN_UNSET="SWARM_CODE_MODEL" run_swarm -p "t12 override" --no-resume --json
+    rm -f "$CASE_HOME/.swarm-code/.profile_override" "$CASE_HOME/.swarm-code/settings.json"
     if [ "$(req_count)" -ne 0 ]; then
         cleanup; fail T12 "a non-local .profile_override endpoint was dialed"; return
+    fi
+    if ! grep -q "network isolation: refusing" "$CASE/stderr.txt"; then
+        cleanup; fail T12 "override: no refusal notice (was the override applied at all?)"; return
     fi
     # providers[]: the non-local first entry is refused, the local one used.
     RUN_ENV=("SWARM_CODE_PROVIDERS_JSON=[{\"endpoint\":\"http://0.0.0.0:$PORT\",\"model\":\"evil-provider\"},{\"endpoint\":\"http://127.0.0.1:$PORT\"}]")
@@ -762,14 +833,473 @@ EOF
 
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+# T18 — a tool call cut off at the output-token limit (finish_reason
+#       "length", arguments ending mid-string) is NOT run: the file is never
+#       written, the model is told why and asked to reissue, and history
+#       keeps "{}" instead of the cut-off blob.
+# ------------------------------------------------------------
+t18() {
+    new_case t18
+    python3 - "$CASE/scenario.json" "$WORK" <<'PYEOF'
+import json, sys
+out, work = sys.argv[1], sys.argv[2]
+full = json.dumps({"path": work + "/config.py",
+                   "content": "SETTINGS = {\n  'debug': False,\n  'db_url': 'postgres://prod-db/app'\n}\n"})
+cut = full[:full.index("postgres://prod") + len("postgres://prod")]
+json.dump({"responses": [
+    {"type": "tool_calls", "finish": "length",
+     "calls": [{"id": "call_cut", "name": "write", "arguments": cut}]},
+    {"type": "text", "content": "REISSUE_ACK_T11"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T18 "mock failed to start"; return; }
+    run_swarm -p "write the config" --no-resume --json
+    cleanup
+    local out; out="$(final_json)"
+    if [ -e "$WORK/config.py" ]; then fail T18 "truncated write was executed: $(cat "$WORK/config.py")"
+    elif [ "$RC" -ne 0 ]; then fail T18 "exit code $RC"
+    elif ! req_has 1 "error: not executed"; then fail T18 "model never told the cut-off call did not run"
+    elif ! req_has 1 "none of them ran"; then fail T18 "truncation nudge missing"
+    elif req_has 1 "postgres://prod"; then fail T18 "cut-off arguments were sent back verbatim"
+    elif ! echo "$out" | grep -q "REISSUE_ACK_T11"; then fail T18 "final text missing: $out"
+    else pass T18; fi
+}
+
+# ------------------------------------------------------------
+# T19 — arguments cut mid-string WITHOUT a length finish_reason (the lenient
+#       json_decode accepts them) are caught by the strict JSON check.
+# ------------------------------------------------------------
+t19() {
+    new_case t19
+    local sentinel="$WORK/SENTINEL_T12"
+    python3 - "$CASE/scenario.json" "$sentinel" <<'PYEOF'
+import json, sys
+out, sentinel = sys.argv[1], sys.argv[2]
+json.dump({"responses": [
+    {"type": "tool_calls",
+     "calls": [{"id": "call_m", "name": "bash",
+                "arguments": '{"command": "touch ' + sentinel}]},
+    {"type": "text", "content": "MALFORMED_ACK_T12"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T19 "mock failed to start"; return; }
+    run_swarm -p "touch it" --no-resume --json
+    cleanup
+    if [ -e "$sentinel" ]; then fail T19 "malformed (cut) command was executed"
+    elif [ "$RC" -ne 0 ]; then fail T19 "exit code $RC"
+    elif ! req_has 1 "were not valid JSON"; then fail T19 "model never told the arguments were malformed"
+    else pass T19; fi
+}
+
+# ------------------------------------------------------------
+# T20 — a stream the user interrupted (the runtime's "[Request interrupted
+#       by user]" marker) never runs the tool calls it carried, and the turn
+#       ends without calling the model again.
+# ------------------------------------------------------------
+t20() {
+    new_case t20
+    local sentinel="$WORK/SENTINEL_T13"
+    python3 - "$CASE/scenario.json" "$sentinel" <<'PYEOF'
+import json, sys
+out, sentinel = sys.argv[1], sys.argv[2]
+json.dump({"responses": [
+    {"type": "tool_calls", "content": "Creating the file.\n\n[Request interrupted by user]",
+     "calls": [{"id": "call_i", "name": "bash", "arguments": {"command": "touch " + sentinel}}]},
+    {"type": "text", "content": "SHOULD_NOT_BE_CALLED_T13"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T20 "mock failed to start"; return; }
+    run_swarm -p "make the file" --json
+    cleanup
+    local journal; journal="$(journal_file)"
+    if [ -e "$sentinel" ]; then fail T20 "tool call from an interrupted stream was executed"
+    elif [ "$(req_count)" -ne 1 ]; then fail T20 "expected 1 request (turn ends), got $(req_count)"
+    elif ! grep -q 'call_i' "$journal" || ! grep -q '\[interrupted\]' "$journal"; then
+        fail T20 "journal lacks the [interrupted] result for the call"
+    else pass T20; fi
+}
+
+# ------------------------------------------------------------
+# T21 — headless reports only THIS run's answer. Resume is the default, so
+#       run 2's history holds run 1's reply; a run 2 whose request fails
+#       (HTTP 400, or no server at all) must be status error / exit 1, not
+#       run 1's answer with status ok.
+# ------------------------------------------------------------
+t21() {
+    new_case t21
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "FIRST_RUN_ANSWER_T14"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T21 "mock failed to start"; return; }
+    run_swarm -p "t21 first" --json
+    cleanup
+    if [ "$RC" -ne 0 ] || ! final_json | grep -q FIRST_RUN_ANSWER_T14; then
+        fail T21 "run 1 did not succeed: rc=$RC $(final_json)"; return
+    fi
+
+    cat >"$CASE/scenario2.json" <<'EOF'
+{"responses": [{"type": "http", "status": 400, "body": "{\"error\":{\"message\":\"bad request\"}}"}]}
+EOF
+    start_mock "$CASE/scenario2.json" || { fail T21 "mock 2 failed to start"; return; }
+    run_swarm -p "t21 second" --json
+    cleanup
+    local out2; out2="$(final_json)"
+    if [ "$RC" -eq 0 ]; then fail T21 "run 2 (HTTP 400) exited 0: $out2"; return; fi
+    if echo "$out2" | grep -q FIRST_RUN_ANSWER_T14; then fail T21 "run 2 (HTTP 400) reported run 1's answer: $out2"; return; fi
+    if ! echo "$out2" | grep -q '"status":"error"'; then fail T21 "run 2 (HTTP 400) status not error: $out2"; return; fi
+
+    # Run 3: nothing listening on the port any more.
+    run_swarm -p "t21 third" --json
+    local out3; out3="$(final_json)"
+    if [ "$RC" -eq 0 ]; then fail T21 "run 3 (server down) exited 0: $out3"
+    elif echo "$out3" | grep -q FIRST_RUN_ANSWER_T14; then fail T21 "run 3 (server down) reported run 1's answer: $out3"
+    elif ! echo "$out3" | grep -q '"status":"error"'; then fail T21 "run 3 status not error: $out3"
+    else pass T21; fi
+}
+
+# ------------------------------------------------------------
+# T22 — a small context window (SWARM_CODE_MAX_TOKENS=32768) gets a positive,
+#       window-scaled budget (16384): no "compacting" on every step, and the
+#       context meter reads x/16k (the old budget was -35616).
+# ------------------------------------------------------------
+t22() {
+    new_case t22
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_t15", "name": "bash", "arguments": {"command": "echo small-window-t22"}}]},
+  {"type": "text", "content": "SMALL_WINDOW_OK_T15"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T22 "mock failed to start"; return; }
+    RUN_ENV="SWARM_CODE_MAX_TOKENS=32768" run_swarm -p "t22 run it" --no-resume --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T22 "exit code $RC"
+    elif grep -q "compacting" "$CASE/stderr.txt"; then
+        fail T22 "compacted with a tiny history: $(grep compacting "$CASE/stderr.txt" | head -1)"
+    elif ! req_has 0 "/16k tok"; then fail T22 "context meter does not show the 16k budget"
+    elif ! final_json | grep -q SMALL_WINDOW_OK_T15; then fail T22 "final text missing: $(final_json)"
+    else pass T22; fi
+}
+
+# ------------------------------------------------------------
+# T23 — /compact never loses history: with nothing old enough to summarize
+#       it is a no-op (no LLM call, no extra summary); an earlier summary is
+#       merged into the new one, not stacked; a failed summarizer (503)
+#       leaves the history untouched instead of eliding it.
+# ------------------------------------------------------------
+t23() {
+    new_case t23
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [], "silent": [{"type": "text", "content": "SHOULD_NOT_BE_CALLED"}]}
+EOF
+    seed_journal 6
+    start_mock "$CASE/scenario.json" || { fail T23 "mock failed to start"; return; }
+    run_swarm -p "/compact" --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T23 "noop: exit code $RC"; return; fi
+    if [ "$(silent_count)" -ne 0 ]; then fail T23 "noop: summarizer called for 12 messages"; return; fi
+    if [ "$(jcount 'Summary of earlier')" -ne 0 ]; then fail T23 "noop: a summary was prepended"; return; fi
+    if [ "$(wc -l <"$(journal_file)")" -ne 12 ]; then fail T23 "noop: journal changed ($(wc -l <"$(journal_file)") lines)"; return; fi
+
+    new_case t16b
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [], "silent": [{"type": "text", "content": "NEW_MERGED_SUMMARY_T16"}]}
+EOF
+    seed_journal 15 "OLD_SUMMARY_FACT_T16"
+    start_mock "$CASE/scenario.json" || { fail T23 "merge: mock failed to start"; return; }
+    run_swarm -p "/compact" --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T23 "merge: exit code $RC"; return; fi
+    if [ "$(silent_count)" -ne 1 ]; then fail T23 "merge: expected 1 summarizer call, got $(silent_count)"; return; fi
+    if ! grep -q OLD_SUMMARY_FACT_T16 "$REQLOG"; then fail T23 "merge: earlier summary not passed to the summarizer"; return; fi
+    if [ "$(jcount 'Summary of earlier')" -ne 1 ]; then fail T23 "merge: $(jcount 'Summary of earlier') summaries in the journal (stacked?)"; return; fi
+    if [ "$(jcount NEW_MERGED_SUMMARY_T16)" -ne 1 ]; then fail T23 "merge: new summary not journaled"; return; fi
+    if [ "$(jcount '"q15"')" -ne 1 ]; then fail T23 "merge: most recent user message not kept verbatim"; return; fi
+
+    new_case t16c
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [], "silent": [
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"},
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"},
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"},
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"}]}
+EOF
+    seed_journal 15
+    start_mock "$CASE/scenario.json" || { fail T23 "fail: mock failed to start"; return; }
+    run_swarm -p "/compact" --json
+    cleanup
+    # (>= 1: the runtime may retry a 5xx at the curl level.)
+    if [ "$(silent_count)" -lt 1 ]; then fail T23 "fail: summarizer never called"
+    elif [ "$(wc -l <"$(journal_file)")" -ne 30 ]; then fail T23 "fail: 503 summarizer lost messages ($(wc -l <"$(journal_file)") of 30 left)"
+    elif [ "$(jcount 'compaction failed')" -ne 0 ]; then fail T23 "fail: journaled a compaction-failed placeholder"
+    else pass T23; fi
+}
+
+# ------------------------------------------------------------
+# T24 — compaction mid-turn keeps the live request. 12 tool rounds of 7000
+#       chars against a 32K window cross the budget at ~round 9, when the
+#       user message is more than 16 messages back: every request must
+#       still carry it (it used to be summarized away, leaving requests with
+#       no user message); only the pre-turn history is summarized.
+# ------------------------------------------------------------
+t24() {
+    new_case t24
+    python3 - "$CASE/scenario.json" <<'PYEOF'
+import json, sys
+# Distinct commands: the guardrail stops identical repeated calls.
+calls = [{"type": "tool_calls", "calls": [{"id": "c%d" % i, "name": "bash",
+          "arguments": {"command": "head -c 7000 /dev/zero | tr '\\0' A; echo round-%d" % i}}]}
+         for i in range(12)]
+json.dump({"responses": calls + [{"type": "text", "content": "LONG_TURN_DONE_T17"}],
+           "silent": [{"type": "text", "content": "SUMMARY_OF_OLD_T17"}]},
+          open(sys.argv[1], "w"))
+PYEOF
+    seed_journal 5
+    start_mock "$CASE/scenario.json" || { fail T24 "mock failed to start"; return; }
+    RUN_ENV="SWARM_CODE_MAX_TOKENS=32768" run_swarm -p "LIVE_REQUEST_T17 run the dozen commands" --json
+    cleanup
+    local verdict
+    verdict="$(python3 - "$REQLOG" <<'PYEOF'
+import json, sys
+seen_silent, after, missing = False, 0, []
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r["kind"] == "silent":
+        seen_silent = True
+        continue
+    msgs = json.dumps(r["body"]["messages"])
+    if "LIVE_REQUEST_T17" not in msgs:
+        missing.append(r["n"])
+    if seen_silent and "SUMMARY_OF_OLD_T17" in msgs:
+        after += 1
+if not seen_silent:
+    print("no compaction happened")
+elif missing:
+    print("requests without the live user message: %s" % missing)
+elif after == 0:
+    print("no request carried the summary after compaction")
+else:
+    print("ok")
+PYEOF
+)"
+    if [ "$RC" -ne 0 ]; then fail T24 "exit code $RC"
+    elif [ "$verdict" != "ok" ]; then fail T24 "$verdict"
+    elif [ "$(silent_count)" -ne 1 ]; then fail T24 "expected 1 summarizer call, got $(silent_count)"
+    elif ! final_json | grep -q LONG_TURN_DONE_T17; then fail T24 "final text missing: $(final_json)"
+    else pass T24; fi
+}
+
+# ------------------------------------------------------------
+# T25 — a fatal 4xx keeps the turn's completed work.
+#   a) "maximum context length" after a big tool result: trimmed and retried
+#      once — the retry carries the stub, the turn succeeds;
+#   b) a plain 400 after two writes: the journal keeps both write results
+#      (it used to keep only the user message), and a resumed run sends them;
+#   c) the overflow retry happens once, not in a loop.
+# ------------------------------------------------------------
+t25() {
+    new_case t25
+    python3 - "$CASE/scenario.json" "$WORK" <<'PYEOF'
+import json, sys
+out, work = sys.argv[1], sys.argv[2]
+over = {"type": "http", "status": 400,
+        "body": json.dumps({"error": {"message": "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens."}})}
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_big", "name": "bash",
+      "arguments": {"command": "head -c 12000 /dev/zero | tr '\\0' B"}}]},
+    {"type": "tool_calls", "calls": [{"id": "call_w", "name": "write",
+      "arguments": {"path": work + "/a.txt", "content": "A"}}]},
+    over,
+    {"type": "text", "content": "RECOVERED_T18"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T25 "a: mock failed to start"; return; }
+    run_swarm -p "t25 build it" --no-resume --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T25 "a: exit code $RC: $(final_json)"; return; fi
+    if ! final_json | grep -q RECOVERED_T18; then fail T25 "a: no recovery: $(final_json)"; return; fi
+    if ! req_has 3 "chars elided"; then fail T25 "a: retry did not carry the trimmed result"; return; fi
+    if req_has 3 "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"; then fail T25 "a: retry still carried the 12KB result"; return; fi
+    if ! req_has 3 "call_w"; then fail T25 "a: retry lost the completed write"; return; fi
+
+    new_case t18b
+    python3 - "$CASE/scenario.json" "$WORK" <<'PYEOF'
+import json, sys
+out, work = sys.argv[1], sys.argv[2]
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_w1", "name": "write",
+      "arguments": {"path": work + "/a.txt", "content": "A"}}]},
+    {"type": "tool_calls", "calls": [{"id": "call_w2", "name": "write",
+      "arguments": {"path": work + "/b.txt", "content": "B"}}]},
+    {"type": "http", "status": 400, "body": "{\"error\":{\"message\":\"bad request\"}}"}]},
+    open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T25 "b: mock failed to start"; return; }
+    run_swarm -p "t25 write two files" --json
+    cleanup
+    local journal; journal="$(journal_file)"
+    if [ "$RC" -eq 0 ]; then fail T25 "b: exit 0 after a fatal 400"; return; fi
+    if [ ! -f "$WORK/a.txt" ] || [ ! -f "$WORK/b.txt" ]; then fail T25 "b: writes did not land"; return; fi
+    if [ "$(grep -c '"tool_call_id":"call_w[12]"' "$journal")" -ne 2 ]; then
+        fail T25 "b: journal lost the completed writes: $(cat "$journal")"; return
+    fi
+    cat >"$CASE/scenario2.json" <<'EOF'
+{"responses": [{"type": "text", "content": "RESUMED_T18"}]}
+EOF
+    start_mock "$CASE/scenario2.json" || { fail T25 "b: mock 2 failed to start"; return; }
+    run_swarm -p "t25 what did you write" --json
+    cleanup
+    if ! req_has 0 "call_w1" || ! req_has 0 "call_w2"; then fail T25 "b: resumed request has no record of the writes"; return; fi
+
+    new_case t18c
+    python3 - "$CASE/scenario.json" <<'PYEOF'
+import json, sys
+over = {"type": "http", "status": 400,
+        "body": json.dumps({"error": {"message": "context_length_exceeded"}})}
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_big", "name": "bash",
+      "arguments": {"command": "head -c 12000 /dev/zero | tr '\\0' B"}}]},
+    over, over, over, {"type": "text", "content": "SHOULD_NOT_GET_HERE"}]}, open(sys.argv[1], "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T25 "c: mock failed to start"; return; }
+    run_swarm -p "t25 loop" --no-resume --json
+    cleanup
+    if [ "$RC" -eq 0 ]; then fail T25 "c: exit 0 after repeated overflow"
+    elif [ "$(req_count)" -ne 3 ]; then fail T25 "c: expected 3 requests (one retry), got $(req_count)"
+    else pass T25; fi
+}
+
+# ------------------------------------------------------------
+# T26 — text round-trips byte for byte: "<div>", "<" and a literal <
+#       (JS source) in tool arguments and prose, native and inband. A
+#       u003c -> "<" "repair" pass (for a long-fixed runtime bug) turned
+#       "<" into "\<" — in files the model wrote and in its prose.
+# ------------------------------------------------------------
+t26() {
+    new_case t26
+    python3 - "$CASE" "$WORK" <<'PYEOF'
+import json, sys
+case, work = sys.argv[1], sys.argv[2]
+# The file the model means to write: markup, a bare "<", and a JS <
+# escape that must land as the six characters backslash-u-0-0-3-c.
+want = 's = "<div>";\nlt = "<";\njs = "\\u003cp\\u003e";\n'
+open(case + "/want.txt", "w").write(want)
+args = json.dumps({"path": work + "/esc.js", "content": want})
+# Some models JSON-escape "<" as < inside the arguments: decoded once
+# by the argument parse, it must become a plain "<".
+args_escaped = args.replace('"<div>"', '"\\u003cdiv\\u003e"')
+prose = 'Use <div>, not \\u003cdiv\\u003e, when the text says "<".'
+open(case + "/prose.txt", "w").write(prose)
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_esc", "name": "write", "arguments": args_escaped}]},
+    {"type": "text", "content": prose}]}, open(case + "/native.json", "w"))
+json.dump({"responses": [
+    {"type": "text", "content": "Writing it.\ncall:write" + args_escaped},
+    {"type": "text", "content": prose}]}, open(case + "/inband.json", "w"))
+PYEOF
+    local fmt
+    for fmt in native inband; do
+        rm -f "$WORK/esc.js"
+        start_mock "$CASE/$fmt.json" || { fail T26 "$fmt: mock failed to start"; return; }
+        RUN_ENV="SWARM_CODE_TOOL_FORMAT=$fmt" run_swarm -p "write esc.js" --no-resume --json
+        cleanup
+        if [ "$RC" -ne 0 ]; then fail T26 "$fmt: exit code $RC"; return; fi
+        if ! cmp -s "$WORK/esc.js" "$CASE/want.txt"; then
+            fail T26 "$fmt: file content changed: $(cat "$WORK/esc.js" 2>/dev/null)"; return
+        fi
+        if ! python3 -c 'import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if d["summary"]==open(sys.argv[2]).read() else 1)' \
+                "$CASE/stdout.txt" "$CASE/prose.txt"; then
+            fail T26 "$fmt: prose changed: $(final_json)"; return
+        fi
+    done
+    pass T26
+}
+
+# ------------------------------------------------------------
+# T27 — the persisted /profile override: an env var that is set beats one
+#       left by an earlier session (a stale profile model was sent instead
+#       of SWARM_CODE_MODEL); the profile's chat_template_kwargs reach the
+#       request (they were dropped); /model changes only the model and
+#       keeps the profile's settings (it overwrote them).
+# ------------------------------------------------------------
+t27() {
+    new_case t27
+    mkdir -p "$CASE_HOME/.swarm-code"
+    cat >"$CASE_HOME/.swarm-code/settings.json" <<'EOF'
+{"profiles": {"qwen2": {"model": "qwen-2-stale-model", "endpoint": "http://127.0.0.1:9",
+                         "chat_template_kwargs": {"enable_thinking": false}}}}
+EOF
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "PROFILE_OK_T20"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T27 "mock failed to start"; return; }
+    run_swarm -p "/profile qwen2" --no-resume --json
+    if [ "$RC" -ne 0 ]; then cleanup; fail T27 "/profile run exit code $RC"; return; fi
+    run_swarm -p "t27 hello" --no-resume --json
+    cleanup
+    local model ct
+    model="$(req_field 0 model)"; ct="$(req_field 0 chat_template_kwargs)"
+    if [ "$RC" -ne 0 ]; then fail T27 "run after /profile: exit $RC (endpoint override beat env?)"; return; fi
+    if [ "$model" != '"test"' ]; then fail T27 "stale override beat SWARM_CODE_MODEL: model=$model"; return; fi
+    if [ "$ct" != '{"enable_thinking": false}' ]; then fail T27 "profile chat_template_kwargs lost: $ct"; return; fi
+
+    start_mock "$CASE/scenario.json" || { fail T27 "mock 2 failed to start"; return; }
+    run_swarm -p "/model other-model" --no-resume --json
+    run_swarm -p "t27 again" --no-resume --json
+    cleanup
+    ct="$(req_field 0 chat_template_kwargs)"
+    if [ "$RC" -ne 0 ]; then fail T27 "run after /model: exit $RC"
+    elif [ "$ct" != '{"enable_thinking": false}' ]; then fail T27 "/model wiped the profile's kwargs: $ct"
+    elif [ "$(req_field 0 model)" != '"test"' ]; then fail T27 "after /model: env model not sent: $(req_field 0 model)"
+    else pass T27; fi
+}
+
+# ------------------------------------------------------------
+# T28 — the -p prompt: README's `-p --json "prompt"` (a flag right after
+#       -p used to mean "read stdin" — 0 requests, exit 1), either flag
+#       order, prompts that START with "-" (Scheduler/Flows pass user text
+#       right after -p; "-- summarize…" was dropped), and stdin via `-p -`
+#       or no positional argument.
+# ------------------------------------------------------------
+t28() {
+    new_case t28
+    python3 - "$CASE/scenario.json" <<'PYEOF'
+import json, sys
+json.dump({"responses": [{"type": "text", "content": "OK_T21_%d" % i} for i in range(6)]},
+          open(sys.argv[1], "w"))
+PYEOF
+    printf 't28 from stdin\n' >"$CASE/stdin1.txt"
+    printf 't28 stdin fallback\n' >"$CASE/stdin2.txt"
+    start_mock "$CASE/scenario.json" || { fail T28 "mock failed to start"; return; }
+    local n=0 why=""
+    t28_case() {  # <want-prompt> <args...>
+        local want="$1"; shift
+        run_swarm "$@"
+        if [ "$RC" -ne 0 ]; then why="[$*] exit $RC"; return 1; fi
+        if ! req_has "$n" "$want"; then why="[$*] request $n lacks prompt '$want'"; return 1; fi
+        if ! grep -q "OK_T21_$n" "$CASE/stdout.txt"; then why="[$*] stdout lacks the answer"; return 1; fi
+        n=$((n + 1))
+    }
+    t28_case "t28 list the test files" -p --json "t28 list the test files" --no-resume &&
+    t28_case "t28 other order" --no-resume --json -p "t28 other order" &&
+    t28_case "-- summarize the diff t28" --no-resume -p "-- summarize the diff t28" &&
+    t28_case "-x t28 dash prompt" -p "-x t28 dash prompt" --json --no-resume &&
+    RUN_STDIN="$CASE/stdin1.txt" t28_case "t28 from stdin" --no-resume -p - --json &&
+    RUN_STDIN="$CASE/stdin2.txt" t28_case "t28 stdin fallback" -p --json --no-resume
+    local ok=$?
+    cleanup
+    if [ "$ok" -ne 0 ]; then fail T28 "$why"; else pass T28; fi
+}
+
+# ------------------------------------------------------------
+
 # Multi-agent / MCP / scheduler / persistence cases (A1..).
 . "$ROOT/tests/integration/agents_cases.sh"
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
-for t in ${INTEG_ONLY:-t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 agents_cases}; do
-    "$t"
-done
+# `run.sh t4 t11` (or INTEG_ONLY="t4 t11") runs just those cases; no
+# arguments runs them all.
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 agents_cases"
+for t in ${*:-${INTEG_ONLY:-$ALL_TESTS}}; do "$t"; done
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"
