@@ -9,7 +9,7 @@ module Util
 # Agent/Config/Tools). Keeping these here means a bug fix lands
 # once, not 8 times.
 
-export [shell_q, noninteractive_wrap, no_stdin]
+export [shell_q, noninteractive_wrap, no_stdin, join_all]
 
 # POSIX-safe single-quote wrap. Replaces `'` with `'\''` (close,
 # escape, reopen) so the result is always safe to splice into a
@@ -46,4 +46,31 @@ fun noninteractive_wrap(user_cmd) {
 # MCP server's next request. stderr is left alone: each caller decides.
 fun no_stdin(cmd) {
     "exec </dev/null\n" ++ to_string(cmd) ++ "\n"
+}
+
+# Concatenate a list of strings. `acc ++ s` in a loop re-copies the growing
+# accumulator (quadratic on a 2000-line read); joining halves recursively is
+# O(n log n) and the recursion is only log2(n) deep.
+fun join_all(parts) {
+    join_n(parts, length(parts))
+}
+
+fun join_n(parts, n) {
+    if (n <= 16) { join_lin(parts, n, "") }
+    else {
+        h = n / 2
+        join_n(take_n(parts, h, []), h) ++ join_n(drop_n(parts, h), n - h)
+    }
+}
+
+fun join_lin(parts, n, acc) {
+    if (n <= 0 || length(parts) == 0) { acc } else { join_lin(tl(parts), n - 1, acc ++ hd(parts)) }
+}
+
+fun take_n(lst, n, acc) {
+    if (n <= 0 || length(lst) == 0) { acc } else { take_n(tl(lst), n - 1, list_append(acc, hd(lst))) }
+}
+
+fun drop_n(lst, n) {
+    if (n <= 0 || length(lst) == 0) { lst } else { drop_n(tl(lst), n - 1) }
 }

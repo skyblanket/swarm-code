@@ -40,7 +40,7 @@ export [exec_raw, max_output_bytes]
 # turn). Each tool now gets a cap tuned to its role, mirroring claude-code's
 # per-tool limits. truncate_output keeps HEAD+TAIL so the failing tail of a
 # log survives the cut. max_output_bytes() stays as the conservative default
-# (and the read_ceiling base) for any caller without a dedicated cap.
+# for any caller without a dedicated cap.
 fun max_output_bytes() { 6000 }
 fun bash_output_cap() { 24000 }
 fun run_tests_raw_cap() { 16000 }
@@ -510,8 +510,12 @@ fun do_read(args) {
     # limit is max lines to return. Both optional; defaults match CC.
     offset_raw = map_get(args, 'offset')
     limit_raw = map_get(args, 'limit')
-    offset = if (offset_raw == nil) { 1 } else { to_int(offset_raw) }
-    limit = if (limit_raw == nil) { 2000 } else { to_int(limit_raw) }
+    # parse_int_safe, not to_int: the to_int BUILTIN returns nil for junk
+    # like "abc", which then leaked into the line numbers as "nil".
+    offset_n = if (offset_raw == nil) { 1 } else { parse_int_safe(to_string(offset_raw), 1) }
+    limit_n = if (limit_raw == nil) { 2000 } else { parse_int_safe(to_string(limit_raw), 2000) }
+    offset = if (offset_n < 1) { 1 } else { offset_n }
+    limit = if (limit_n < 1) { 2000 } else { limit_n }
     if (p == nil) {
         "error: missing 'path' argument"
     } else {
@@ -557,28 +561,30 @@ fun read_file_capped(path, offset, limit) {
                               read_probe_timeout_s() * 1000)
         nul_count = parse_int_safe(string_trim(elem(nul_r, 1)), 0)
         if (nul_count == 0) {
-            # Size guard: file_read() pulls the WHOLE file into memory, so a
-            # multi-GB file would OOM the VM before truncate_output ever runs.
-            # Stat first; for anything large, read only a capped head via
-            # `head -c` instead of slurping the whole thing.
-            size_str = string_trim(elem(run_sh("wc -c < " ++ pq ++ " 2>/dev/null", read_probe_timeout_s() * 1000), 1))
-            size = parse_int_safe(size_str, 0)
-            read_ceiling = read_output_cap()
-            content = if (size == 0) { "" } else { if (size > read_ceiling) {
-                head = elem(run_sh("head -c " ++ to_string(read_ceiling) ++ " " ++ pq ++ " 2>&1", read_probe_timeout_s() * 1000), 1)
-                head ++ "\n...[file is " ++ size_str ++ " bytes — showing first " ++
-                to_string(read_ceiling) ++ ". Use bash sed/grep for specific ranges.]"
-            } else {
-                file_read(path)
-            } }
-            if (content == nil) {
-                "error: could not read " ++ path
-            } else { if (size == 0) {
+            # Size guard: file_read() pulls the WHOLE file into memory (and
+            # refuses anything over 1MB), so only files within that cap are
+            # read in-process. Bigger ones are windowed by LINE with sed —
+            # the old code loaded just `head -c 65000` and THEN applied
+            # offset/limit, so offset 15000 of a 20,000-line file came back
+            # empty with no marker. Either way the OUTPUT is capped.
+            st = file_stat(to_string(path))
+            size = if (st == nil) { 0 } else { map_get(st, 'size') }
+            if (size == 0) {
                 "[empty file] " ++ to_string(path) ++ " exists but has no content."
+            } else { if (size <= file_read_cap()) {
+                content = file_read(path)
+                if (content == nil) {
+                    "error: could not read " ++ path
+                } else { if (string_length(content) != size) {
+                    # A NUL byte past the first 8KB: file_read stopped at it.
+                    read_window_streamed(path, pq, offset, limit,
+                        "\n[note: this file contains NUL bytes after the first 8KB; they are not shown]")
+                } else {
+                    read_window_from_content(path, content, offset, limit)
+                }}
             } else {
-                sliced = slice_lines(content, offset, limit)
-                truncate_output(sliced, read_output_cap())
-            } }
+                read_window_streamed(path, pq, offset, limit, "")
+            }}
         } else {
             # Best-effort label; `file` may not be installed.
             ft_r = run_sh("file --brief --mime-type " ++ pq ++ " 2>/dev/null",
@@ -595,15 +601,11 @@ fun read_file_capped(path, offset, limit) {
     } } }
 }
 
-# Slice [offset, offset+limit) lines from content (1-based offset) and
-# prefix each line with its 1-based file line number + a tab — `N\t<content>`,
-# the cat -n shape claude-code's Read emits. The schema PROMISED line numbers
-# (the edit/multi_edit prose tells the model to strip the leading number+tab
-# before using a line as old_string); previously the body returned raw content
-# with no anchors, so the model dropped to `od -c` to count offsets. The line
-# number is the ABSOLUTE file line (start + position-in-window + 1), so anchors
-# stay correct even when reading a windowed slice with offset > 1.
-fun slice_lines(content, offset, limit) {
+# file_read's in-process cap (the runtime returns nil above it).
+fun file_read_cap() { 1048576 }
+
+# Window [offset, offset+limit) of an in-memory file (1-based offset).
+fun read_window_from_content(path, content, offset, limit) {
     parts = string_split(content, "\n")
     # A final newline ends the last line; it doesn't start an empty one
     # (a 6-line file used to read back as 7 lines).
@@ -611,25 +613,86 @@ fun slice_lines(content, offset, limit) {
         take_first_lines(parts, length(parts) - 1, [])
     } else { parts }
     total = length(lines)
-    start = if (offset < 1) { 0 } else { offset - 1 }
-    if (start >= total) {
-        ""
-    } else {
-        window = take_first_lines(drop_first_n(lines, start), limit, [])
-        number_lines(window, start + 1, "")
+    if (offset > total) { read_past_eof(path, offset, total) }
+    else {
+        window = take_first_lines(drop_first_n(lines, offset - 1), limit, [])
+        render_read_window(window, offset, total)
     }
 }
 
-# Join lines, each prefixed with `<lineno>\t`. lineno is the 1-based file line
-# number of the FIRST window line; it increments per line. Matches cat -n /
-# claude-code Read so the model has stable anchors for edit old_strings.
-fun number_lines(lst, lineno, acc) {
-    if (length(lst) == 0) { acc }
+# Window of a big file, selected by line number with sed (bounded: sed quits
+# after the last wanted line, head -c caps the bytes). The first output line
+# is the file's line count (wc -l, +1 when the last line has no newline).
+fun read_window_streamed(path, pq, offset, limit, note) {
+    last = offset + limit - 1
+    cmd = "n=$(wc -l < " ++ pq ++ "); [ -n \"$(tail -c 1 " ++ pq ++ ")\" ] && n=$((n+1)); echo \"$n\"; " ++
+          "sed -n '" ++ to_string(offset) ++ "," ++ to_string(last) ++ "p;" ++ to_string(last) ++ "q' " ++ pq ++
+          " | head -c " ++ to_string(read_output_cap() + 1)
+    r = run_sh(cmd, search_timeout_s() * 1000)
+    if (elem(r, 2) == 'true') {
+        "error: read of " ++ to_string(path) ++ " timed out after " ++ to_string(search_timeout_s()) ++
+        "s (a very large file?) — use bash with sed -n 'A,Bp' for a specific range."
+    } else {
+        out = elem(r, 1)
+        nl = string_index_of(out, "\n")
+        total = if (nl < 0) { parse_int_safe(string_trim(out), 0) } else { parse_int_safe(string_trim(string_sub(out, 0, nl)), 0) }
+        body = if (nl < 0) { "" } else { string_sub(out, nl + 1, string_length(out) - nl - 1) }
+        if (offset > total) { read_past_eof(path, offset, total) }
+        else {
+            parts = string_split(body, "\n")
+            lines = if (string_ends_with(body, "\n") == 'true' && length(parts) > 1) {
+                take_first_lines(parts, length(parts) - 1, [])
+            } else { parts }
+            render_read_window(lines, offset, total) ++ note
+        }
+    }
+}
+
+fun read_past_eof(path, offset, total) {
+    "error: offset " ++ to_string(offset) ++ " is past the end of " ++ to_string(path) ++
+    " (" ++ to_string(total) ++ " lines) — use a smaller offset."
+}
+
+# Prefix each window line with its 1-based file line number + a tab —
+# `N\t<content>`, the cat -n shape claude-code's Read emits (the edit /
+# multi_edit prose tells the model to strip it before using a line as
+# old_string). Numbers are ABSOLUTE file lines, so anchors stay right for a
+# windowed read. The output is capped at read_output_cap() on a LINE
+# boundary, and every cut says where to continue:
+#   [output capped at N bytes — lines A-K of T shown; continue with offset=K+1]
+#   [lines A-B of T shown — continue with offset=B+1]      (limit reached)
+fun render_read_window(window, start, total) {
+    r = cap_numbered_lines(window, start, read_output_cap(), [], 0)
+    parts = elem(r, 0)
+    last = elem(r, 1)
+    capped = elem(r, 2)
+    body = Util.join_all(parts)
+    shown = to_string(start) ++ "-" ++ to_string(last) ++ " of " ++ to_string(total)
+    if (capped == 'true') {
+        body ++ "\n[output capped at " ++ to_string(read_output_cap()) ++ " bytes — lines " ++ shown ++
+        " shown; continue with offset=" ++ to_string(last + 1) ++ "]"
+    } else { if (last < total) {
+        body ++ "\n[lines " ++ shown ++ " shown — continue with offset=" ++ to_string(last + 1) ++ "]"
+    } else { body }}
+}
+
+# → {parts, last_line_number_included, capped}. A single line longer than
+# the whole budget is cut (and flagged) rather than dropped.
+fun cap_numbered_lines(lines, lineno, budget, acc, used) {
+    if (length(lines) == 0) { {acc, lineno - 1, 'false'} }
     else {
-        h = hd(lst)
-        sep = if (string_length(acc) == 0) { "" } else { "\n" }
-        line = to_string(lineno) ++ "\t" ++ h
-        number_lines(tl(lst), lineno + 1, acc ++ sep ++ line)
+        piece = to_string(lineno) ++ "\t" ++ hd(lines)
+        sep = if (length(acc) == 0) { "" } else { "\n" }
+        need = used + string_length(sep) + string_length(piece)
+        if (need > budget) {
+            if (length(acc) == 0) {
+                {[string_sub(piece, 0, budget) ++ "…[line " ++ to_string(lineno) ++ " is " ++
+                  to_string(string_length(hd(lines))) ++ " bytes — cut here; use bash (cut -c / head -c) for the rest]"],
+                 lineno, 'true'}
+            } else { {acc, lineno - 1, 'true'} }
+        } else {
+            cap_numbered_lines(tl(lines), lineno + 1, budget, list_append(acc, sep ++ piece), need)
+        }
     }
 }
 

@@ -242,7 +242,9 @@ fun main() {
         t_pre_tool_hook_big_payload(),
         t_configured_hook_big_payload(),
         t_pre_tool_hook_fails_closed(),
-        t_hook_matcher_families()
+        t_hook_matcher_families(),
+        t_read_offset_past_64k(),
+        t_read_huge_file_window()
     ]
 
     passed = sum_list(results, 0)
@@ -2979,4 +2981,37 @@ fun t_hook_matcher_families() {
         if (matcher_blocks("write", 'multi_edit') == 'false') { 'true' } else { 'false' })
     check("hook matchers: edit covers multi_edit, bash covers every shell tool, case-insensitive",
           bool_and(fires, quiet))
+}
+
+# read loaded only `head -c 65000` and THEN applied offset/limit, so a
+# 20,000-line file read with offset 15000 came back EMPTY with no marker.
+fun make_lines_file(path, n) {
+    shell("awk 'BEGIN { for (i = 1; i <= " ++ to_string(n) ++ "; i++) printf \"line %d of the numbered test file\\n\", i }' > " ++ path)
+}
+
+fun t_read_offset_past_64k() {
+    p = "/tmp/swc_read_20k.txt"
+    make_lines_file(p, 20000)
+    r = Tools.exec_raw('read', %{path: p, offset: 15000, limit: 5}, %{})
+    d = Tools.exec_raw('read', %{path: p}, %{})
+    past = Tools.exec_raw('read', %{path: p, offset: 25000}, %{})
+    file_delete(p)
+    check("read: offset beyond the first 64KB works; caps and past-EOF are explicit",
+          bool_and3(bool_and3(string_starts_with(r, "15000\tline 15000 of"),
+                              string_contains(r, "15004\tline 15004 of"),
+                              string_contains(r, "offset=15005")),
+                    bool_and(string_contains(d, "[output capped"), string_contains(d, "offset=")),
+                    bool_and(string_contains(past, "past the end"), string_contains(past, "20000 lines"))))
+}
+
+# Files over file_read's 1MB cap are windowed with sed (never slurped).
+fun t_read_huge_file_window() {
+    p = "/tmp/swc_read_huge.txt"
+    make_lines_file(p, 40000)
+    r = Tools.exec_raw('read', %{path: p, offset: 39998, limit: 50}, %{})
+    file_delete(p)
+    check("read: a >1MB file reads its tail window by line number",
+          bool_and3(string_starts_with(r, "39998\tline 39998 of"),
+                    string_contains(r, "40000\tline 40000 of"),
+                    if (string_contains(r, "40001") == 'false') { 'true' } else { 'false' }))
 }
