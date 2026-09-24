@@ -759,7 +759,7 @@ fun do_write(args, opts) {
                 # so the caller can show a real overwrite diff. Display-only
                 # (headless suppresses the render). Skipped for files ≥64KB —
                 # a large paste isn't worth diffing in the preview.
-                capture_write_prior(opts, to_string(path))
+                capture_write_prior(opts, to_string(raw_path_arg(args)), to_string(path))
                 ensure_parent_dirs(to_string(path))
                 rc = file_write(path, content)
                 if (rc == 'ok') {
@@ -773,11 +773,11 @@ fun do_write(args, opts) {
 }
 
 # Stash an about-to-be-overwritten file's prior content into the
-# 'write_diff_table' ETS (keyed by the raw path arg, matching
-# resolve_path_key in agent.sw), so show_edit_diff can render a real
+# 'write_diff_table' ETS (keyed by the RAW path arg, matching
+# resolve_path_key in agent.sw — `path` is the ~-expanded file), so show_edit_diff can render a real
 # overwrite diff. No table (subagent / test opts) → no-op. Only for an
 # existing file under 64KB; a fresh create or a huge blob is left alone.
-fun capture_write_prior(opts, path) {
+fun capture_write_prior(opts, key, path) {
     wd = if (opts == nil) { nil } else { map_get(opts, 'write_diff_table') }
     if (wd == nil) { 'ok' }
     else {
@@ -788,17 +788,17 @@ fun capture_write_prior(opts, path) {
             st = file_stat(path)
             disk = if (st == nil) { 0 - 1 } else { map_get(st, 'size') }
             if (prior != nil && string_length(prior) < 65536 && string_length(prior) == disk) {
-                ets_put(wd, path, prior)
+                ets_put(wd, key, prior)
             } else {
                 # ≥64KB (or unreadable): clear any stale prior from an
                 # earlier write to the same path so show_edit_diff doesn't
                 # render a bogus diff against outdated content.
-                ets_delete(wd, path)
+                ets_delete(wd, key)
             }
         } else {
             # Fresh create: same stale-entry guard (the path may have been
             # written before, then deleted out-of-band).
-            ets_delete(wd, path)
+            ets_delete(wd, key)
         }
     }
 }
@@ -891,6 +891,8 @@ fun do_edit_loaded(path, original, old_s, new_s, replace_all) {
     if (original == nil) {
         # Missing file. Empty old_string = create it with new_string.
         if (string_length(old_s) == 0) {
+            # Same as write: create missing parent directories first.
+            ensure_parent_dirs(to_string(path))
             rc_c = file_write(path, new_s)
             if (rc_c == 'ok') {
                 "ok: created " ++ path ++ " (" ++ to_string(string_length(new_s)) ++ " bytes)"
@@ -1060,7 +1062,7 @@ fun join_chars(lst, acc) {
 # ------------------------------------------------------------
 fun do_glob(args) {
     pattern = map_get(args, 'pattern')
-    path = map_get(args, 'path')
+    path = opt_path_arg(args, 'path')
     if (pattern == nil) {
         "error: missing 'pattern'"
     } else {
@@ -1145,7 +1147,7 @@ fun do_grep(args) {
     pattern = map_get(args, 'pattern')
     if (pattern == nil) { "error: missing 'pattern'" }
     else {
-        path = map_get(args, 'path')
+        path = opt_path_arg(args, 'path')
         glob_arg = map_get(args, 'glob')
         mode = map_get(args, 'output_mode')
         hl = map_get(args, 'head_limit')
@@ -1265,10 +1267,36 @@ fun run_sh(cmd, timeout_ms) {
 # helpers
 # ------------------------------------------------------------
 
-# Accept either 'path' or 'file_path' (Claude Code uses file_path).
+# Accept either 'path' or 'file_path' (Claude Code uses file_path), with a
+# leading `~` / `~/` expanded to $HOME (see expand_home).
 fun resolve_path_arg(args) {
+    p = raw_path_arg(args)
+    if (p == nil) { nil } else { expand_home(p) }
+}
+
+fun raw_path_arg(args) {
     p = map_get(args, 'path')
     if (p != nil) { p } else { map_get(args, 'file_path') }
+}
+
+# `~` / `~/…` → $HOME. Tool paths never pass through a shell unquoted, so
+# nothing expanded them: `read ~/.bashrc` said "file not found" and
+# `write ~/x` created a literal `./~/` directory in the cwd. (`~user` is
+# left alone.)
+fun expand_home(p) {
+    s = to_string(p)
+    home = getenv("HOME")
+    if (home == nil) { s }
+    else { if (s == "~") { to_string(home) }
+    else { if (string_starts_with(s, "~/") == 'true') {
+        to_string(home) ++ string_sub(s, 1, string_length(s) - 1)
+    } else { s }}}
+}
+
+# An optional directory/file arg for search/wait tools: nil stays nil.
+fun opt_path_arg(args, key) {
+    v = map_get(args, key)
+    if (v == nil) { nil } else { expand_home(v) }
 }
 
 # Truncate long output to prevent context blowup.
@@ -1791,7 +1819,7 @@ fun do_run_tests(args) {
         command = if (cmd == nil) { "" } else { to_string(cmd) }
         t_raw = map_get(args, 'timeout_ms')
         t_s = if (t_raw == nil) { TestRunner.default_timeout_ms() / 1000 } else { resolve_bash_timeout_s(t_raw) }
-        result = TestRunner.run_tests_timed(to_string(repo), command, t_s * 1000)
+        result = TestRunner.run_tests_timed(expand_home(repo), command, t_s * 1000)
         fw = map_get(result, 'framework')
         passed = map_get(result, 'passed')
         failed = map_get(result, 'failed')
@@ -1925,7 +1953,7 @@ fun do_code_search(args) {
     if (pat == nil) { "error: code_search needs 'pattern'" }
     else {
         kind = map_get(args, 'kind')
-        path = map_get(args, 'path')
+        path = opt_path_arg(args, 'path')
         lang = map_get(args, 'lang')
         k = if (kind == nil) { "ref" } else { to_string(kind) }
         base = if (path == nil) { "." } else { to_string(path) }
@@ -1983,7 +2011,7 @@ fun do_log_wait(args, opts) {
     if (pat == nil) { "error: log_wait needs 'pattern'" }
     else {
         task_id = map_get(args, 'task_id')
-        path_arg = map_get(args, 'path')
+        path_arg = opt_path_arg(args, 'path')
         timeout_n = clamp_wait_timeout_s(map_get(args, 'timeout_sec'))
 
         # Resolve log path: explicit path, or task_id's log file (in this
@@ -2041,7 +2069,7 @@ fun clamp_wait_timeout_s(raw) {
 # args: {"path": "/path/to/file", "timeout_sec": 60}
 # Returns when the file's signature changes, or on timeout.
 fun do_file_watch(args) {
-    path_arg = map_get(args, 'path')
+    path_arg = opt_path_arg(args, 'path')
     if (path_arg == nil) { "error: file_watch needs 'path'" }
     else {
         path = to_string(path_arg)

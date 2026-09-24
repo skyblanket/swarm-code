@@ -146,7 +146,7 @@ fun multi_edit_s() {
 fun glob_s() {
     tool("glob",
         "Find files matching a glob pattern (e.g. `src/**/*.sw`). Returns " ++
-        "paths sorted by modification time, capped at 100 (a cap notice is " ++
+        "relative paths (in no particular order), capped at 100 (a cap notice is " ++
         "appended when more matched — narrow the pattern to see the rest). " ++
         "Use for file discovery.",
         obj(%{
@@ -157,13 +157,15 @@ fun glob_s() {
 
 fun grep_s() {
     tool("grep",
-        "Search file contents with a regex. Returns file paths by default; " ++
-        "set output_mode=content to see matching lines.",
+        "Search file contents with a regex (ripgrep syntax). Returns matching lines " ++
+        "as `path:line:text` by default; set output_mode=files_with_matches for just " ++
+        "the file paths, or count for per-file match counts. An invalid regex is " ++
+        "reported as an error.",
         obj(%{
             pattern: s("Regular expression"),
             path: s("Optional: file or directory to search"),
             glob: s("Optional: file glob filter (e.g. *.sw)"),
-            output_mode: s("'files_with_matches' | 'content' | 'count'"),
+            output_mode: s("'content' (default) | 'files_with_matches' | 'count'"),
             head_limit: i("Optional: cap results (default 100 lines; output truncated past ~16KB)")
         }, ["pattern"]))
 }

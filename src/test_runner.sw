@@ -35,6 +35,7 @@ import ToolExecutor
 import ToolRegistry
 import Background
 import Hooks
+import ToolSchemas
 
 fun main() {
     print("")
@@ -246,7 +247,11 @@ fun main() {
         t_read_offset_past_64k(),
         t_read_huge_file_window(),
         t_edit_refuses_nul_and_huge(),
-        t_run_tests_quoting_timeout_output()
+        t_run_tests_quoting_timeout_output(),
+        t_edit_create_makes_parents(),
+        t_tilde_paths_expand(),
+        t_guardrail_counts_bash_exit_codes(),
+        t_schema_text_matches_code()
     ]
 
     passed = sum_list(results, 0)
@@ -3066,4 +3071,78 @@ fun t_run_tests_quoting_timeout_output() {
                              string_contains(bad, "boom-compile-error")),
                     bool_and3(string_contains(slow, "timed out"), string_contains(slow, "started-rt"),
                               if (el < 10000) { 'true' } else { 'false' })))
+}
+
+# edit with old_string="" on a missing file creates it — but unlike write it
+# did not create parent directories, so a new file in a new dir failed.
+fun t_edit_create_makes_parents() {
+    root = "/tmp/swc_edit_newdir"
+    shell("rm -rf " ++ root)
+    p = root ++ "/a/b/new.txt"
+    r = Tools.exec_raw('edit', %{path: p, old_string: "", new_string: "hello\n"}, %{})
+    body = file_read(p)
+    shell("rm -rf " ++ root)
+    check("edit: creating a file in a missing directory makes the parents (like write)",
+          bool_and(string_starts_with(r, "ok: created"), if (body == "hello\n") { 'true' } else { 'false' }))
+}
+
+# `~` wasn't expanded: `read ~/.bashrc` → file not found, and `write ~/x`
+# created a literal ./~/ directory in the cwd.
+fun t_tilde_paths_expand() {
+    home = getenv("HOME")
+    name = "swc_tilde_probe_" ++ to_string(timestamp()) ++ ".txt"
+    w = Tools.exec_raw('write', %{path: "~/" ++ name, content: "tilde-ok\n"}, %{})
+    r = Tools.exec_raw('read', %{path: "~/" ++ name}, %{})
+    at_home = file_exists(home ++ "/" ++ name)
+    literal = file_exists("./~/" ++ name)
+    file_delete(home ++ "/" ++ name)
+    if (literal == 'true') { shell("rm -rf './~'") }
+    check("read/write expand ~/ to $HOME (no literal ./~ directory)",
+          bool_and3(string_starts_with(w, "ok:"), string_starts_with(r, "1\ttilde-ok"),
+                    bool_and(at_home, if (literal == 'false') { 'true' } else { 'false' })))
+}
+
+# The 8-consecutive-failures brake only counted results starting "error:",
+# but bash reports failure as "[exit N]" — so it never fired for bash.
+fun t_guardrail_counts_bash_exit_codes() {
+    opts = guardrail_opts()
+    fail_n(opts, 8)
+    table = map_get(opts, 'guardrails_table')
+    halted = ets_get(table, 'halt_reason')
+    opts2 = guardrail_opts()
+    fail_n(opts2, 7)
+    ToolGuardrails.observe_after(opts2, "bash", "[exit 0]\nok")
+    ToolGuardrails.observe_after(opts2, "bash", "[exit 1]\nfail")
+    t2 = map_get(opts2, 'guardrails_table')
+    check("guardrail: 8 consecutive non-zero [exit N] bash results halt; [exit 0] resets",
+          bool_and(if (halted != nil) { 'true' } else { 'false' },
+                   if (ets_get(t2, 'halt_reason') == nil) { 'true' } else { 'false' }))
+}
+
+fun fail_n(opts, n) {
+    if (n > 0) {
+        ToolGuardrails.observe_after(opts, "bash", "[exit 1]\nsomething failed")
+        fail_n(opts, n - 1)
+    }
+}
+
+# Schema text must describe what the code does: grep defaults to content
+# (not "file paths by default"); glob's output isn't mtime-sorted.
+fun schema_desc(schemas, name) {
+    if (length(schemas) == 0) { "" }
+    else {
+        f = map_get(hd(schemas), 'function')
+        if (to_string(map_get(f, 'name')) == name) { to_string(map_get(f, 'description')) }
+        else { schema_desc(tl(schemas), name) }
+    }
+}
+
+fun t_schema_text_matches_code() {
+    all = ToolSchemas.all_schemas()
+    g = schema_desc(all, "grep")
+    f = schema_desc(all, "glob")
+    check("tool schemas: grep says content by default; glob doesn't claim mtime order",
+          bool_and3(if (string_contains(g, "file paths by default") == 'false') { 'true' } else { 'false' },
+                    string_contains(g, "matching lines"),
+                    if (string_contains(f, "modification time") == 'false') { 'true' } else { 'false' }))
 }
