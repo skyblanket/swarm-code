@@ -25,6 +25,8 @@
 #   T13 interrupted stream  — tool calls of an ESC-interrupted stream never run
 #   T14 stale headless ok   — a failed resumed run never reports the prior answer
 #   T15 small window        — SWARM_CODE_MAX_TOKENS=32768 keeps a positive budget
+#   T16 /compact safety     — no-op when nothing is old, merges summaries, 503 keeps all
+#   T17 mid-turn compaction — the live user request survives compaction
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -147,6 +149,29 @@ silent_count() { grep -c '"kind": "silent"' "$REQLOG"; }
 
 # journal_file — the session journal .active points at (for resume checks).
 journal_file() { cat "$CASE_HOME/.swarm-code/sessions/.active" 2>/dev/null; }
+
+# seed_journal <n_pairs> [summary_text] — pre-write a resumable session:
+# optional earlier-compaction summary, then n user/assistant pairs
+# ("q1".."qN" / "a1".."aN"), and point .active at it.
+seed_journal() {
+    local dir="$CASE_HOME/.swarm-code/sessions"
+    mkdir -p "$dir"
+    python3 - "$dir/journal-1000.jsonl" "$1" "${2:-}" <<'PYEOF'
+import json, sys
+path, n, summary = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(path, "w") as f:
+    if summary:
+        f.write(json.dumps({"role": "assistant",
+                            "content": "Summary of earlier conversation: " + summary}) + "\n")
+    for i in range(1, n + 1):
+        f.write(json.dumps({"role": "user", "content": "q%d" % i}) + "\n")
+        f.write(json.dumps({"role": "assistant", "content": "a%d" % i}) + "\n")
+PYEOF
+    printf '%s' "$dir/journal-1000.jsonl" >"$dir/.active"
+}
+
+# jcount <substring> — journal lines containing the substring.
+jcount() { grep -c -- "$1" "$(journal_file)"; }
 
 # ------------------------------------------------------------
 # T1 — plain prompt, final JSON line carries the scripted text
@@ -563,11 +588,119 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T16 — /compact never loses history: with nothing old enough to summarize
+#       it is a no-op (no LLM call, no extra summary); an earlier summary is
+#       merged into the new one, not stacked; a failed summarizer (503)
+#       leaves the history untouched instead of eliding it.
+# ------------------------------------------------------------
+t16() {
+    new_case t16
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [], "silent": [{"type": "text", "content": "SHOULD_NOT_BE_CALLED"}]}
+EOF
+    seed_journal 6
+    start_mock "$CASE/scenario.json" || { fail T16 "mock failed to start"; return; }
+    run_swarm -p "/compact" --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T16 "noop: exit code $RC"; return; fi
+    if [ "$(silent_count)" -ne 0 ]; then fail T16 "noop: summarizer called for 12 messages"; return; fi
+    if [ "$(jcount 'Summary of earlier')" -ne 0 ]; then fail T16 "noop: a summary was prepended"; return; fi
+    if [ "$(wc -l <"$(journal_file)")" -ne 12 ]; then fail T16 "noop: journal changed ($(wc -l <"$(journal_file)") lines)"; return; fi
+
+    new_case t16b
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [], "silent": [{"type": "text", "content": "NEW_MERGED_SUMMARY_T16"}]}
+EOF
+    seed_journal 15 "OLD_SUMMARY_FACT_T16"
+    start_mock "$CASE/scenario.json" || { fail T16 "merge: mock failed to start"; return; }
+    run_swarm -p "/compact" --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T16 "merge: exit code $RC"; return; fi
+    if [ "$(silent_count)" -ne 1 ]; then fail T16 "merge: expected 1 summarizer call, got $(silent_count)"; return; fi
+    if ! grep -q OLD_SUMMARY_FACT_T16 "$REQLOG"; then fail T16 "merge: earlier summary not passed to the summarizer"; return; fi
+    if [ "$(jcount 'Summary of earlier')" -ne 1 ]; then fail T16 "merge: $(jcount 'Summary of earlier') summaries in the journal (stacked?)"; return; fi
+    if [ "$(jcount NEW_MERGED_SUMMARY_T16)" -ne 1 ]; then fail T16 "merge: new summary not journaled"; return; fi
+    if [ "$(jcount '"q15"')" -ne 1 ]; then fail T16 "merge: most recent user message not kept verbatim"; return; fi
+
+    new_case t16c
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [], "silent": [
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"},
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"},
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"},
+  {"type": "http", "status": 503, "body": "{\"error\":{\"message\":\"overloaded\"}}"}]}
+EOF
+    seed_journal 15
+    start_mock "$CASE/scenario.json" || { fail T16 "fail: mock failed to start"; return; }
+    run_swarm -p "/compact" --json
+    cleanup
+    # (>= 1: the runtime may retry a 5xx at the curl level.)
+    if [ "$(silent_count)" -lt 1 ]; then fail T16 "fail: summarizer never called"
+    elif [ "$(wc -l <"$(journal_file)")" -ne 30 ]; then fail T16 "fail: 503 summarizer lost messages ($(wc -l <"$(journal_file)") of 30 left)"
+    elif [ "$(jcount 'compaction failed')" -ne 0 ]; then fail T16 "fail: journaled a compaction-failed placeholder"
+    else pass T16; fi
+}
+
+# ------------------------------------------------------------
+# T17 — compaction mid-turn keeps the live request. 12 tool rounds of 7000
+#       chars against a 32K window cross the budget at ~round 9, when the
+#       user message is more than 16 messages back: every request must
+#       still carry it (it used to be summarized away, leaving requests with
+#       no user message); only the pre-turn history is summarized.
+# ------------------------------------------------------------
+t17() {
+    new_case t17
+    python3 - "$CASE/scenario.json" <<'PYEOF'
+import json, sys
+# Distinct commands: the guardrail stops identical repeated calls.
+calls = [{"type": "tool_calls", "calls": [{"id": "c%d" % i, "name": "bash",
+          "arguments": {"command": "head -c 7000 /dev/zero | tr '\\0' A; echo round-%d" % i}}]}
+         for i in range(12)]
+json.dump({"responses": calls + [{"type": "text", "content": "LONG_TURN_DONE_T17"}],
+           "silent": [{"type": "text", "content": "SUMMARY_OF_OLD_T17"}]},
+          open(sys.argv[1], "w"))
+PYEOF
+    seed_journal 5
+    start_mock "$CASE/scenario.json" || { fail T17 "mock failed to start"; return; }
+    RUN_ENV="SWARM_CODE_MAX_TOKENS=32768" run_swarm -p "LIVE_REQUEST_T17 run the dozen commands" --json
+    cleanup
+    local verdict
+    verdict="$(python3 - "$REQLOG" <<'PYEOF'
+import json, sys
+seen_silent, after, missing = False, 0, []
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r["kind"] == "silent":
+        seen_silent = True
+        continue
+    msgs = json.dumps(r["body"]["messages"])
+    if "LIVE_REQUEST_T17" not in msgs:
+        missing.append(r["n"])
+    if seen_silent and "SUMMARY_OF_OLD_T17" in msgs:
+        after += 1
+if not seen_silent:
+    print("no compaction happened")
+elif missing:
+    print("requests without the live user message: %s" % missing)
+elif after == 0:
+    print("no request carried the summary after compaction")
+else:
+    print("ok")
+PYEOF
+)"
+    if [ "$RC" -ne 0 ]; then fail T17 "exit code $RC"
+    elif [ "$verdict" != "ok" ]; then fail T17 "$verdict"
+    elif [ "$(silent_count)" -ne 1 ]; then fail T17 "expected 1 summarizer call, got $(silent_count)"
+    elif ! final_json | grep -q LONG_TURN_DONE_T17; then fail T17 "final text missing: $(final_json)"
+    else pass T17; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"

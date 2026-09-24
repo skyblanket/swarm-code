@@ -232,7 +232,12 @@ fun main() {
         # --- headless reports only this run's answer ---
         t_headless_answer_this_run_only(),
         # --- context budget scales with the window ---
-        t_context_budget_scales_with_window()
+        t_context_budget_scales_with_window(),
+        # --- compaction keeps the live turn, never loses history ---
+        t_compact_split_keeps_live_user(),
+        t_compact_split_pair_boundary(),
+        t_compact_nothing_old_is_noop(),
+        t_compact_failed_summary_keeps_history()
     ]
 
     passed = sum_list(results, 0)
@@ -2760,3 +2765,66 @@ fun t_context_budget_scales_with_window() {
                     bool_and(eqs(explicit_big, 16384), eqs(degenerate, 1))))
 }
 
+# ------------------------------------------------------------
+# Compaction keeps the live turn verbatim and never loses history
+# ------------------------------------------------------------
+fun pairs(n, tag, acc) {
+    if (n <= 0) { acc }
+    else {
+        id = tag ++ to_string(n)
+        pairs(n - 1, tag, acc ++ [LLM.new_message_assistant("", [%{id: id, name: "bash", arguments: "{}"}], nil),
+                                  LLM.new_message_tool(id, "out " ++ id)])
+    }
+}
+
+fun chat_msgs(n, acc) {
+    if (n <= 0) { acc }
+    else { chat_msgs(n - 1, acc ++ [LLM.new_message_user("q" ++ to_string(n)),
+                                    LLM.new_message_assistant("a" ++ to_string(n), [], nil)]) }
+}
+
+# Mid-turn: the live request is followed by 20 tool messages. "Keep the last
+# 16" used to summarize the request away, so the next request carried no
+# user message at all.
+fun t_compact_split_keeps_live_user() {
+    rest = [LLM.new_message_user("old q"), LLM.new_message_assistant("old a", [], nil),
+            LLM.new_message_user("LIVE REQUEST")] ++ pairs(10, "c", [])
+    k = Agent.compact_split(rest)
+    check("compact_split: the tail starts at the live user request (2), not 16 from the end",
+          eqs(k, 2))
+}
+
+# The tail never opens on a tool result whose assistant got summarized.
+fun t_compact_split_pair_boundary() {
+    rest = [LLM.new_message_user("u1")] ++ pairs(10, "p", []) ++
+           [LLM.new_message_user("u2")] ++ pairs(1, "z", [])
+    k = Agent.compact_split(rest)
+    check("compact_split: tail opens on the assistant of a tool pair, not its result",
+          bool_and(eqs(k, 7), eqs(map_get(hd(drop_n(rest, k)), 'role'), 'assistant')))
+}
+
+fun drop_n(lst, n) {
+    if (n <= 0 || length(lst) == 0) { lst } else { drop_n(tl(lst), n - 1) }
+}
+
+fun dead_llm_opts() {
+    %{endpoint: "http://127.0.0.1:9", model: "test", tool_format: 'native', max_tokens: 256}
+}
+
+# 12 messages: nothing is old enough to summarize — no LLM call, no extra
+# summary prepended (it used to grow the history by one summary per call).
+fun t_compact_nothing_old_is_noop() {
+    h = [LLM.new_message_system("s")] ++ chat_msgs(6, [])
+    out = Agent.compact_history(h, dead_llm_opts())
+    check("compact_history: nothing old enough → history unchanged",
+          bool_and(eqs(length(out), 13), eqs(out, h)))
+}
+
+# The summarizer is down: keep everything (it used to delete the old
+# messages and journal "[compaction failed, messages elided]").
+fun t_compact_failed_summary_keeps_history() {
+    h = [LLM.new_message_system("s")] ++ chat_msgs(15, [])
+    out = Agent.compact_history(h, dead_llm_opts())
+    check("compact_history: failed summarizer → history unchanged, nothing elided",
+          bool_and(eqs(length(out), 31), eqs(out, h)))
+}

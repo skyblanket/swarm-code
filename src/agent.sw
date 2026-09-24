@@ -49,7 +49,7 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         show_expand, handle_bg_command, route_input,
         skip_remaining_tools, turn_interrupted,
         args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls,
-        headless_answer]
+        headless_answer, compact_history, compact_split]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -1108,8 +1108,11 @@ fun slash_dispatch(cmd, history, opts) {
     }
     else { if (cmd == "/compact") {
         compacted = compact_history(history, opts)
-        print("\e[2m[history compacted: " ++ to_string(length(history)) ++
-              " → " ++ to_string(length(compacted)) ++ " messages]\e[0m")
+        # Unchanged (nothing old enough / summarizer failed) already said why.
+        if (length(compacted) != length(history)) {
+            print("\e[2m[history compacted: " ++ to_string(length(history)) ++
+                  " → " ++ to_string(length(compacted)) ++ " messages]\e[0m")
+        }
         compacted
     }
     else { if (cmd == "/save") {
@@ -1632,42 +1635,117 @@ fun approx_tokens(history) {
 fun sum_msg_chars(msgs, acc) { history_chars_loop(msgs, acc) }
 
 # ------------------------------------------------------------
-# Compaction — summarize oldest messages, keep system + last 16.
+# Compaction — summarize the old part, keep the live turn verbatim.
 # ------------------------------------------------------------
+# Result: [system, summary, ...tail]. The tail is kept verbatim: at most the
+# last COMPACT_KEEP_TAIL() messages, pulled back so it always starts at or
+# before the MOST RECENT user message (mid-turn compaction used to summarize
+# the live request away — requests then went out with no user message at
+# all) and never on a role:'tool' result cut off from its assistant.
+# Invariants (each was a bug):
+#   - nothing old enough to summarize → history unchanged, NO LLM call (it
+#     used to summarize an empty transcript and prepend yet another summary);
+#   - summarizer failed / said nothing → history unchanged (it used to delete
+#     the old messages anyway and journal "[compaction failed, messages
+#     elided]");
+#   - an earlier summary is folded into the new one, not stacked.
+fun SUMMARY_PREFIX() { "Summary of earlier conversation: " }
+fun COMPACT_KEEP_TAIL() { 16 }
+
 fun compact_history(history, opts) {
-    if (length(history) < 10) { history }
-    else {
-        sys_msg = hd(history)
-        rest = tl(history)
-        keep_tail = take_last(rest, 16)
-        to_summarize = drop_last(rest, 16)
-
-        summary_prompt =
-            "Summarize the conversation below to save context. Output EXACTLY " ++
-            "these four sections, each 1-3 sentences:\n\n" ++
-            "**Current State**: What has been accomplished so far.\n" ++
-            "**Working State**: Files modified, commands run, tools used.\n" ++
-            "**Key Details**: Important technical decisions, paths, names, configs.\n" ++
-            "**Pending**: What still needs to be done, open questions.\n\n" ++
-            "Be dense and precise. Preserve exact file paths, function names, " ++
-            "and error messages — they are needed for continuity. Under 500 words total.\n\n" ++
-            format_for_summary(to_summarize, "")
-
+    has_sys = if (length(history) > 0 && map_get(hd(history), 'role') == 'system') { 'true' } else { 'false' }
+    head = if (has_sys == 'true') { [hd(history)] } else { [] }
+    rest = if (has_sys == 'true') { tl(history) } else { history }
+    k = compact_split(rest)
+    old = take_first(rest, k, [])
+    keep_tail = drop_first_n(rest, k)
+    prev_summary = summary_texts(old, "")
+    fresh = non_summary_msgs(old, [])
+    if (length(fresh) == 0) {
+        turn_print(opts, "  " ++ UI.dim_text("(nothing old enough to compact — the current turn is kept verbatim)"))
+        history
+    } else {
         ask_msgs = [
             LLM.new_message_system("You are a concise summarizer."),
-            LLM.new_message_user(summary_prompt)
+            LLM.new_message_user(compact_prompt(prev_summary, fresh))
         ]
         summary = LLM.chat_silent(ask_msgs, opts)
-        summary_text = if (summary == nil) {
-            "[compaction failed, messages elided]"
-        } else { to_string(summary) }
-
-        synth = LLM.new_message_assistant(
-            "Summary of earlier conversation: " ++ summary_text,
-            nil, nil)
-
-        prepend([sys_msg, synth], keep_tail)
+        summary_text = if (summary == nil) { "" } else { string_trim(to_string(summary)) }
+        if (string_length(summary_text) == 0) {
+            turn_print(opts, "  " ++ UI.warn_text("(compaction failed — the summarizer returned nothing; history kept as is)"))
+            history
+        } else {
+            synth = LLM.new_message_assistant(SUMMARY_PREFIX() ++ summary_text, nil, nil)
+            head ++ [synth] ++ keep_tail
+        }
     }
+}
+
+fun compact_prompt(prev_summary, fresh) {
+    earlier = if (string_length(prev_summary) == 0) { "" }
+              else {
+        "An EARLIER SUMMARY covers what came before the messages below. Fold " ++
+        "its facts into your new summary — do not drop them:\n" ++ prev_summary ++ "\n\n" ++
+        "Messages since that summary:\n"
+    }
+    "Summarize the conversation below to save context. Output EXACTLY " ++
+    "these four sections, each 1-3 sentences:\n\n" ++
+    "**Current State**: What has been accomplished so far.\n" ++
+    "**Working State**: Files modified, commands run, tools used.\n" ++
+    "**Key Details**: Important technical decisions, paths, names, configs.\n" ++
+    "**Pending**: What still needs to be done, open questions.\n\n" ++
+    "Be dense and precise. Preserve exact file paths, function names, " ++
+    "and error messages — they are needed for continuity. Under 500 words total.\n\n" ++
+    earlier ++ format_for_summary(fresh, "")
+}
+
+# Index in `rest` (history minus the system message) where the verbatim tail
+# starts; everything before it gets summarized. 0 = nothing to summarize.
+fun compact_split(rest) {
+    n = length(rest)
+    k0 = if (n > COMPACT_KEEP_TAIL()) { n - COMPACT_KEEP_TAIL() } else { 0 }
+    lu = last_user_index(rest, n - 1)
+    k1 = if (lu >= 0 && lu < k0) { lu } else { k0 }
+    pair_start(rest, k1)
+}
+
+# Step back over role:'tool' results so the tail opens on the assistant that
+# issued them (a tool message without its tool_call is invalid on the wire).
+fun pair_start(rest, k) {
+    if (k <= 0) { 0 }
+    else { if (map_get(nth_at(rest, k), 'role') == 'tool') { pair_start(rest, k - 1) } else { k } }
+}
+
+fun is_summary_msg(m) {
+    if (map_get(m, 'role') == 'assistant' &&
+        string_starts_with(to_string(map_get(m, 'content')), SUMMARY_PREFIX()) == 'true') { 'true' }
+    else { 'false' }
+}
+
+# The text of every earlier summary in `msgs` (older builds stacked several).
+fun summary_texts(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        if (is_summary_msg(m) == 'true') {
+            c = to_string(map_get(m, 'content'))
+            t = string_sub(c, string_length(SUMMARY_PREFIX()), string_length(c) - string_length(SUMMARY_PREFIX()))
+            summary_texts(tl(msgs), if (string_length(acc) == 0) { t } else { acc ++ "\n\n" ++ t })
+        } else { summary_texts(tl(msgs), acc) }
+    }
+}
+
+fun non_summary_msgs(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        non_summary_msgs(tl(msgs), if (is_summary_msg(m) == 'true') { acc } else { list_append(acc, m) })
+    }
+}
+
+fun drop_first_n(lst, n) {
+    if (n <= 0 || length(lst) == 0) { lst }
+    else { drop_first_n(tl(lst), n - 1) }
 }
 
 fun take_last(lst, n) {
