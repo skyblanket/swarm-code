@@ -23,6 +23,9 @@
 #   T11 untrusted project   — ./.swarm-code.json can't run hooks, redirect
 #                             the endpoint or loosen permissions unless the
 #                             user lists the dir in trusted_projects
+#   T12 network gate        — userinfo / uppercase-scheme / api-key bypasses
+#                             are refused at startup; non-local providers[]
+#                             and .profile_override endpoints at dial time
 #
 # Exit code: 0 iff every test passes.
 
@@ -476,6 +479,74 @@ EOF
     fi
 }
 
+# req_model <n> — the "model" field of request #n to the mock.
+req_model() {
+    python3 - "$REQLOG" "$1" <<'PYEOF'
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r["n"] == int(sys.argv[2]):
+        print(r["body"].get("model", ""))
+PYEOF
+}
+
+# ------------------------------------------------------------
+# T12 — network isolation. 0.0.0.0 dials this machine on Linux/macOS, so
+#       it stands in for "a non-local host that actually answers": each
+#       refused case must leave the mock with no request at all.
+# ------------------------------------------------------------
+t12() {
+    new_case t12
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "GATE_T12_A"},
+               {"type": "text", "content": "GATE_T12_B"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T12 "mock failed to start"; return; }
+    local url
+    for url in "http://127.0.0.1@0.0.0.0:$PORT" "http://localhost:1@0.0.0.0:$PORT" \
+               "HTTP://0.0.0.0:$PORT" "http://127.0.0.1.x.invalid:$PORT"; do
+        RUN_ENDPOINT="$url" run_swarm -p "t12 startup" --no-resume --json
+        if [ "$RC" -ne 1 ] || [ "$(req_count)" -ne 0 ]; then
+            cleanup; fail T12 "startup gate let $url through (rc $RC, $(req_count) requests)"; return
+        fi
+    done
+    # An API key is not an opt-in to a remote host.
+    RUN_ENV=("SWARM_CODE_API_KEY=k")
+    RUN_ENDPOINT="http://0.0.0.0:$PORT" run_swarm -p "t12 key" --no-resume --json
+    RUN_ENV=()
+    if [ "$RC" -ne 1 ] || [ "$(req_count)" -ne 0 ]; then
+        cleanup; fail T12 "an api_key bypassed the gate (rc $RC)"; return
+    fi
+    # .profile_override is read at dial time — past the startup check.
+    mkdir -p "$CASE_HOME/.swarm-code"
+    printf '{"endpoint": "http://0.0.0.0:%s", "model": "evil-override"}\n' "$PORT" \
+        >"$CASE_HOME/.swarm-code/.profile_override"
+    run_swarm -p "t12 override" --no-resume --json
+    rm -f "$CASE_HOME/.swarm-code/.profile_override"
+    if [ "$(req_count)" -ne 0 ]; then
+        cleanup; fail T12 "a non-local .profile_override endpoint was dialed"; return
+    fi
+    # providers[]: the non-local first entry is refused, the local one used.
+    RUN_ENV=("SWARM_CODE_PROVIDERS_JSON=[{\"endpoint\":\"http://0.0.0.0:$PORT\",\"model\":\"evil-provider\"},{\"endpoint\":\"http://127.0.0.1:$PORT\"}]")
+    run_swarm -p "t12 providers" --no-resume --json
+    RUN_ENV=()
+    if [ "$RC" -ne 0 ]; then cleanup; fail T12 "providers: exit code $RC"; return; fi
+    if [ "$(req_count)" -ne 1 ] || [ "$(req_model 0)" != "test" ]; then
+        cleanup; fail T12 "providers: non-local provider dialed (model $(req_model 0))"; return
+    fi
+    if ! grep -q "network isolation: refusing" "$CASE/stderr.txt"; then
+        cleanup; fail T12 "providers: no refusal notice on stderr"; return
+    fi
+    # Control: with the explicit opt-in the same host IS reachable, so the
+    # refusals above were the gate, not a dead address.
+    RUN_ENV=("SWARM_CODE_ALLOW_REMOTE=1")
+    RUN_ENDPOINT="http://0.0.0.0:$PORT" run_swarm -p "t12 allowed" --no-resume --json
+    RUN_ENV=()
+    cleanup
+    if [ "$RC" -ne 0 ] || [ "$(req_count)" -ne 2 ]; then fail T12 "ALLOW_REMOTE=1 control failed (rc $RC)"
+    else pass T12; fi
+}
+
 # ------------------------------------------------------------
 
 echo "integration: binary $BIN"
@@ -491,6 +562,7 @@ t8
 t9
 t10
 t11
+t12
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

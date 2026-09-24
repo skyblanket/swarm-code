@@ -78,7 +78,7 @@ Point it at any OpenAI-compatible endpoint via `~/.swarm-code/settings.json`. Pr
 }
 ```
 
-Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default). Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
+Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default; an API key alone is not an opt-in). The check applies to every URL the LLM layer dials — primary, fallback, `providers`, and `/profile` switches. Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
 
 A repo-local `./.swarm-code.json` is **untrusted** (it ships with whatever you cloned): it may set `model`, `max_tokens`, `vision`, `chat_template_kwargs` and `llm_timeout_ms`, and may only *tighten* `permissions`. Its hooks, MCP servers, endpoints, API keys, providers and profiles are ignored, with a one-line notice. To let a repo you trust apply its file in full, list it in `~/.swarm-code/settings.json`: `"trusted_projects": ["/abs/path/to/repo"]`.
 

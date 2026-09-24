@@ -226,7 +226,12 @@ fun main() {
         t_project_scope_strips_untrusted(),
         t_project_scope_trusted_applies(),
         t_project_ignored_keys(),
-        t_project_trusted_dir_match()
+        t_project_trusted_dir_match(),
+        # --- security: network-isolation gate ---
+        t_endpoint_gate_bypasses_refused(),
+        t_endpoint_gate_locals_allowed(),
+        t_endpoint_host_parse(),
+        t_endpoint_refusal_reason()
     ]
 
     passed = sum_list(results, 0)
@@ -2735,4 +2740,85 @@ fun t_project_trusted_dir_match() {
         eqs(Config.is_trusted_dir([""], ["/"]), 'false'),
         eqs(Config.is_trusted_dir([], ["/work/repo"]), 'false')])
     check("project settings: trusted_projects is an exact directory match", ok)
+}
+
+# ------------------------------------------------------------
+# Security: network-isolation gate (Config.is_local_endpoint)
+# ------------------------------------------------------------
+# 'true' iff Config.is_local_endpoint(url) == want for every url.
+fun sec_local_all(urls, want) {
+    if (length(urls) == 0) { 'true' }
+    else {
+        u = hd(urls)
+        if (Config.is_local_endpoint(u) == want) { sec_local_all(tl(urls), want) }
+        else {
+            print("      mismatch: " ++ u ++ " (want " ++ to_string(want) ++ ")")
+            'false'
+        }
+    }
+}
+
+# Every URL here reached, or passed the gate for, a non-local host before.
+fun t_endpoint_gate_bypasses_refused() {
+    ok = sec_local_all([
+        "http://127.0.0.1@0.0.0.0:9",           # userinfo: curl dials 0.0.0.0
+        "http://localhost:1@0.0.0.0:9",         # userinfo with a "port"
+        "http://[::1]@evil.example/",
+        "http://127.0.0.1%2f@evil.example/",
+        "HTTP://0.0.0.0:9",                     # uppercase scheme
+        "http://127.0.0.1.x.invalid",           # prefix match on a name
+        "http://10.0.0.1.nip.io/",
+        "http://fd-anything.invalid",           # "fd" prefix on a name
+        "http://fc.example.com",
+        "http://[fd::1]/",                      # 00fd:: is not ULA
+        "http://3221225985:9/",                 # decimal IPv4 = 192.0.2.1
+        "http://0x7f000001/",                   # hex IPv4
+        "http://0x7f.0.0.1/",
+        "http://010.0.0.1/",                    # octal first octet = 8.0.0.1
+        "http://127.1/",                        # short-form IPv4
+        "http://256.1.1.1/",
+        "http://0.0.0.0:8000",
+        "http://172.32.0.1", "http://172.15.0.1", "http://100.128.0.1",
+        "http://11.0.0.1", "http://192.169.0.1", "https://evil.example/v1",
+        "http://{evil.example,127.0.0.1}/",     # curl URL globbing
+        "http://127.0.0.1:80:90/",
+        "http://localhost./",
+        "ftp://127.0.0.1/", "file:///etc/passwd", "127.0.0.1:8000", ""], 'false')
+    check("network gate: userinfo/case/prefix/numeric-IP/IPv6-prefix bypasses are refused", ok)
+}
+
+fun t_endpoint_gate_locals_allowed() {
+    ok = sec_local_all([
+        "http://localhost:8000", "http://LOCALHOST:8000/v1",
+        "http://127.0.0.1:8000", "https://127.0.0.1/v1/chat/completions",
+        "http://127.8.9.10", "http://[::1]:8000/v1", "http://[::1]",
+        "http://10.1.2.3", "http://192.168.0.10:8080/v1",
+        "http://172.16.0.1", "http://172.31.255.255:1",
+        "http://100.64.0.1", "http://100.127.1.1",
+        "http://sushi:8000", "http://sushi", "https://gpu-box.local/v1",
+        "https://node.tailnet.ts.net", "http://[fd12:3456::1]:8000",
+        "http://[fe80::1]", "http://127.0.0.1:8000/v1?q=a@b"], 'true')
+    check("network gate: loopback, RFC1918, CGNAT, ULA, .local, .ts.net, bare names pass", ok)
+}
+
+fun t_endpoint_host_parse() {
+    ok = sec_all([
+        eqs(Config.endpoint_host("HTTP://Sushi:8000/v1"), "sushi"),
+        eqs(Config.endpoint_host("http://[::1]:8000/x"), "::1"),
+        eqs(Config.endpoint_host("https://api.example.com"), "api.example.com"),
+        eqs(Config.endpoint_host("http://127.0.0.1@0.0.0.0:9"), nil),
+        eqs(Config.endpoint_host("http://h:port"), nil),
+        eqs(Config.endpoint_host("sushi:8000"), nil)])
+    check("network gate: endpoint_host lowercases, strips port/brackets, refuses userinfo", ok)
+}
+
+# The refusal names the opt-in; an API key is no longer an implicit one.
+fun t_endpoint_refusal_reason() {
+    r_remote = Config.endpoint_refusal("https://api.example.com/v1")
+    r_local = Config.endpoint_refusal("http://127.0.0.1:8000")
+    remote_ok = if (getenv("SWARM_CODE_ALLOW_REMOTE") == "1") { eqs(r_remote, nil) }
+                else { if (r_remote == nil) { 'false' }
+                       else { string_contains(r_remote, "SWARM_CODE_ALLOW_REMOTE=1") }}
+    check("network gate: endpoint_refusal names SWARM_CODE_ALLOW_REMOTE=1, passes locals",
+          bool_and(remote_ok, eqs(r_local, nil)))
 }

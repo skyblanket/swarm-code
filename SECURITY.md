@@ -23,7 +23,11 @@ backported.
 ## Security model
 
 - **Network isolation by default.** Only local-network endpoints are allowed
-  unless you explicitly set `SWARM_CODE_ALLOW_REMOTE=1`.
+  unless you explicitly set `SWARM_CODE_ALLOW_REMOTE=1` (an API key is not an
+  opt-in). The check runs on every URL the LLM layer dials — primary,
+  fallback, `providers`, and the `/profile` override — and parses it the way
+  curl does: http(s) only, no `user@` credentials, IP literals only as strict
+  dotted quads or bracketed IPv6.
 - **Untrusted project config.** A repository's `./.swarm-code.json` can only
   set harmless keys (`model`, `max_tokens`, …) and *tighten* permissions. Its
   hooks, MCP servers, endpoint / API key / providers / profiles, and any

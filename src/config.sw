@@ -38,7 +38,8 @@ import Util
 # }
 
 export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
-        llm_timeout_ms, project_scope, project_ignored_keys, is_trusted_dir, project_notice]
+        llm_timeout_ms, project_scope, project_ignored_keys, is_trusted_dir, project_notice,
+        endpoint_host, is_local_endpoint, endpoint_refusal]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
@@ -252,6 +253,196 @@ fun project_notice() {
             }
         }
     }
+}
+
+# ------------------------------------------------------------
+# Network isolation — may this LLM endpoint URL be dialed?
+# ------------------------------------------------------------
+# The ONE local-network check, used by main.sw's startup gate (primary
+# endpoint) and by llm.sw at the point of dial, so fallback, providers[]
+# and ~/.swarm-code/.profile_override endpoints get the same treatment.
+# The URL is read the way curl will read it and anything ambiguous is
+# refused:
+#   * scheme http:// or https:// only (any case)
+#   * no userinfo: curl dials "http://127.0.0.1@evil" at evil, so an '@'
+#     anywhere in the authority is refused outright
+#   * host lowercased, port (digits only) stripped, host chars limited
+#     to [a-z0-9._-] — no %-escapes, braces or other curl-isms
+#   * IPv6 only in brackets, and only ::1, fc00::/7 and fe80::/10
+#   * a host whose LAST label is numeric (or 0x…) is an IPv4 literal and
+#     must be a strict dotted quad: curl dials 3221225985, 0x7f.1 and
+#     010.0.0.1 (octal) as other addresses than they appear to be
+#   * names: localhost, *.local (mDNS), *.ts.net, or a bare dot-less
+#     name (MagicDNS / /etc/hosts) — "127.0.0.1.evil.com" is a name
+# IPv4: loopback 127/8, RFC1918 10/8 172.16/12 192.168/16, CGNAT 100.64/10.
+# ------------------------------------------------------------
+
+# nil when `url` may be dialed, else a one-line refusal reason. The only
+# opt-out is SWARM_CODE_ALLOW_REMOTE=1 — an API key alone is not one.
+fun endpoint_refusal(url) {
+    if (getenv("SWARM_CODE_ALLOW_REMOTE") == "1") { nil }
+    else { if (is_local_endpoint(url) == 'true') { nil }
+    else {
+        host = endpoint_host(url)
+        why = if (host == nil) { "not a plain http(s)://host[:port] URL" }
+              else { "host " ++ host ++ " is not on the local network" }
+        "network isolation: refusing to contact " ++ to_string(url) ++ " (" ++ why ++
+        ") — set SWARM_CODE_ALLOW_REMOTE=1 to allow remote endpoints"
+    }}
+}
+
+fun is_local_endpoint(url) {
+    host = endpoint_host(url)
+    if (host == nil) { 'false' } else { is_local_host(host) }
+}
+
+# Lowercased host of an http(s) URL (an IPv6 literal without brackets),
+# or nil when the URL is not a plain http(s)://host[:port][/...] form.
+fun endpoint_host(url) {
+    s = string_lower(string_trim(to_string(url)))
+    rest = if (string_starts_with(s, "http://") == 'true') { string_sub(s, 7, string_length(s) - 7) }
+           else { if (string_starts_with(s, "https://") == 'true') { string_sub(s, 8, string_length(s) - 8) }
+           else { nil }}
+    if (rest == nil) { nil }
+    else {
+        auth = authority_of(rest, 0, string_length(rest))
+        if (string_length(auth) == 0 || string_contains(auth, "@") == 'true') { nil }
+        else { host_of_authority(auth) }
+    }
+}
+
+# Everything before the first '/', '?' or '#'.
+fun authority_of(s, i, n) {
+    if (i >= n) { s }
+    else {
+        ch = string_sub(s, i, 1)
+        if (ch == "/" || ch == "?" || ch == "#") { string_sub(s, 0, i) }
+        else { authority_of(s, i + 1, n) }
+    }
+}
+
+fun host_of_authority(a) {
+    if (string_starts_with(a, "[") == 'true') {
+        close = string_index_of(a, "]")
+        if (close < 0) { nil }
+        else {
+            inner = string_sub(a, 1, close - 1)
+            port_part = string_sub(a, close + 1, string_length(a) - close - 1)
+            if (valid_port_suffix(port_part) == 'true' && string_contains(inner, ":") == 'true' &&
+                all_chars_in(inner, "0123456789abcdef:.") == 'true') { inner }
+            else { nil }
+        }
+    } else {
+        colon = string_index_of(a, ":")
+        host = if (colon < 0) { a } else { string_sub(a, 0, colon) }
+        port_part = if (colon < 0) { "" } else { string_sub(a, colon, string_length(a) - colon) }
+        if (valid_port_suffix(port_part) == 'true' && valid_hostname(host) == 'true') { host }
+        else { nil }
+    }
+}
+
+# "" or ':' followed by 1-5 digits.
+fun valid_port_suffix(s) {
+    n = string_length(s)
+    if (n == 0) { 'true' }
+    else { if (string_starts_with(s, ":") == 'true' && n >= 2 && n <= 6) {
+        all_chars_in(string_sub(s, 1, n - 1), "0123456789")
+    } else { 'false' }}
+}
+
+# Non-empty, dot-separated labels of [a-z0-9_-].
+fun valid_hostname(h) {
+    if (string_length(h) == 0) { 'false' }
+    else { if (all_chars_in(h, "abcdefghijklmnopqrstuvwxyz0123456789.-_") == 'false') { 'false' }
+    else { if (string_starts_with(h, ".") == 'true' || string_ends_with(h, ".") == 'true' ||
+               string_contains(h, "..") == 'true') { 'false' }
+    else { 'true' }}}
+}
+
+fun all_chars_in(s, allowed) { aci_loop(s, allowed, 0, string_length(s)) }
+
+fun aci_loop(s, allowed, i, n) {
+    if (i >= n) { 'true' }
+    else { if (string_contains(allowed, string_sub(s, i, 1)) == 'true') { aci_loop(s, allowed, i + 1, n) }
+    else { 'false' }}
+}
+
+# `h` is a validated, lowercased host from endpoint_host.
+fun is_local_host(h) {
+    if (string_contains(h, ":") == 'true') { is_local_ipv6(h) }
+    else { if (ipv4_like(h) == 'true') { is_private_ipv4(h) }
+    else { is_local_name(h) }}
+}
+
+# The last label decides: numeric (or 0x-hex) means curl parses the whole
+# host as an IPv4 address, however few dots it has.
+fun ipv4_like(h) {
+    last = last_label(h, string_length(h) - 1)
+    if (string_starts_with(last, "0x") == 'true') { 'true' }
+    else { all_chars_in(last, "0123456789") }
+}
+
+fun last_label(h, i) {
+    if (i < 0) { h }
+    else { if (string_sub(h, i, 1) == ".") { string_sub(h, i + 1, string_length(h) - i - 1) }
+    else { last_label(h, i - 1) }}
+}
+
+fun is_private_ipv4(h) {
+    parts = string_split(h, ".")
+    if (length(parts) != 4) { 'false' }
+    else { if (strict_octets(parts) == 'false') { 'false' }
+    else {
+        a = to_int(hd(parts))
+        b = to_int(hd(tl(parts)))
+        if (a == 127 || a == 10) { 'true' }
+        else { if (a == 192 && b == 168) { 'true' }
+        else { if (a == 172 && b >= 16 && b <= 31) { 'true' }
+        else { if (a == 100 && b >= 64 && b <= 127) { 'true' }
+        else { 'false' }}}}
+    }}
+}
+
+# Decimal 0-255, 1-3 digits, no leading zero (curl reads 010 as octal 8).
+fun strict_octets(parts) {
+    if (length(parts) == 0) { 'true' }
+    else {
+        p = hd(parts)
+        n = string_length(p)
+        ok = if (n < 1 || n > 3) { 'false' }
+             else { if (all_chars_in(p, "0123456789") == 'false') { 'false' }
+             else { if (n > 1 && string_starts_with(p, "0") == 'true') { 'false' }
+             else { if (to_int(p) > 255) { 'false' } else { 'true' }}}}
+        if (ok == 'true') { strict_octets(tl(parts)) } else { 'false' }
+    }
+}
+
+# Loopback, ULA fc00::/7, link-local fe80::/10. The first group must be
+# written out in full: "fd::1" is 00fd::1 — a public address.
+fun is_local_ipv6(h) {
+    if (h == "::1" || h == "0:0:0:0:0:0:0:1") { 'true' }
+    else {
+        colon = string_index_of(h, ":")
+        first = if (colon < 0) { h } else { string_sub(h, 0, colon) }
+        if (string_length(first) != 4) { 'false' }
+        else {
+            p2 = string_sub(first, 0, 2)
+            p3 = string_sub(first, 0, 3)
+            if (p2 == "fc" || p2 == "fd") { 'true' }
+            else { if (p3 == "fe8" || p3 == "fe9" || p3 == "fea" || p3 == "feb") { 'true' }
+            else { 'false' }}
+        }
+    }
+}
+
+fun is_local_name(h) {
+    if (h == "localhost") { 'true' }
+    else { if (string_ends_with(h, ".local") == 'true') { 'true' }
+    else { if (string_ends_with(h, ".ts.net") == 'true') { 'true' }
+    # Bare (dot-less) name: mDNS / Tailscale MagicDNS / /etc/hosts. It can't
+    # be told apart from a public bare host without DNS; on dev machines the
+    # local case is overwhelmingly the common one.
+    else { string_contains(h, ".") == 'false' }}}
 }
 
 # ------------------------------------------------------------
