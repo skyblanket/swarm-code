@@ -80,6 +80,8 @@ Point it at any OpenAI-compatible endpoint via `~/.swarm-code/settings.json`. Pr
 
 Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default). Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
 
+A repo-local `./.swarm-code.json` is **untrusted** (it ships with whatever you cloned): it may set `model`, `max_tokens`, `vision`, `chat_template_kwargs` and `llm_timeout_ms`, and may only *tighten* `permissions`. Its hooks, MCP servers, endpoints, API keys, providers and profiles are ignored, with a one-line notice. To let a repo you trust apply its file in full, list it in `~/.swarm-code/settings.json`: `"trusted_projects": ["/abs/path/to/repo"]`.
+
 ## Features
 
 | Capability | Support |
@@ -119,6 +121,7 @@ Panel agents run under the fail-closed `council_panel` context: they may inspect
 swarm-code runs shell commands, reads and writes files, and can reach the network — so it is built fail-closed:
 
 - **Local-network-only by default**; remote endpoints require an explicit `SWARM_CODE_ALLOW_REMOTE=1`.
+- A cloned repo's `./.swarm-code.json` cannot run hooks, start MCP servers, redirect the endpoint/key, or loosen permissions unless you add the directory to `trusted_projects`.
 - Every tool runs through one **`ToolExecutor` policy boundary** — context allow-lists, argument-rewriting hooks, guardrails, and permissions — *before* any raw handler executes, and **fails closed** on a missing or unknown execution context.
 - A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd`, fork bombs, …) cannot be bypassed by environment overrides.
 - Subagents, MCP, and council contexts run under restricted (often read-only) policies.

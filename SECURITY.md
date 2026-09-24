@@ -24,6 +24,11 @@ backported.
 
 - **Network isolation by default.** Only local-network endpoints are allowed
   unless you explicitly set `SWARM_CODE_ALLOW_REMOTE=1`.
+- **Untrusted project config.** A repository's `./.swarm-code.json` can only
+  set harmless keys (`model`, `max_tokens`, …) and *tighten* permissions. Its
+  hooks, MCP servers, endpoint / API key / providers / profiles, and any
+  permission loosening are ignored (with a notice) unless the directory is
+  listed under `trusted_projects` in `~/.swarm-code/settings.json`.
 - **Single policy boundary.** Every tool call — from the main agent, subagents,
   the council, and the MCP server — passes through `ToolExecutor`: context
   allow-lists, argument-rewriting hooks, guardrails, and permissions are applied

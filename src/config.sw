@@ -10,6 +10,11 @@ import Util
 #   1. $HOME/.swarm-code/settings.json          (user-global)
 #   2. ./.swarm-code.json                       (project-local, overrides)
 #
+# The project file arrives with whatever repo you cloned, so it is NOT
+# trusted by default: only harmless keys apply and permissions may only
+# tighten (see project_scope). Listing the directory under
+# "trusted_projects" in the user settings lets it apply in full.
+#
 # Project context is loaded from the first that exists:
 #   1. ./SWARM.md                               (swarm-code's preferred name)
 #   2. ./CLAUDE.md                              (fallback, most repos have one)
@@ -33,18 +38,20 @@ import Util
 # }
 
 export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
-        llm_timeout_ms]
+        llm_timeout_ms, project_scope, project_ignored_keys, is_trusted_dir, project_notice]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
 # ------------------------------------------------------------
 fun load() {
-    user_path = getenv("HOME") ++ "/.swarm-code/settings.json"
-    project_path = "./.swarm-code.json"
-    user_settings = load_one(user_path)
-    project_settings = load_one(project_path)
-    map_merge(user_settings, project_settings)
+    user_settings = load_one(user_settings_path())
+    project_settings = load_one(project_settings_path())
+    trusted = project_trusted(user_settings, project_settings)
+    map_merge(user_settings, project_scope(user_settings, project_settings, trusted))
 }
+
+fun user_settings_path()    { getenv("HOME") ++ "/.swarm-code/settings.json" }
+fun project_settings_path() { "./.swarm-code.json" }
 
 fun load_one(path) {
     if (file_exists(path) == 'false') {
@@ -54,8 +61,195 @@ fun load_one(path) {
         if (file_content == nil) {
             map_new()
         } else {
+            # A non-object top level ("[]", "1") would crash map_merge.
             decoded = json_decode(file_content)
-            if (decoded == nil) { map_new() } else { decoded }
+            if (decoded == nil || is_map(decoded) != 'true') { map_new() } else { decoded }
+        }
+    }
+}
+
+# ------------------------------------------------------------
+# Project scope — what a repo's ./.swarm-code.json may contribute.
+# ------------------------------------------------------------
+# Opening swarm-code inside a cloned repo must not hand that repo's
+# author control of the session. Unless the directory is trusted, the
+# project file may NOT:
+#   * run commands            — hooks (SessionStart fires at launch)
+#   * start processes         — mcpServers
+#   * redirect the prompt     — endpoint, api_key, providers, profiles,
+#                               fallback_profile
+#   * loosen permissions      — a "permissions" entry only applies when
+#                               it is STRICTER (allow < ask < deny) than
+#                               what the user would otherwise get
+# It is an ALLOW-list (project_safe_keys), so a key added later is
+# ignored from project scope until someone decides it is harmless.
+#
+# Opt-in — user settings only, a project can never trust itself:
+#   "trusted_projects": ["/abs/path/to/repo", ...]
+# in ~/.swarm-code/settings.json; that directory's file applies in full.
+# ------------------------------------------------------------
+fun project_safe_keys() {
+    ["model", "max_tokens", "llm_timeout_ms", "chat_template_kwargs", "vision"]
+}
+
+# The part of `project` that may be merged over `user`. trusted='true'
+# returns the project unchanged (the old full-override behaviour).
+fun project_scope(user, project, trusted) {
+    if (trusted == 'true') { project }
+    else {
+        safe = copy_keys(project, project_safe_keys(), map_new())
+        pp = map_get(project, 'permissions')
+        if (pp == nil || is_map(pp) != 'true') { safe }
+        else { map_put(safe, 'permissions', tighten_permissions(user_perms(user), pp)) }
+    }
+}
+
+fun copy_keys(src, keys, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        k = hd(keys)
+        v = map_get(src, k)
+        next = if (v == nil) { acc } else { map_put(acc, k, v) }
+        copy_keys(src, tl(keys), next)
+    }
+}
+
+fun user_perms(user) {
+    up = map_get(user, 'permissions')
+    if (up == nil || is_map(up) != 'true') { map_new() } else { up }
+}
+
+# User permissions plus every project entry that is stricter than the
+# user's effective decision for that tool (configured, else the default).
+fun tighten_permissions(uperms, pperms) {
+    tighten_loop(map_keys(pperms), map_values(pperms), uperms, uperms)
+}
+
+fun tighten_loop(keys, vals, uperms, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        k = hd(keys)
+        next = if (perm_stricter(hd(vals), effective_user_perm(uperms, k)) == 'true') {
+            map_put(acc, k, hd(vals))
+        } else { acc }
+        tighten_loop(tl(keys), tl(vals), uperms, next)
+    }
+}
+
+fun effective_user_perm(uperms, tool) {
+    cur = map_get(uperms, tool)
+    if (cur == nil) { default_permission(tool) } else { string_to_perm(cur) }
+}
+
+# 'true' when the configured value v is stricter than the decision `cur`.
+fun perm_stricter(v, cur) {
+    if (perm_rank(string_to_perm(v)) > perm_rank(cur)) { 'true' } else { 'false' }
+}
+
+fun perm_rank(p) {
+    if (p == 'deny') { 2 } else { if (p == 'ask') { 1 } else { 0 }}
+}
+
+# Names of the project keys project_scope drops for an untrusted dir —
+# "permissions.<tool>" for a loosening entry. [] when nothing is lost.
+fun project_ignored_keys(user, project) {
+    ignored_loop(map_keys(project), project, user, [])
+}
+
+fun ignored_loop(keys, project, user, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        k = hd(keys)
+        ks = to_string(k)
+        next = if (list_has(project_safe_keys(), ks) == 'true') { acc }
+               else { if (ks == "permissions") {
+                   pp = map_get(project, k)
+                   if (pp == nil || is_map(pp) != 'true') { list_append(acc, ks) }
+                   else { acc ++ loosening_keys(map_keys(pp), map_values(pp), user_perms(user), []) }
+               }
+               else { list_append(acc, ks) }}
+        ignored_loop(tl(keys), project, user, next)
+    }
+}
+
+fun loosening_keys(keys, vals, uperms, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        k = hd(keys)
+        cur = effective_user_perm(uperms, k)
+        next = if (perm_rank(string_to_perm(hd(vals))) < perm_rank(cur)) {
+            list_append(acc, "permissions." ++ to_string(k))
+        } else { acc }
+        loosening_keys(tl(keys), tl(vals), uperms, next)
+    }
+}
+
+fun join_names(names, acc) {
+    if (length(names) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { ", " }
+        join_names(tl(names), acc ++ sep ++ to_string(hd(names)))
+    }
+}
+
+fun list_has(lst, x) {
+    if (length(lst) == 0) { 'false' }
+    else { if (hd(lst) == x) { 'true' } else { list_has(tl(lst), x) }}
+}
+
+# Is the current directory listed in the user's "trusted_projects"?
+# Costs one shell() (for the real cwd), paid only when there IS a
+# project file and the user HAS a trust list.
+fun project_trusted(user, project) {
+    tp = map_get(user, 'trusted_projects')
+    if (map_size(project) == 0 || tp == nil || is_list(tp) != 'true') { 'false' }
+    else {
+        # Both spellings of the cwd: logical (symlinks kept, as the user
+        # typed it) and physical (pwd -P), so either form of entry matches.
+        cwds = string_split(string_trim(to_string(elem(shell("pwd; pwd -P"), 1))), "\n")
+        is_trusted_dir(tp, cwds)
+    }
+}
+
+# Pure core of project_trusted: does any entry of `trusted` equal any
+# of `cwds` (trailing slashes ignored)? Entries are absolute paths.
+fun is_trusted_dir(trusted, cwds) {
+    if (length(trusted) == 0) { 'false' }
+    else {
+        t = strip_trailing_slash(string_trim(to_string(hd(trusted))))
+        if (string_length(t) > 0 && dir_in(cwds, t) == 'true') { 'true' }
+        else { is_trusted_dir(tl(trusted), cwds) }
+    }
+}
+
+fun dir_in(cwds, t) {
+    if (length(cwds) == 0) { 'false' }
+    else { if (strip_trailing_slash(string_trim(to_string(hd(cwds)))) == t) { 'true' }
+    else { dir_in(tl(cwds), t) }}
+}
+
+fun strip_trailing_slash(s) {
+    if (string_length(s) > 1 && string_ends_with(s, "/") == 'true') {
+        strip_trailing_slash(string_sub(s, 0, string_length(s) - 1))
+    } else { s }
+}
+
+# One-line notice naming what an untrusted ./.swarm-code.json tried to
+# set, or nil when nothing was dropped. main prints it once at startup.
+fun project_notice() {
+    project = load_one(project_settings_path())
+    if (map_size(project) == 0) { nil }
+    else {
+        user = load_one(user_settings_path())
+        if (project_trusted(user, project) == 'true') { nil }
+        else {
+            ignored = project_ignored_keys(user, project)
+            if (length(ignored) == 0) { nil }
+            else {
+                "./.swarm-code.json: ignored untrusted project settings (" ++
+                join_names(ignored, "") ++ ") — to trust this repo, add its path to " ++
+                "\"trusted_projects\" in ~/.swarm-code/settings.json"
+            }
         }
     }
 }

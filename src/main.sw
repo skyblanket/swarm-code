@@ -54,6 +54,9 @@ fun main() {
     # server exposing bash/read/write/edit/glob/grep/web_fetch tools.
     # No LLM, no agent loop — pure tool execution for orchestrators.
     if (has_flag(os_args(), "--mcp-server") == 'true') {
+        # stdout is JSON-RPC framing — the notice goes to stderr.
+        mcp_pn = Config.project_notice()
+        if (mcp_pn != nil) { eprint("swarm-code: " ++ mcp_pn) }
         mcp_server_opts = %{
             cwd: resolve_cwd(),
             settings: Config.load(),
@@ -133,6 +136,11 @@ fun main() {
     # isn't discarded with the alt buffer (silent-exit bug).
     in_alt = if (tui_env == "1" && headless == 'false') { 'true' } else { 'false' }
     verify_network_isolation(endpoint_url, map_get(base_opts, 'api_key'), in_alt)
+
+    # An untrusted ./.swarm-code.json had keys dropped (Config.project_scope)
+    # — say so once, so a repo's config never half-applies silently.
+    project_note = Config.project_notice()
+    if (project_note != nil) { print(" " ++ UI.warn_text("⚠ " ++ project_note)) }
 
     # Load settings (user-global + project-local merged) and project context.
     settings = Config.load()
