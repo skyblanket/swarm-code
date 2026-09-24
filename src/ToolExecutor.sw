@@ -151,10 +151,12 @@ fun permission_gate(name, args, opts) {
     decision = Config.check_permission(name, args, opts)
     if (decision == 'allow') { 'ok' }
     else { if (decision == 'deny') {
-        "error: permission denied for tool '" ++ to_string(name) ++ "'"
+        Config.denial_message(name, args, opts)
     } else {
+        risk = Config.command_risk(name, args)
+        why = if (elem(risk, 0) == 'dangerous') { " — flagged dangerous: " ++ elem(risk, 1) } else { "" }
         "error: tool '" ++ to_string(name) ++
-        "' requires interactive permission in this execution context"
+        "' requires interactive permission in this execution context" ++ why
     }}
 }
 

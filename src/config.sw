@@ -1,6 +1,7 @@
 module Config
 
 import Util
+import CommandGuard
 
 # ============================================================
 # Config — settings.json, SWARM.md, permissions, hooks
@@ -33,7 +34,7 @@ import Util
 # }
 
 export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
-        llm_timeout_ms]
+        llm_timeout_ms, command_of, command_risk, denial_message, denial_reason, uses_sudo]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
@@ -127,7 +128,7 @@ fun load_project_context() {
 # Permissions — decide whether a tool call should run.
 # Returns an atom: 'allow', 'deny', or 'ask'.
 #
-# Policy (updated):
+# Policy:
 #   1. Default-allow for every BUILT-IN tool. The user explicitly asked
 #      for "all allowed by default" — prompting on every bash/write/edit
 #      was breaking flow during tool test runs. The one exception is MCP
@@ -136,47 +137,53 @@ fun load_project_context() {
 #   2. settings.permissions[tool_name] in settings.json can downgrade
 #      a specific tool to 'ask' or 'deny' if the user wants tighter
 #      control on one tool (e.g. "bash": "ask").
-#   3. The dangerous-bash hard gate still fires regardless. Commands
-#      that look like `rm -rf`, `sudo`, `curl | sh`, `mkfs`, force
-#      push, or hard resets still prompt even in default-allow mode.
-#      We are not giving a model root access to the box.
+#   3. Every tool that runs a model-supplied shell command (command_of:
+#      bash, background, bg_server, run_tests.command) goes through the
+#      CommandGuard classifier, which parses the command like sh does:
+#        * hardline  (rm -r on /, mkfs, dd to a raw disk, halt/reboot,
+#          chmod -R on /, fork bomb) → 'deny', unconditionally — before
+#          any settings/env lookup, so SWARM_CODE_ALLOW_DANGEROUS=1
+#          cannot turn it off.
+#        * dangerous (sudo, rm -rf on ~ or a system path, dd to a
+#          device) → escalates 'allow' to 'ask' (a configured 'deny'
+#          stays 'deny'); 'deny' outright when SWARM_CODE_DENY_DANGEROUS=1
+#          (unattended /flows children); skipped entirely when
+#          SWARM_CODE_ALLOW_DANGEROUS=1.
+#      denial_message() names the matched pattern so the model can adapt.
 # ------------------------------------------------------------
 fun check_permission(tool_name, args, opts) {
-    # HARDLINE: unbypassable deny for catastrophic patterns (mkfs, dd
-    # to disk, shutdown/reboot, fork bomb, rm -rf /*). Fires BEFORE
-    # any settings/env lookup so SWARM_CODE_ALLOW_DANGEROUS=1 cannot
-    # turn it off. See is_hardline_bash for the pattern list.
-    if (tool_name == 'bash' && is_hardline_bash(args) == 'true') {
+    risk = command_risk(tool_name, args)
+    level = elem(risk, 0)
+    if (level == 'hardline') {
         'deny'
     }
     else {
-        settings = map_get(opts, 'settings')
-        perms = if (settings == nil) { nil } else { map_get(settings, 'permissions') }
+        decision = configured_decision(tool_name, opts)
 
-        # settings.json is decoded with atom keys, so pass tool_name directly.
-        configured = if (perms == nil) {
-            nil
-        } else {
-            map_get(perms, tool_name)
-        }
-
-        decision = if (configured != nil) {
-            string_to_perm(configured)
-        } else {
-            default_permission(tool_name)
-        }
-
-        # Hard-gate dangerous bash commands regardless of config.
         # Headless converts 'ask' to 'allow' (agent.resolve_permission),
         # so unattended children (/flows fan-out sets
         # SWARM_CODE_DENY_DANGEROUS=1) turn this gate into a hard deny
         # instead of silently auto-approving.
-        if (tool_name == 'bash' && is_dangerous_bash(args) == 'true') {
-            if (getenv("SWARM_CODE_DENY_DANGEROUS") == "1") { 'deny' } else { 'ask' }
+        if (level == 'dangerous' && dangerous_bypassed() == 'false') {
+            if (decision == 'deny') { 'deny' }
+            else { if (getenv("SWARM_CODE_DENY_DANGEROUS") == "1") { 'deny' } else { 'ask' } }
         } else {
             decision
         }
     }
+}
+
+# settings.permissions[tool] if set, else the built-in default.
+fun configured_decision(tool_name, opts) {
+    settings = if (opts == nil) { nil } else { map_get(opts, 'settings') }
+    perms = if (settings == nil) { nil } else { map_get(settings, 'permissions') }
+    # settings.json is decoded with atom keys, so pass tool_name directly.
+    configured = if (perms == nil) { nil } else { map_get(perms, tool_name) }
+    if (configured != nil) { string_to_perm(configured) } else { default_permission(tool_name) }
+}
+
+fun dangerous_bypassed() {
+    if (getenv("SWARM_CODE_ALLOW_DANGEROUS") == "1") { 'true' } else { 'false' }
 }
 
 fun string_to_perm(s) {
@@ -197,142 +204,67 @@ fun default_permission(tool_name) {
     else { 'allow' }
 }
 
-# Return 'true' ONLY for truly catastrophic, unambiguous patterns.
-# Scoped down from a broad "destructive commands" net because the old
-# version was flagging perfectly normal dev workflows like
-# `rm -rf ./build-dir`, `git push --force` on feature branches, and
-# `git reset --hard HEAD~1`. The model is a coding assistant; those
-# are its daily bread.
-#
-# What still trips the gate (after much narrowing):
-#   * rm -rf targeting `/` or `~` or `$HOME` literally
-#   * mkfs (formatting a block device)
-#   * dd if=... writing to /dev/disk, /dev/sd, /dev/nvme, /dev/rdisk
-#   * sudo (privilege escalation is always worth a beat)
-#
-# You can fully disable even this minimal gate by exporting
-# SWARM_CODE_ALLOW_DANGEROUS=1 before launching swarm-code. Everything
-# runs, nothing prompts. YOLO mode.
+# The shell command a tool call will run, or nil for tools that don't run
+# one. Every tool listed here gets the same hardline/dangerous gate as bash —
+# before, `background` / `bg_server` / `run_tests.command` ran ungated.
+fun command_of(tool_name, args) {
+    t = to_string(tool_name)
+    if (args == nil || is_map(args) == 'false') { nil }
+    else { if (t == "bash" || t == "background" || t == "bg_server" || t == "run_tests") {
+        c = map_get(args, 'command')
+        if (c == nil) { nil } else { to_string(c) }
+    } else { nil }}
+}
+
+# {'hardline'|'dangerous'|'ok', reason} for a tool call.
+fun command_risk(tool_name, args) {
+    cmd = command_of(tool_name, args)
+    if (cmd == nil) { {'ok', ""} } else { CommandGuard.risk_of(cmd) }
+}
+
+fun uses_sudo(cmd) { CommandGuard.uses_sudo(cmd) }
+
+# "error: permission denied for tool 'X' — <why>". The why names the
+# matched pattern (and the offending simple command), so the model can
+# pick a narrower command instead of retrying the same call.
+fun denial_message(tool_name, args, opts) {
+    "error: permission denied for tool '" ++ to_string(tool_name) ++ "'" ++
+        denial_reason(tool_name, args, opts)
+}
+
+fun denial_reason(tool_name, args, opts) {
+    risk = command_risk(tool_name, args)
+    level = elem(risk, 0)
+    if (level == 'hardline') {
+        " — blocked by the hardline safety floor: " ++ elem(risk, 1) ++
+        ". This is never allowed (no setting or env var lifts it); use a narrower command."
+    } else { if (configured_decision(tool_name, opts) == 'deny') {
+        " — denied by settings.json (permissions." ++ to_string(tool_name) ++ " = \"deny\")."
+    } else { if (level == 'dangerous' && dangerous_bypassed() == 'false' &&
+                 getenv("SWARM_CODE_DENY_DANGEROUS") == "1") {
+        " — flagged dangerous: " ++ elem(risk, 1) ++
+        ". SWARM_CODE_DENY_DANGEROUS=1 is set for this unattended run, so it is denied; use a narrower command."
+    } else { if (level == 'dangerous' && dangerous_bypassed() == 'false') {
+        " — flagged dangerous: " ++ elem(risk, 1) ++ "; it was not approved."
+    } else {
+        " — not approved at the permission prompt (don't retry the same call; ask the user or try another approach)."
+    }}}}
+}
+
+# Kept for callers/tests that ask about a bash args map directly.
+# 'true' for dangerous OR hardline commands (a hardline command is certainly
+# dangerous); 'false' when SWARM_CODE_ALLOW_DANGEROUS=1 (YOLO mode).
 fun is_dangerous_bash(args) {
-    bypass = getenv("SWARM_CODE_ALLOW_DANGEROUS")
-    if (bypass == "1") { 'false' }
+    if (dangerous_bypassed() == 'true') { 'false' }
     else {
-        cmd = map_get(args, 'command')
-        if (cmd == nil) { 'false' }
-        else {
-            # rm targeting the filesystem root or user home literally.
-            # We look for "rm " ++ anything ++ " /" at word boundary
-            # rather than the broad "rm -rf" string match. A simple
-            # conservative approach: flag only the specific dangerous
-            # literal suffixes.
-            if (string_contains(cmd, "rm -rf /") == 'true' &&
-                string_contains(cmd, "rm -rf /tmp") == 'false' &&
-                string_contains(cmd, "rm -rf /var/") == 'false' &&
-                string_contains(cmd, "rm -rf /Users/") == 'false' &&
-                string_contains(cmd, "rm -rf /home/") == 'false' &&
-                string_contains(cmd, "rm -rf /opt/") == 'false') { 'true' }
-            else { if (string_contains(cmd, "rm -rf ~") == 'true') { 'true' }
-            else { if (string_contains(cmd, "rm -rf $HOME") == 'true') { 'true' }
-            else { if (string_contains(cmd, "sudo ") == 'true') { 'true' }
-            else { if (string_contains(cmd, "mkfs") == 'true') { 'true' }
-            else { if (string_contains(cmd, "dd if=") == 'true' &&
-                        string_contains(cmd, "of=/dev/") == 'true') { 'true' }
-            else { 'false' }}}}}}
-        }
+        level = elem(command_risk('bash', args), 0)
+        if (level == 'ok') { 'false' } else { 'true' }
     }
 }
 
-# ------------------------------------------------------------
-# HARDLINE blocklist — UNBYPASSABLE bash patterns.
-# ------------------------------------------------------------
-# Unlike is_dangerous_bash, this CANNOT be turned off with
-# SWARM_CODE_ALLOW_DANGEROUS=1. If your agent is asking to mkfs a
-# disk or reboot the box, no env var should let it through.
-#
-# Categories:
-#   * Filesystem destruction: mkfs, mkswap
-#   * Disk wipe: dd if=... of=/dev/{sd,nvme,disk,rdisk}
-#   * System halt: shutdown, reboot, halt, poweroff, init 0, init 6
-#   * Filesystem lockout: chmod 000 /, chown -R 0:0 /
-#   * Fork bomb literal: :(){:|:&};:
-#   * Whole-disk rm: rm -rf /*
-# ------------------------------------------------------------
+# 'true' for the unbypassable tier (see CommandGuard for the categories).
 fun is_hardline_bash(args) {
-    cmd = map_get(args, 'command')
-    if (cmd == nil) { 'false' }
-    else {
-        s = to_string(cmd)
-        # Filesystem destruction
-        if (string_contains(s, "mkfs") == 'true') { 'true' }
-        else { if (string_contains(s, "mkswap") == 'true') { 'true' }
-        # dd writing to a raw disk node
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/sd") == 'true') { 'true' }
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/nvme") == 'true') { 'true' }
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/disk") == 'true') { 'true' }
-        else { if (string_contains(s, "dd if=") == 'true' &&
-                   string_contains(s, "of=/dev/rdisk") == 'true') { 'true' }
-        # System halt — matched as whole command words (not bare substrings),
-        # so `cat asphalt_survey.csv` / `vim shutdown_handler.py` are NOT
-        # blocked while `shutdown -h now`, `/sbin/reboot`, `poweroff` still are.
-        else { if (contains_command_word(s, "shutdown") == 'true') { 'true' }
-        else { if (contains_command_word(s, "reboot") == 'true') { 'true' }
-        else { if (contains_command_word(s, "halt") == 'true') { 'true' }
-        else { if (contains_command_word(s, "poweroff") == 'true') { 'true' }
-        else { if (contains_command_word(s, "init 0") == 'true') { 'true' }
-        else { if (contains_command_word(s, "init 6") == 'true') { 'true' }
-        # telinit N is the SysV alias (telinit 0 halts, telinit 6 reboots) —
-        # word-boundary "init 0" misses it ("init" preceded by 'l'), so match
-        # the verb directly. Keep this as long as "init 0"/"init 6" are blocked.
-        else { if (contains_command_word(s, "telinit") == 'true') { 'true' }
-        # Filesystem lockout
-        else { if (string_contains(s, "chmod 000 /") == 'true') { 'true' }
-        else { if (string_contains(s, "chown -R 0:0 /") == 'true') { 'true' }
-        # Fork bomb
-        else { if (string_contains(s, ":(){:|:&};:") == 'true') { 'true' }
-        # Whole-disk wipe
-        else { if (string_contains(s, "rm -rf /*") == 'true') { 'true' }
-        else { 'false' }}}}}}}}}}}}}}}}}
-    }
-}
-
-# Whole-word match for a catastrophic verb: the word must be bounded by a
-# non-identifier char (or string edge) on both sides, so it isn't matched as
-# a substring of a larger filename/identifier (asphalt, rebooter,
-# shutdown_handler). Over-blocks rare cases like `cat shutdown.sh` — the safe
-# direction for an unbypassable floor (never under-blocks a real `shutdown`).
-fun contains_command_word(s, word) {
-    cw_scan(s, word, string_length(word), string_length(s), 0)
-}
-
-fun cw_scan(s, word, wlen, slen, i) {
-    if (i + wlen > slen) { 'false' }
-    else {
-        if (string_sub(s, i, wlen) == word) {
-            prev_ch = cw_char_at(s, i - 1, slen)
-            next_ch = cw_char_at(s, i + wlen, slen)
-            if (cw_boundary(prev_ch) == 'true' && cw_boundary(next_ch) == 'true') { 'true' }
-            else { cw_scan(s, word, wlen, slen, i + 1) }
-        } else { cw_scan(s, word, wlen, slen, i + 1) }
-    }
-}
-
-fun cw_char_at(s, idx, slen) {
-    if (idx < 0 || idx >= slen) { "" }
-    else { string_sub(s, idx, 1) }
-}
-
-fun cw_boundary(ch) {
-    if (ch == "") { 'true' }
-    else { if (cw_is_ident(ch) == 'true') { 'false' } else { 'true' }}
-}
-
-fun cw_is_ident(ch) {
-    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")
-        || (ch >= "0" && ch <= "9") || ch == "_") { 'true' }
-    else { 'false' }
+    if (elem(command_risk('bash', args), 0) == 'hardline') { 'true' } else { 'false' }
 }
 
 # ------------------------------------------------------------

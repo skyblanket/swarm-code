@@ -2655,7 +2655,7 @@ fun execute_all(tool_calls, history, opts) {
                 effective_args = map_get(prepared, 'args')
                 decision = resolve_permission(name_atom, effective_args, opts)
                 if (decision == 'deny') {
-                    denial = "error: permission denied for tool '" ++ name_str ++ "'"
+                    denial = Config.denial_message(name_str, effective_args, opts)
                     turn_print(opts, UI.err_text(denial))
                     denial
                 } else {

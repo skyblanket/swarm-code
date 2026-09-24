@@ -231,7 +231,12 @@ fun main() {
         t_grep_glob_default_path(),
         t_file_watch_no_injection(),
         t_file_watch_portable_mtime(),
-        t_wait_timeout_clamped()
+        t_wait_timeout_clamped(),
+        t_classifier_catches_bypasses(),
+        t_classifier_no_false_positives(),
+        t_command_tools_gated(),
+        t_denial_names_reason(),
+        t_sudo_tab_blocked()
     ]
 
     passed = sum_list(results, 0)
@@ -2756,4 +2761,108 @@ fun t_wait_timeout_clamped() {
           bool_and3(if (Tools.clamp_wait_timeout_s(0) == 1 && Tools.clamp_wait_timeout_s(99999) == 600) { 'true' } else { 'false' },
                     if (Tools.clamp_wait_timeout_s(nil) == 60 && Tools.clamp_wait_timeout_s("soon") == 60) { 'true' } else { 'false' },
                     bool_and(string_starts_with(r, "timeout:"), if (el < 5000) { 'true' } else { 'false' })))
+}
+
+# The hardline/dangerous gates matched raw substrings, so trivial respellings
+# sailed through. Every command here MUST be hard-denied (hardline).
+fun hardline_bypass_cases() {
+    ["rm -r -f /", "rm -fr /", "rm -Rf /*", "rm -rf  /*", "rm -rf --no-preserve-root /",
+     "rm -rf -- /", "rm --recursive --force /", ":(){ :|:& };:", "bomb(){ bomb|bomb& };bomb",
+     "chmod -R 000 /", "chown -R nobody /", "dd of=/dev/sda if=/dev/zero",
+     "dd bs=1M of=/dev/nvme0n1 if=img", "echo ok; shutdown -h now", "true && /sbin/reboot",
+     "sh -c 'mkfs.ext4 /dev/sdb1'", "bash -lc \"halt\"", "echo \"$(poweroff)\"", "echo `reboot`",
+     "systemctl poweroff", "cat /dev/zero > /dev/sda", "sudo rm -rf /", "r''eboot",
+     "x=1 init 0", "env FOO=1 mkswap /dev/sdc", "nohup telinit 6 &", "eval 'rm -rf /*'",
+     "find . -name x | xargs rm -rf /", "cd /tmp && { rm -rf /; }"]
+}
+
+# ...and every command here must at least ASK (dangerous tier).
+fun dangerous_bypass_cases() {
+    ["rm -rf \"$HOME\"", "rm -rf ~", "rm -rf ~/", "rm -r ${HOME}/*", "sudo\tls",
+     "sudo -u root ls", "ls; sudo reboot-ish", "rm -rf /etc/nginx", "dd if=x of=/dev/tty7"]
+}
+
+# False positives: words inside quoted args / echo / grep patterns / heredoc
+# bodies were hard-denied with no override. These must all be allowed.
+fun false_positive_cases() {
+    ["grep -r shutdown src/", "echo reboot required", "git commit -m 'halt the build'",
+     "cat > app.py <<'EOF'\ndef shutdown(self):\n    os.system('reboot')\nEOF",
+     "python3 - <<EOF\nprint('mkfs and rm -rf / are scary')\nEOF\necho done",
+     "python3 -c 'def shutdown(): pass'", "cat asphalt_survey.csv", "vim shutdown_handler.py",
+     "rm -rf ./build /tmp/x", "echo hi # shutdown now", "grep mkfs notes.txt",
+     "dd if=/dev/zero of=/dev/null count=1", "ls -la /tmp", "echo 'rm -rf /'",
+     "printf '%s\\n' \"sudo is just a word\"", "git log --grep=reboot", "man halt > /tmp/h.txt",
+     "rg -n 'poweroff|reboot' .", "echo \"init 0\""]
+}
+
+fun failing_cases(cases, pred, acc) {
+    if (length(cases) == 0) { acc }
+    else {
+        c = hd(cases)
+        next = if (pred(c) == 'true') { acc } else { list_append(acc, c) }
+        failing_cases(tl(cases), pred, next)
+    }
+}
+
+fun report_cases(label, bad) {
+    if (length(bad) > 0) { print("      " ++ label ++ ": " ++ json_encode(bad)) }
+    if (length(bad) == 0) { 'true' } else { 'false' }
+}
+
+fun t_classifier_catches_bypasses() {
+    bad_h = failing_cases(hardline_bypass_cases(),
+        fn(c) { Config.is_hardline_bash(%{command: c}) }, [])
+    bad_d = failing_cases(dangerous_bypass_cases(),
+        fn(c) { Config.is_dangerous_bash(%{command: c}) }, [])
+    check("command classifier: respelled rm/dd/chmod/halt/fork-bomb/sudo are caught",
+          bool_and(report_cases("not hardline", bad_h), report_cases("not dangerous", bad_d)))
+}
+
+fun t_classifier_no_false_positives() {
+    bad = failing_cases(false_positive_cases(),
+        fn(c) {
+            if (Config.is_hardline_bash(%{command: c}) == 'false' &&
+                Config.is_dangerous_bash(%{command: c}) == 'false' &&
+                ToolExecutor.permission_gate('bash', %{command: c}, %{settings: map_new()}) == 'ok') { 'true' }
+            else { 'false' }
+        }, [])
+    check("command classifier: words in quotes/echo/grep/heredocs are not flagged",
+          report_cases("wrongly flagged", bad))
+}
+
+# background / bg_server / run_tests.command ran shell commands with NO gate.
+fun t_command_tools_gated() {
+    o = %{settings: map_new()}
+    evil = "mkfs.ext4 /dev/sdz"
+    g_bg  = ToolExecutor.permission_gate('background', %{command: evil}, o)
+    g_srv = ToolExecutor.permission_gate('bg_server', %{command: evil}, o)
+    g_rt  = ToolExecutor.permission_gate('run_tests', %{repo_path: ".", command: evil}, o)
+    g_ask = ToolExecutor.permission_gate('background', %{command: "rm -rf ~/tmp"},
+                                         %{settings: map_new(), execution_context: "mcp_server"})
+    check("hardline/dangerous gates cover background, bg_server and run_tests",
+          bool_and(bool_and3(string_contains(to_string(g_bg), "permission denied"),
+                             string_contains(to_string(g_srv), "permission denied"),
+                             string_contains(to_string(g_rt), "permission denied")),
+                   string_contains(to_string(g_ask), "requires interactive permission")))
+}
+
+# A denial must say WHY (which pattern), so the model can adapt — it used to
+# be a bare "permission denied for tool 'bash'". A configured deny must also
+# stay a deny for a dangerous command (the dangerous gate turned it into ask).
+fun t_denial_names_reason() {
+    g = to_string(ToolExecutor.permission_gate('bash', %{command: "rm -fr /"}, %{settings: map_new()}))
+    d = Config.check_permission('bash', %{command: "rm -rf ~/x"},
+                                %{settings: %{permissions: %{bash: "deny"}}})
+    check("permission denial names the matched pattern; configured deny beats dangerous-ask",
+          bool_and3(string_contains(g, "hardline"), string_contains(g, "rm"),
+                    if (d == 'deny') { 'true' } else { 'false' }))
+}
+
+# The sudo refusal matched the literal "sudo " — a TAB bypassed it.
+fun t_sudo_tab_blocked() {
+    out = to_string(Tools.exec_raw('bash', %{command: "sudo\tls /"}, %{}))
+    out2 = to_string(Tools.exec_raw('background', %{command: "sudo ls /"}, %{bg_table: Background.init()}))
+    check("sudo refusal is token-aware (sudo<TAB>ls) and covers the background tool",
+          bool_and(string_starts_with(out, "error: sudo is disabled"),
+                   string_starts_with(out2, "error: sudo is disabled")))
 }

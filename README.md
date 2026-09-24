@@ -120,7 +120,7 @@ swarm-code runs shell commands, reads and writes files, and can reach the networ
 
 - **Local-network-only by default**; remote endpoints require an explicit `SWARM_CODE_ALLOW_REMOTE=1`.
 - Every tool runs through one **`ToolExecutor` policy boundary** — context allow-lists, argument-rewriting hooks, guardrails, and permissions — *before* any raw handler executes, and **fails closed** on a missing or unknown execution context.
-- A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd`, fork bombs, …) cannot be bypassed by environment overrides.
+- A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd` to a disk, halt/reboot, fork bombs, …) cannot be bypassed by environment overrides. It covers every tool that runs a shell command (`bash`, `background`, `bg_server`, `run_tests`), and commands are parsed like `sh` does — respellings such as `rm -fr /`, `dd of=/dev/sda if=…` or `sh -c '…'` are caught, while words inside quotes, `echo`/`grep` arguments or heredoc bodies are not flagged. Denials name the matched pattern.
 - Subagents, MCP, and council contexts run under restricted (often read-only) policies.
 - Secrets are redacted from session logs and trajectory exports.
 

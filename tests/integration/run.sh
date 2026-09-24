@@ -22,6 +22,9 @@
 #   T10 stale PWD           — the real cwd, not $PWD, reaches the system prompt
 #   T11 grep without a path — MCP server's stdin (the JSON-RPC stream) is never
 #                             read by a tool subprocess; the next request survives
+#   T12 command-tool gate   — `background` gets the same hardline gate as bash
+#                             (denial names the pattern); a command merely
+#                             MENTIONING reboot/halt still runs
 #
 # INTEG_ONLY="t4 t11" runs just those tests (default: all).
 #
@@ -430,10 +433,43 @@ t11() {
 }
 
 # ------------------------------------------------------------
+# T12 — every command-running tool shares the classifier: `background`
+#       used to run a hardline command ungated. And the classifier is
+#       token-aware: words inside quoted args / grep patterns don't trip it.
+# ------------------------------------------------------------
+t12() {
+    new_case t12
+    local sentinel="$WORK/owned-by-background"
+    cat >"$CASE/scenario.json" <<EOF
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_bg", "name": "background",
+     "arguments": {"command": "mkfs.ext4 -n /dev/null; touch $sentinel"}}]},
+  {"type": "tool_calls", "calls": [
+    {"id": "call_fp", "name": "bash",
+     "arguments": {"command": "echo reboot required; grep -c 'shutdown now' /dev/null; echo fp-ran-t12"}}]},
+  {"type": "text", "content": "GATE_ACK_T12"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T12 "mock failed to start"; return; }
+    run_swarm -p "clean up" --no-resume --json
+    cleanup
+    sleep 1
+    local out; out="$(final_json)"
+    if [ -e "$sentinel" ]; then fail T12 "HARDLINE BREACH: background command executed"
+    elif [ "$RC" -ne 0 ]; then fail T12 "exit code $RC"
+    elif ! req_has 1 "permission denied"; then fail T12 "background call was not denied"
+    elif ! req_has 1 "hardline"; then fail T12 "denial does not name the reason"
+    elif ! req_has 2 "fp-ran-t12"; then fail T12 "false positive: a command mentioning reboot/halt was blocked"
+    elif ! echo "$out" | grep -q "GATE_ACK_T12"; then fail T12 "final text missing: $out"
+    else pass T12; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
-for t in ${INTEG_ONLY:-t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11}; do
+for t in ${INTEG_ONLY:-t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12}; do
     "$t"
 done
 

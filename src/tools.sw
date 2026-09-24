@@ -30,6 +30,7 @@ import Mcp
 import Util
 import TestRunner
 import PathGuard
+import CommandGuard
 
 export [exec_raw, max_output_bytes]
 
@@ -290,16 +291,9 @@ fun do_bash(args, opts) {
     if (cmd == nil) {
         "error: missing 'command' argument"
     } else {
-        # Sudo guard — outright block unless explicitly enabled. The
-        # model has no safe way to enter a sudo password, and the
-        # ambient setuid escalation risk is too high to gate behind
-        # only a prompt (which is_dangerous_bash already does).
-        # Set SWARM_CODE_ALLOW_SUDO=1 to opt back in.
         cmd_s = to_string(cmd)
-        sudo_allowed = getenv("SWARM_CODE_ALLOW_SUDO")
-        if (string_contains(cmd_s, "sudo ") == 'true' && sudo_allowed != "1") {
-            "error: sudo is disabled — set SWARM_CODE_ALLOW_SUDO=1 to enable (acknowledge that an agent running sudo is high-risk)"
-        }
+        refusal = sudo_refusal(cmd_s)
+        if (refusal != nil) { refusal }
         else {
             bg_table = map_get(opts, 'bg_table')
             run_bg = bash_run_in_background(args)
@@ -321,6 +315,20 @@ fun do_bash(args, opts) {
             }
         }
     }
+}
+
+# Sudo guard — outright block unless explicitly enabled. The model has no
+# safe way to enter a sudo password, and the ambient setuid escalation risk
+# is too high to gate behind only a prompt (which the dangerous-command gate
+# already does). Token-aware (CommandGuard: `sudo<TAB>ls`, `env sudo …`,
+# `$(sudo …)` all count; the word "sudo" inside an echo'd string doesn't),
+# and applied to every command-running tool, not just bash.
+# Set SWARM_CODE_ALLOW_SUDO=1 to opt back in. Returns nil or the error.
+fun sudo_refusal(cmd_s) {
+    if (getenv("SWARM_CODE_ALLOW_SUDO") == "1") { nil }
+    else { if (CommandGuard.uses_sudo(cmd_s) == 'true') {
+        "error: sudo is disabled — set SWARM_CODE_ALLOW_SUDO=1 to enable (acknowledge that an agent running sudo is high-risk)"
+    } else { nil }}
 }
 
 # Classic blocking path: run under shell_managed with the resolved timeout.
@@ -1367,12 +1375,13 @@ fun do_background(args, opts) {
     if (cmd == nil) { "error: background needs 'command'" }
     else {
         if (bg_table == nil) { "error: background system not initialized" }
+        else { if (sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
             id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
             "launched " ++ id ++ ": " ++ label_str ++
                 "\n(use bg_status and bg_result to check progress)"
-        }
+        }}
     }
 }
 
@@ -1417,6 +1426,7 @@ fun do_bg_server(args, opts) {
     if (cmd == nil) { "error: bg_server needs 'command'" }
     else {
         if (bg_table == nil) { "error: background system not initialized" }
+        else { if (sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
             id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
@@ -1424,7 +1434,7 @@ fun do_bg_server(args, opts) {
             "launched detached server " ++ id ++ ": " ++ label_str ++
                 "\nlog: " ++ log_file ++
                 "\n(use bg_tail to read log, bg_kill to stop)"
-        }
+        }}
     }
 }
 
@@ -1671,6 +1681,7 @@ fun do_run_tests(args) {
     repo = map_get(args, 'repo_path')
     cmd = map_get(args, 'command')
     if (repo == nil) { "error: run_tests needs 'repo_path'" }
+    else { if (cmd != nil && sudo_refusal(to_string(cmd)) != nil) { sudo_refusal(to_string(cmd)) }
     else {
         command = if (cmd == nil) { "" } else { to_string(cmd) }
         result = TestRunner.run_tests(to_string(repo), command)
@@ -1696,7 +1707,7 @@ fun do_run_tests(args) {
         } else {
             summary
         }
-    }
+    }}
 }
 
 # ------------------------------------------------------------
