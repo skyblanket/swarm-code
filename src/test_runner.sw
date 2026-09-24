@@ -3451,6 +3451,9 @@ fun t_headless_default_allowed_still_run() {
         eqs(Agent.resolve_permission('read', %{path: "/tmp/x"}, dflt), 'allow'),
         eqs(Agent.resolve_permission('bash', %{command: "mkfs /dev/sda1"}, dflt), 'deny')])
     check("headless: default-allowed tools still run; hardline still denies", ok)
+}
+
+# ------------------------------------------------------------
 # Tool-layer review fixes
 # ------------------------------------------------------------
 
