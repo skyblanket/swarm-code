@@ -29,6 +29,7 @@
 #   T17 mid-turn compaction — the live user request survives compaction
 #   T18 fatal 4xx           — completed tool pairs survive; context overflow retries once
 #   T19 escapes round-trip  — "<div>" / "\u003c" in args and prose, native + inband
+#   T20 profile override    — env beats a stale override; kwargs kept; /model keeps profile
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -151,6 +152,18 @@ PYEOF
 req_count() { wc -l <"$REQLOG" | tr -d ' '; }
 stream_count() { grep -c '"kind": "stream"' "$REQLOG"; }
 silent_count() { grep -c '"kind": "silent"' "$REQLOG"; }
+
+# req_field <n> <key> — JSON of top-level field <key> of streaming request #n.
+req_field() {
+    python3 - "$REQLOG" "$1" "$2" <<'PYEOF'
+import json, sys
+path, n, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+for line in open(path):
+    r = json.loads(line)
+    if r["n"] == n and r.get("kind", "stream") == "stream":
+        print(json.dumps(r["body"].get(key), sort_keys=True))
+PYEOF
+}
 
 # journal_file — the session journal .active points at (for resume checks).
 journal_file() { cat "$CASE_HOME/.swarm-code/sessions/.active" 2>/dev/null; }
@@ -826,11 +839,50 @@ PYEOF
 }
 
 # ------------------------------------------------------------
+# T20 — the persisted /profile override: an env var that is set beats one
+#       left by an earlier session (a stale profile model was sent instead
+#       of SWARM_CODE_MODEL); the profile's chat_template_kwargs reach the
+#       request (they were dropped); /model changes only the model and
+#       keeps the profile's settings (it overwrote them).
+# ------------------------------------------------------------
+t20() {
+    new_case t20
+    mkdir -p "$CASE_HOME/.swarm-code"
+    cat >"$CASE_HOME/.swarm-code/settings.json" <<'EOF'
+{"profiles": {"qwen2": {"model": "qwen-2-stale-model", "endpoint": "http://127.0.0.1:9",
+                         "chat_template_kwargs": {"enable_thinking": false}}}}
+EOF
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "PROFILE_OK_T20"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T20 "mock failed to start"; return; }
+    run_swarm -p "/profile qwen2" --no-resume --json
+    if [ "$RC" -ne 0 ]; then cleanup; fail T20 "/profile run exit code $RC"; return; fi
+    run_swarm -p "t20 hello" --no-resume --json
+    cleanup
+    local model ct
+    model="$(req_field 0 model)"; ct="$(req_field 0 chat_template_kwargs)"
+    if [ "$RC" -ne 0 ]; then fail T20 "run after /profile: exit $RC (endpoint override beat env?)"; return; fi
+    if [ "$model" != '"test"' ]; then fail T20 "stale override beat SWARM_CODE_MODEL: model=$model"; return; fi
+    if [ "$ct" != '{"enable_thinking": false}' ]; then fail T20 "profile chat_template_kwargs lost: $ct"; return; fi
+
+    start_mock "$CASE/scenario.json" || { fail T20 "mock 2 failed to start"; return; }
+    run_swarm -p "/model other-model" --no-resume --json
+    run_swarm -p "t20 again" --no-resume --json
+    cleanup
+    ct="$(req_field 0 chat_template_kwargs)"
+    if [ "$RC" -ne 0 ]; then fail T20 "run after /model: exit $RC"
+    elif [ "$ct" != '{"enable_thinking": false}' ]; then fail T20 "/model wiped the profile's kwargs: $ct"
+    elif [ "$(req_field 0 model)" != '"test"' ]; then fail T20 "after /model: env model not sent: $(req_field 0 model)"
+    else pass T20; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"

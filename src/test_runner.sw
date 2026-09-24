@@ -35,6 +35,7 @@ import ToolExecutor
 import ToolRegistry
 import Background
 import Util
+import Prompts
 
 fun main() {
     print("")
@@ -240,7 +241,12 @@ fun main() {
         t_compact_failed_summary_keeps_history(),
         # --- a fatal 4xx keeps completed work; context overflow retries ---
         t_context_overflow_detection(),
-        t_mech_trim_protects_live_user()
+        t_mech_trim_protects_live_user(),
+        # --- profile override: env precedence, kwargs, /model, tool format ---
+        t_override_env_beats_stale_override(),
+        t_profile_override_keeps_chat_template_kwargs(),
+        t_model_override_keeps_active_profile(),
+        t_system_prompt_follows_wire_format()
     ]
 
     passed = sum_list(results, 0)
@@ -2863,3 +2869,66 @@ fun t_mech_trim_protects_live_user() {
 }
 
 fun rep_tail(s, n, acc) { if (n <= 0) { acc } else { rep_tail(s, n - 1, acc ++ s) } }
+
+# ------------------------------------------------------------
+# Profile override: env precedence, chat_template_kwargs, /model, format
+# ------------------------------------------------------------
+fun env_none() { fn(name) { nil } }
+fun env_model_test() { fn(name) { if (name == "SWARM_CODE_MODEL") { "test" } else { nil } } }
+
+# An override left by an EARLIER session no longer beats an env var that is
+# set (it silently sent a stale /profile's model with SWARM_CODE_MODEL=test);
+# this session's own override still does, and with no env var it applies.
+fun t_override_env_beats_stale_override() {
+    opts = %{model: "test", session_id: "sess-new"}
+    stale = %{model: "qwen3-b", session_id: "sess-old"}
+    mine = %{model: "qwen3-b", session_id: "sess-new"}
+    check("override: env beats a stale override; this session's override beats env",
+          bool_and3(eqs(map_get(LLM.apply_override_map(opts, stale, env_model_test()), 'model'), "test"),
+                    eqs(map_get(LLM.apply_override_map(opts, mine, env_model_test()), 'model'), "qwen3-b"),
+                    eqs(map_get(LLM.apply_override_map(opts, stale, env_none()), 'model'), "qwen3-b")))
+}
+
+# /profile qwen2 must carry the profile's chat_template_kwargs through the
+# override file (they were dropped, then cleared — enable_thinking lost).
+fun t_profile_override_keeps_chat_template_kwargs() {
+    prof = json_decode("{\"model\":\"qwen2-x\",\"chat_template_kwargs\":{\"enable_thinking\":false}}")
+    file_ov = json_decode(json_encode(map_put(map_put(Agent.profile_to_override(prof), 'profile', "qwen2"),
+                                              'session_id', "s1")))
+    eff = LLM.apply_override_map(%{model: "m", session_id: "s1"}, file_ov, env_none())
+    ct = map_get(eff, 'chat_template_kwargs')
+    body = LLM.build_request_body([LLM.new_message_user("hi")], map_put(map_put(native_opts(), 'chat_template_kwargs', ct), 'model', map_get(eff, 'model')))
+    check("/profile keeps the profile's chat_template_kwargs (enable_thinking:false reaches the body)",
+          bool_and(if (ct != nil) { 'true' } else { 'false' },
+                   string_contains(body, "\"enable_thinking\":false")))
+}
+
+# /model X carries forward what is in effect: a /profile's endpoint, api_key
+# and kwargs survive (it used to write {model} alone and revert them).
+fun t_model_override_keeps_active_profile() {
+    active = %{endpoint: "http://gpu-box:8000", api_key: "k-1", model: "qwen2-x", profile: "qwen2",
+               chat_template_kwargs: %{enable_thinking: 'false'}, session_id: "s1"}
+    kept = LLM.effective_override(active, %{session_id: "s1"})
+    ov = map_put(map_put(kept, 'model', "other-model"), 'session_id', "s1")
+    eff = LLM.apply_override_map(%{endpoint: "http://launch", model: "m", session_id: "s1"}, ov, env_none())
+    check("/model changes only the model: the active profile's endpoint/api_key/kwargs stay",
+          bool_and3(eqs(map_get(eff, 'model'), "other-model"),
+                    eqs(map_get(eff, 'endpoint'), "http://gpu-box:8000"),
+                    bool_and(eqs(map_get(eff, 'api_key'), "k-1"),
+                             if (map_get(eff, 'chat_template_kwargs') != nil) { 'true' } else { 'false' })))
+}
+
+# The system prompt is built once for the launch format; a request sent in
+# the other format (an override to inband has no tools array) must carry the
+# matching tool sections, or the model has no usable tools.
+fun t_system_prompt_follows_wire_format() {
+    native_sys = [LLM.new_message_system(Prompts.system_prompt("/tmp", "native")), LLM.new_message_user("hi")]
+    inband_sys = [LLM.new_message_system(Prompts.system_prompt("/tmp", "inband")), LLM.new_message_user("hi")]
+    as_inband = LLM.build_request_body(native_sys, map_put(native_opts(), 'tool_format', 'inband'))
+    as_native = LLM.build_request_body(inband_sys, native_opts())
+    check("system prompt tool sections follow the request's wire format (native <-> inband)",
+          bool_and(bool_and(string_contains(as_inband, "TOOL-CALLING PROTOCOL"),
+                            bool_not(string_contains(as_inband, "=== TOOL USE ==="))),
+                   bool_and(string_contains(as_native, "=== TOOL USE ==="),
+                            bool_not(string_contains(as_native, "TOOL-CALLING PROTOCOL")))))
+}

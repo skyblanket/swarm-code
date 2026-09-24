@@ -200,7 +200,10 @@ fun main() {
     context_env = getenv("SWARM_CODE_EXECUTION_CONTEXT")
     execution_context = if (context_env == nil) { "main" }
                         else { to_string(context_env) }
-    opts0 = map_put(base_opts, 'execution_context', execution_context)
+    # session_id: stamps /profile and /model overrides so THIS session's beat
+    # env vars while one left over from an earlier session doesn't (LLM.apply_override).
+    opts0 = map_put(map_put(base_opts, 'execution_context', execution_context),
+                    'session_id', uuid())
     opts = map_put(opts0, 'cwd', cwd)
     opts2 = map_put(opts, 'todos_table', todos_table)
     opts3 = map_put(opts2, 'perms_table', perms_table)

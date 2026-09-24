@@ -49,7 +49,8 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         show_expand, handle_bg_command, route_input,
         skip_remaining_tools, turn_interrupted,
         args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls,
-        headless_answer, compact_history, compact_split, mechanical_trim_ex]
+        headless_answer, compact_history, compact_split, mechanical_trim_ex,
+        profile_to_override]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -990,14 +991,17 @@ fun slash_dispatch(cmd, history, opts) {
     else { if (cmd == "/model") { show_model_info(opts) ; history }
     else { if (string_starts_with(cmd, "/model ") == 'true') {
         new_model = string_trim(string_sub(cmd, 7, string_length(cmd) - 7))
-        apply_model_override(new_model)
+        apply_model_override(new_model, opts)
         history
     }
-    else { if (cmd == "/profile") { show_active_profile() ; history }
+    else { if (cmd == "/profile") { show_active_profile(opts) ; history }
     else { if (cmd == "/profiles") { list_profiles() ; history }
     else { if (string_starts_with(cmd, "/profile ") == 'true') {
         name = string_trim(string_sub(cmd, 9, string_length(cmd) - 9))
-        apply_profile_override(name)
+        # "/profile clear" is the documented alias of /profile-clear (this
+        # prefix branch used to swallow it as a profile named "clear").
+        if (name == "clear") { clear_profile_override() }
+        else { apply_profile_override(name, opts) }
         history
     }
     else { if (cmd == "/profile-clear" || cmd == "/profile clear") {
@@ -1402,14 +1406,16 @@ fun show_debug_tools() {
 
 # ------------------------------------------------------------
 # Profile / model swap — writes ~/.swarm-code/.profile_override which
-# LLM.apply_override consults before every request. No opts threading
-# required; the change takes effect on the next LLM call.
+# LLM.apply_override consults before every request; the change takes effect
+# on the next LLM call. Each write is stamped with this launch's session_id:
+# in THIS session the override beats env vars, in a later one an env var
+# that is set wins (see LLM.apply_override).
 # ------------------------------------------------------------
 fun profile_override_path() {
     getenv("HOME") ++ "/.swarm-code/.profile_override"
 }
 
-fun apply_profile_override(name) {
+fun apply_profile_override(name, opts) {
     if (string_length(name) == 0) {
         print(UI.warn_text("usage: /profile NAME  (try /profiles to list)"))
     }
@@ -1425,7 +1431,7 @@ fun apply_profile_override(name) {
                 print(UI.warn_text("no profile named '" ++ name ++ "' — try /profiles"))
             }
             else {
-                ov = profile_to_override(p)
+                ov = stamp_override(map_put(profile_to_override(p), 'profile', name), opts)
                 file_write(profile_override_path(), json_encode(ov))
                 print(UI.brand_color() ++ "✓ profile swapped to " ++ name ++ UI.reset())
                 print(UI.grey_text() ++ "  model    : " ++ to_string(map_get(ov, 'model')) ++ UI.reset())
@@ -1436,16 +1442,26 @@ fun apply_profile_override(name) {
     }
 }
 
-fun apply_model_override(model_name) {
+# Changes ONLY the model: whatever part of an existing override is in effect
+# (a /profile's endpoint, api_key, tool_format, chat_template_kwargs) is
+# carried over — it used to be overwritten with {model}, silently reverting
+# the profile while printing "endpoint/api_key unchanged".
+fun apply_model_override(model_name, opts) {
     if (string_length(model_name) == 0) {
         print(UI.warn_text("usage: /model NAME"))
     }
     else {
-        ov = %{ model: model_name }
+        kept = LLM.effective_override(LLM.read_override(), opts)
+        ov = stamp_override(map_put(kept, 'model', model_name), opts)
         file_write(profile_override_path(), json_encode(ov))
         print(UI.brand_color() ++ "✓ model swapped to " ++ model_name ++ UI.reset())
         print(UI.grey_text() ++ "  endpoint/api_key unchanged. /profile-clear to revert." ++ UI.reset())
     }
+}
+
+fun stamp_override(ov, opts) {
+    sid = map_get(opts, 'session_id')
+    if (sid == nil) { ov } else { map_put(ov, 'session_id', to_string(sid)) }
 }
 
 fun clear_profile_override() {
@@ -1458,32 +1474,38 @@ fun clear_profile_override() {
     }
 }
 
-fun show_active_profile() {
+fun show_active_profile(opts) {
     p = profile_override_path()
     if (file_exists(p) == 'false') {
         print("\e[2m(no override active — using launch profile)\e[0m")
     } else {
-        raw = file_read(p)
-        ov = if (raw == nil) { nil } else { json_decode(raw) }
+        ov = LLM.read_override()
         if (ov == nil) {
             print(UI.warn_text("(override file present but unreadable: " ++ p ++ ")"))
         } else {
-            print("\e[1mactive override\e[0m")
-            show_override_field(ov, 'endpoint')
-            show_override_field(ov, 'model')
-            show_override_field(ov, 'api_key')
-            show_override_field(ov, 'tool_format')
+            prof = map_get(ov, 'profile')
+            print("\e[1mactive override\e[0m" ++ (if (prof == nil) { "" } else { " (profile " ++ to_string(prof) ++ ")" }))
+            show_override_field(ov, 'endpoint', opts)
+            show_override_field(ov, 'model', opts)
+            show_override_field(ov, 'api_key', opts)
+            show_override_field(ov, 'tool_format', opts)
+            show_override_field(ov, 'chat_template_kwargs', opts)
             print(UI.grey_text() ++ "  (use /profile-clear to revert)" ++ UI.reset())
         }
     }
 }
 
-fun show_override_field(ov, key) {
+# A field an env var pins (override left by an earlier session) is shown as
+# not applied, so /profile tells the truth about what gets sent.
+fun show_override_field(ov, key, opts) {
     v = map_get(ov, key)
     if (v == nil) { 'skip' }
     else {
         shown = if (key == 'api_key') { "(set)" } else { to_string(v) }
-        print("  " ++ to_string(key) ++ " : " ++ shown)
+        applied = LLM.override_applies(opts, ov, key, fn(name) { getenv(name) })
+        note = if (applied == 'true') { "" }
+               else { UI.grey_text() ++ "  (not applied — the environment sets it)" ++ UI.reset() }
+        print("  " ++ to_string(key) ++ " : " ++ shown ++ note)
     }
 }
 
@@ -1537,14 +1559,17 @@ fun lookup_profile_loop(keys, values, name) {
 
 # Convert a settings.json profile entry into the override-file shape.
 # Only includes fields actually present in the profile — `apply_override`
-# will leave unset fields alone.
+# will leave unset fields alone. chat_template_kwargs is a map and is kept
+# as one (it used to be omitted, and apply_override then cleared the launch
+# value — `/profile qwen2` lost enable_thinking:false).
 fun profile_to_override(p) {
     a = profile_field(map_new(), p, 'endpoint')
     b = profile_field(a, p, 'model')
     c = profile_field(b, p, 'api_key')
     d = profile_field(c, p, 'tool_format')
     e = profile_field(d, p, 'vision')
-    e
+    ct = map_get(p, 'chat_template_kwargs')
+    if (ct == nil) { e } else { map_put(e, 'chat_template_kwargs', ct) }
 }
 
 fun profile_field(acc, p, key) {

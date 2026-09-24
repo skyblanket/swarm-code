@@ -6,6 +6,7 @@ import Markdown
 import Hooks
 import Config
 import UI
+import Prompts
 
 # ============================================================
 # LLM — OpenAI-compatible chat completions client
@@ -49,6 +50,8 @@ export [
     parse_inband_tool_calls, inband_assistant_text,
     api_tool_calls_to_internal,
     repair_history, apply_override,
+    read_override, apply_override_map, override_applies, effective_override,
+    retarget_system_prompt,
     inject_context_status, build_status_string,
     routed_collect, maybe_large_context_hint,
     context_window_tokens, context_budget_tokens, budget_for_window
@@ -87,60 +90,118 @@ fun new_message_tool(tool_call_id, content) {
 # URL ending in `/chat/completions` and we'll use it verbatim.
 # ------------------------------------------------------------
 # ------------------------------------------------------------
-# In-session profile override. Slash command /profile NAME writes
-# ~/.swarm-code/.profile_override with {endpoint, model, api_key,
-# tool_format}; every LLM call consults this file and applies the
-# overrides before serialising the request. File-based (rather than
-# threading opts through main_loop) so it's a 5-line touch instead of
-# a deep refactor — `rm ~/.swarm-code/.profile_override` reverts.
+# Profile override. /profile NAME and /model NAME write
+# ~/.swarm-code/.profile_override ({endpoint, model, api_key, tool_format,
+# vision, chat_template_kwargs, profile, session_id}); every LLM call
+# consults it before serialising the request. File-based (rather than
+# threading opts through main_loop); /profile-clear or deleting the file
+# reverts.
+#
+# Precedence: the file is global and outlives the session that wrote it.
+# An override written by THIS session (its session_id is opts.session_id,
+# minted per launch in main.sw) is the user's explicit in-session choice and
+# beats everything. One left over from an EARLIER session is only a default:
+# an env var that is set (SWARM_CODE_MODEL, …) wins over it, per field — a
+# stale `/profile qwen3-b` used to silently replace SWARM_CODE_MODEL=test.
 # ------------------------------------------------------------
 fun apply_override(opts) {
+    ov = read_override()
+    if (ov == nil) { opts } else { apply_override_map(opts, ov, fn(name) { getenv(name) }) }
+}
+
+fun read_override() {
     home = getenv("HOME")
-    if (home == nil) { opts }
+    if (home == nil) { nil }
     else {
         path = home ++ "/.swarm-code/.profile_override"
-        if (file_exists(path) == 'false') { opts }
+        if (file_exists(path) == 'false') { nil }
         else {
             raw = file_read(path)
-            if (raw == nil) { opts }
-            else {
-                ov = json_decode(raw)
-                if (ov == nil) { opts }
-                else {
-                    a = override_field(opts, ov, 'endpoint')
-                    b = override_field(a, ov, 'model')
-                    c = override_field(b, ov, 'api_key')
-                    d = override_field(c, ov, 'tool_format')
-                    d = override_field(d, ov, 'vision')
-                    # chat_template_kwargs is a map (not a string), so it
-                    # bypasses override_field's to_string coercion. Always
-                    # replace, even with nil, so switching to a profile that
-                    # doesn't set thinking-off actually clears it.
-                    ct_v = map_get(ov, 'chat_template_kwargs')
-                    d = map_put(d, 'chat_template_kwargs', ct_v)
-                    # Re-derive temperature when model changes — Kimi K2.x
-                    # rejects any temperature other than 1.0.
-                    if (map_get(ov, 'model') != nil) {
-                        new_model = to_string(map_get(d, 'model'))
-                        new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
-                                   else { 0.2 }
-                        map_put(d, 'temperature', new_temp)
-                    } else { d }
-                }
-            }
+            if (raw == nil) { nil } else { json_decode(raw) }
         }
     }
 }
 
-fun override_field(opts, ov, key) {
-    v = map_get(ov, key)
-    if (v == nil) { opts }
+# The env var that pins each overridable field (nil: none).
+fun override_env_var(key) {
+    if (key == 'endpoint') { "SWARM_CODE_ENDPOINT" }
+    else { if (key == 'model') { "SWARM_CODE_MODEL" }
+    else { if (key == 'api_key') { "SWARM_CODE_API_KEY" }
+    else { if (key == 'tool_format') { "SWARM_CODE_TOOL_FORMAT" }
+    else { nil }}}}
+}
+
+# Does the override's `key` take effect? It is in the file AND (this session
+# wrote it, or no env var pins the field). env_fn: name -> value | nil (the
+# real getenv, or a stub in tests).
+fun override_applies(opts, ov, key, env_fn) {
+    if (map_get(ov, key) == nil) { 'false' }
     else {
+        sid = map_get(ov, 'session_id')
+        mine = if (sid != nil && to_string(sid) == to_string(map_get(opts, 'session_id'))) { 'true' } else { 'false' }
+        var = override_env_var(key)
+        if (mine == 'true' || var == nil) { 'true' }
+        else { if (env_fn(var) == nil) { 'true' } else { 'false' } }
+    }
+}
+
+fun apply_override_map(opts, ov, env_fn) {
+    a = override_field(opts, ov, 'endpoint', env_fn)
+    b = override_field(a, ov, 'model', env_fn)
+    c = override_field(b, ov, 'api_key', env_fn)
+    d = override_field(c, ov, 'tool_format', env_fn)
+    e = override_field(d, ov, 'vision', env_fn)
+    # chat_template_kwargs is a map (not a string), so it bypasses
+    # override_field's to_string coercion. A /profile swap (the file names its
+    # profile) REPLACES it — even with nil, so switching to a profile without
+    # thinking-off really clears the launch profile's; the profile's own
+    # kwargs are now written to the file (they used to be dropped, so
+    # `/profile qwen2` lost enable_thinking:false). A /model-only override
+    # leaves it alone.
+    ct = map_get(ov, 'chat_template_kwargs')
+    f = if (map_get(ov, 'profile') != nil || ct != nil) { map_put(e, 'chat_template_kwargs', ct) } else { e }
+    # Re-derive temperature when the model changes — Kimi K2.x rejects any
+    # temperature other than 1.0.
+    if (override_applies(opts, ov, 'model', env_fn) == 'true') {
+        new_model = to_string(map_get(f, 'model'))
+        new_temp = if (string_starts_with(new_model, "kimi") == 'true') { 1.0 }
+                   else { 0.2 }
+        map_put(f, 'temperature', new_temp)
+    } else { f }
+}
+
+fun override_field(opts, ov, key, env_fn) {
+    if (override_applies(opts, ov, key, env_fn) == 'false') { opts }
+    else {
+        v = map_get(ov, key)
         val = if (key == 'tool_format') {
             s = to_string(v)
             if (s == "native") { 'native' } else { 'inband' }
         } else { to_string(v) }
         map_put(opts, key, val)
+    }
+}
+
+# The part of an override that takes effect right now, for /model to carry
+# forward when it restamps the file as this session's: it changes ONLY the
+# model. Keeping env-shadowed fields would promote them over env; dropping the
+# active ones silently reverted a /profile's endpoint and api_key (while
+# printing "endpoint/api_key unchanged").
+fun effective_override(ov, opts) {
+    if (ov == nil) { map_new() }
+    else {
+        env_fn = fn(name) { getenv(name) }
+        keep_applying(ov, opts, ['endpoint', 'model', 'api_key', 'tool_format', 'vision',
+                                 'chat_template_kwargs', 'profile'], env_fn, map_new())
+    }
+}
+
+fun keep_applying(ov, opts, keys, env_fn, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        k = hd(keys)
+        next = if (override_applies(opts, ov, k, env_fn) == 'true') { map_put(acc, k, map_get(ov, k)) } else { acc }
+        keep_applying(ov, opts, tl(keys), env_fn, next)
     }
 }
 
@@ -369,7 +430,7 @@ fun build_request_body(messages, opts) {
     # trailing unmatched tool_calls, and collapses consecutive user
     # messages. Keeps the API from rejecting requests after a crash
     # mid-turn or a journal load that landed mid-conversation.
-    repaired = repair_history(messages)
+    repaired = repair_history(retarget_system_prompt(messages, tool_format))
 
     # Drain any pending image attachments (from read_image) and inject
     # them into the LAST user message as OpenAI multimodal content
@@ -416,6 +477,36 @@ fun build_request_body(messages, opts) {
         inband_req(base_with_ct)
     }
     json_encode(final_req)
+}
+
+# ------------------------------------------------------------
+# System prompt ↔ wire format
+# ------------------------------------------------------------
+# main.sw builds the system prompt ONCE, for the launch tool_format. A
+# /profile override, a fallback endpoint or a provider chain can send a
+# request in the OTHER format — and a native prompt ("your tools are in this
+# request's `tools` array") on an inband request, which carries no tools
+# array, left the model with no usable tools at all. Swap the prompt's
+# tool-use sections (Prompts.tool_sections — pure text, so an exact replace)
+# to match the format this request is actually sent in. The history's system
+# message is untouched; only the outbound copy changes.
+fun retarget_system_prompt(messages, tool_format) {
+    if (length(messages) == 0) { messages }
+    else {
+        first = hd(messages)
+        if (map_get(first, 'role') != 'system') { messages }
+        else {
+            want = if (tool_format == 'native') { "native" } else { "inband" }
+            other = if (want == "native") { "inband" } else { "native" }
+            content = to_string(map_get(first, 'content'))
+            from = Prompts.tool_sections(other)
+            if (string_contains(content, from) == 'false') { messages }
+            else {
+                fixed = map_put(first, 'content', string_replace(content, from, Prompts.tool_sections(want)))
+                [fixed | tl(messages)]
+            }
+        }
+    }
 }
 
 # ------------------------------------------------------------
