@@ -469,16 +469,17 @@ fun log_wait_s() {
             pattern: s("Regex/substring to wait for"),
             path: s("Optional: file to watch"),
             task_id: s("Optional: background task id to watch instead of a file"),
-            timeout_sec: i("Optional: max seconds to wait (default 30)")
+            timeout_sec: i("Optional: max seconds to wait (default 60, clamped to 1..600)")
         }, ["pattern"]))
 }
 
 fun file_watch_s() {
     tool("file_watch",
-        "Block until a file changes (or the timeout elapses).",
+        "Block until a file changes — its mtime or size changes, or it appears " ++
+        "or disappears — or the timeout elapses.",
         obj(%{
             path: s("File to watch"),
-            timeout_sec: i("Optional: max seconds to wait (default 30)")
+            timeout_sec: i("Optional: max seconds to wait (default 60, clamped to 1..600)")
         }, ["path"]))
 }
 

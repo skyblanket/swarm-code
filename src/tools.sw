@@ -1857,8 +1857,7 @@ fun do_log_wait(args, opts) {
     else {
         task_id = map_get(args, 'task_id')
         path_arg = map_get(args, 'path')
-        timeout = map_get(args, 'timeout_sec')
-        timeout_n = if (timeout == nil) { 60 } else { parse_int_safe(to_string(timeout), 60) }
+        timeout_n = clamp_wait_timeout_s(map_get(args, 'timeout_sec'))
 
         # Resolve log path: explicit path, or task_id's log file
         log_path = if (path_arg != nil) { to_string(path_arg) }
@@ -1893,29 +1892,50 @@ fun do_log_wait(args, opts) {
     }
 }
 
+# log_wait / file_watch `timeout_sec`: default 60, clamped to [1, 600].
+# Unclamped, 0 reached shell_managed as "no timeout" — a 600s wedge headless,
+# unbounded on a TTY. Non-numeric junk falls back to the default.
+fun clamp_wait_timeout_s(raw) {
+    if (raw == nil) { 60 }
+    else {
+        n = parse_int_safe(to_string(raw), 60)
+        if (n < 1) { 1 } else { if (n > 600) { 600 } else { n } }
+    }
+}
+
 # ------------------------------------------------------------
-# file_watch — block until a file changes (mtime) or appears
+# file_watch — block until a file changes (mtime/size), appears, or vanishes
 # ------------------------------------------------------------
 # args: {"path": "/path/to/file", "timeout_sec": 60}
-# Returns when the file's mtime changes or it appears, or on timeout.
+# Returns when the file's signature changes, or on timeout.
 fun do_file_watch(args) {
     path_arg = map_get(args, 'path')
     if (path_arg == nil) { "error: file_watch needs 'path'" }
     else {
         path = to_string(path_arg)
-        timeout = map_get(args, 'timeout_sec')
-        timeout_n = if (timeout == nil) { 60 } else { to_int(timeout) }
+        timeout_n = clamp_wait_timeout_s(map_get(args, 'timeout_sec'))
 
-        # Capture initial mtime, then poll every 0.5s until it changes.
+        # Capture an initial signature, then poll every 0.5s until it changes.
         # Run via shell_managed so the timeout is enforced in C and the poll
         # loop's process group is killed on timeout/ESC (no GNU `timeout` dep).
+        #
+        # The path is single-quoted with Util.shell_q: it comes from the model,
+        # and the old double-quote escaping ran `$(…)` / backticks in it.
+        # The signature is mtime (full resolution where GNU stat has it) +
+        # size, so two writes in the same second still differ. GNU and BSD
+        # stat disagree on flags — GNU `stat -f` is --file-system, which
+        # printed ever-changing free-space counters and fired "changed" in
+        # 0.5s on an untouched file — so pick the flavour once, up front.
         inner =
-            "p=" ++ shell_inner_quote(path) ++ "; " ++
-            "initial=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
-            "while true; do " ++
-            "  current=$(stat -f %m \"$p\" 2>/dev/null || echo missing); " ++
-            "  [ \"$current\" != \"$initial\" ] && echo \"changed: $initial -> $current\" && exit 0; " ++
-            "  sleep 0.5; " ++
+            "p=" ++ Util.shell_q(path) ++ "\n" ++
+            "if stat -c %Y / >/dev/null 2>&1; then " ++
+            "sig() { stat -c '%y %s' \"$p\" 2>/dev/null || echo missing; }; " ++
+            "else sig() { stat -f '%m %z' \"$p\" 2>/dev/null || echo missing; }; fi\n" ++
+            "initial=$(sig)\n" ++
+            "while :; do " ++
+            "current=$(sig); " ++
+            "if [ \"$current\" != \"$initial\" ]; then echo \"changed: $initial -> $current\"; exit 0; fi; " ++
+            "sleep 0.5; " ++
             "done"
         r = run_sh(inner, timeout_n * 1000)
         code = elem(r, 0)
@@ -1998,12 +2018,6 @@ fun resolve_swc() {
         if (string_length(found) > 0) { found }
         else { "../swarmrt/bin/swc" }
     }
-}
-
-# Escape for use INSIDE a double-quoted shell string (bash).
-fun shell_inner_quote(s) {
-    no_dq = string_replace(s, "\"", "\\\"")
-    "\"" ++ no_dq ++ "\""
 }
 
 # Format the parsed results list as a readable string for the model.

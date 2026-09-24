@@ -228,7 +228,10 @@ fun main() {
         t_bash_syntax_error_reaches_model(),
         t_bg_trailing_comment(),
         t_grep_invalid_regex_surfaces(),
-        t_grep_glob_default_path()
+        t_grep_glob_default_path(),
+        t_file_watch_no_injection(),
+        t_file_watch_portable_mtime(),
+        t_wait_timeout_clamped()
     ]
 
     passed = sum_list(results, 0)
@@ -2715,4 +2718,42 @@ fun t_grep_glob_default_path() {
           bool_and3(string_contains(g, "src/tools.sw:1:module Tools"),
                     string_contains(f, "src/ToolExecutor.sw"),
                     if (string_contains(g ++ f, "./src") == 'false') { 'true' } else { 'false' }))
+}
+
+# file_watch spliced the path into `p="…"` with only `"` escaped, so `$(…)`
+# and backticks in a model-supplied path RAN. It also used BSD-only
+# `stat -f %m`; GNU stat prints (changing) filesystem stats instead, so an
+# untouched file "changed" within 0.5s on Linux.
+fun t_file_watch_no_injection() {
+    pwned = "/tmp/swc_fw_PWNED"
+    file_delete(pwned)
+    r = Tools.exec_raw('file_watch', %{path: "/tmp/$(touch " ++ pwned ++ ")x", timeout_sec: 1}, %{})
+    r2 = Tools.exec_raw('file_watch', %{path: "/tmp/`touch " ++ pwned ++ "`y", timeout_sec: 1}, %{})
+    created = file_exists(pwned)
+    file_delete(pwned)
+    check("file_watch: $(…)/backticks in the path are not executed",
+          if (created == 'false') { 'true' } else { 'false' })
+}
+
+fun t_file_watch_portable_mtime() {
+    p = "/tmp/swc_fw_probe.txt"
+    file_write(p, "one\n")
+    quiet = Tools.exec_raw('file_watch', %{path: p, timeout_sec: 2}, %{})
+    # Modify it from a detached shell ~1s after the watch starts.
+    shell("(sleep 1; echo two >> " ++ p ++ ") >/dev/null 2>&1 & true")
+    changed = Tools.exec_raw('file_watch', %{path: p, timeout_sec: 6}, %{})
+    file_delete(p)
+    check("file_watch: an untouched file times out; a real write is detected",
+          bool_and(string_starts_with(quiet, "timeout:"), string_starts_with(changed, "ok: changed")))
+}
+
+# timeout_sec wasn't clamped: 0 meant 600s headless / unlimited on a TTY.
+fun t_wait_timeout_clamped() {
+    t0 = timestamp()
+    r = Tools.exec_raw('file_watch', %{path: "/tmp/swc_fw_never_there", timeout_sec: 0}, %{})
+    el = timestamp() - t0
+    check("log_wait/file_watch: timeout_sec clamped to [1,600] (0 → 1s, huge → 600, junk → 60)",
+          bool_and3(if (Tools.clamp_wait_timeout_s(0) == 1 && Tools.clamp_wait_timeout_s(99999) == 600) { 'true' } else { 'false' },
+                    if (Tools.clamp_wait_timeout_s(nil) == 60 && Tools.clamp_wait_timeout_s("soon") == 60) { 'true' } else { 'false' },
+                    bool_and(string_starts_with(r, "timeout:"), if (el < 5000) { 'true' } else { 'false' })))
 }
