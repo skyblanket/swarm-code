@@ -1059,6 +1059,7 @@ fun t_session_search_reindexes_changed() {
     h4 = SessionSearch.search_at(d, "alphaword", 10)
     file_delete(j)
     file_delete(d ++ "/index.db")
+    exec_argv("rmdir", [d])
     ok = ag_all([
         ag_is(length(h1), 1),
         ag_is(length(h2), 1),
@@ -1081,6 +1082,7 @@ fun t_skill_slug_traversal_blocked() {
     fgt = Skills.forget(slug)
     survived = file_exists(target)
     file_delete(target)
+    exec_argv("rmdir", [d])
     ok = ag_all([
         ag_is(string_contains(rec, "TRAVERSAL-TARGET-CONTENT"), 'false'),
         string_starts_with(rec, "error: invalid skill slug"),
