@@ -71,8 +71,9 @@ fun main() {
 
     # Headless mode: `swarm -p "<prompt>"` runs one task to completion
     # and exits — no TUI, no Reader. `--json` adds a final result line.
-    # The prompt comes from the argument after -p, OR from stdin when
-    # no argument follows (or `-p -`) — so an orchestrator can pipe a
+    # The prompt comes from the argument after -p (or, when a flag follows
+    # -p, the first positional argument: `-p --json "..."`), OR from stdin
+    # when there is none (or `-p -`) — so an orchestrator can pipe a
     # multi-line prompt without shell-quoting it as an argument.
     cli_args = os_args()
     p_present = if (has_flag(cli_args, "-p") == 'true') { 'true' }
@@ -346,27 +347,72 @@ fun has_flag(args, flag) {
     else { has_flag(tl(args), flag) }}
 }
 
-# Value of the -p / --print flag — the inline headless prompt — or
-# nil. nil means either the flag is absent OR it's present with no
-# inline prompt (a flag-looking next arg, or nothing), in which case
-# the caller reads the prompt from stdin instead.
+# Value of the -p / --print flag — the inline headless prompt — or nil
+# (absent, or read the prompt from stdin):
+#   -p "prompt"            that argument — even when it starts with "-"
+#                          ("-- summarize the diff", "-x ..."): Scheduler and
+#                          Flows pass user prompts right after -p
+#   -p -                   stdin
+#   -p --json "prompt"     a KNOWN flag right after -p: the first positional
+#                          argument after it is the prompt (README's form)
+#   -p  /  -p --json       no positional argument: stdin
+# Only an exact "-" or a known flag is "not the prompt"; any other leading
+# "-" used to switch to stdin, so `-p --json "..."` sent nothing and exited 1
+# and a prompt starting with "-" was silently dropped.
 fun get_print_arg(args) {
-    if (length(args) == 0) { nil }
+    idx = print_arg_index(args)
+    if (idx < 0) { nil } else { list_nth(args, idx) }
+}
+
+# argv index of the inline -p prompt, or -1.
+fun print_arg_index(args) { pai_find(args, 0) }
+
+fun pai_find(args, i) {
+    if (length(args) == 0) { 0 - 1 }
     else {
         h = hd(args)
-        if (h == "-p" || h == "--print") {
-            rest = tl(args)
-            if (length(rest) == 0) { nil }
-            else {
-                cand = hd(rest)
-                # A flag-looking next arg (`--json`, `-`) is not the
-                # prompt — that's stdin mode.
-                if (string_starts_with(cand, "-") == 'true') { nil } else { cand }
-            }
-        } else {
-            get_print_arg(tl(args))
-        }
+        if (h == "-p" || h == "--print") { pai_after(tl(args), i + 1) }
+        else { pai_find(tl(args), i + 1) }
     }
+}
+
+# args: what follows -p; i: argv index of hd(args).
+fun pai_after(args, i) {
+    if (length(args) == 0) { 0 - 1 }
+    else {
+        cand = hd(args)
+        if (cand == "-") { 0 - 1 }
+        else { if (is_cli_flag(cand) == 'true') { first_positional(args, i) }
+        else { i } }
+    }
+}
+
+fun first_positional(args, i) {
+    if (length(args) == 0) { 0 - 1 }
+    else {
+        a = hd(args)
+        if (a == "-") { 0 - 1 }
+        else { if (is_cli_flag(a) == 'true') {
+            if (flag_takes_value(a) == 'true' && length(tl(args)) > 0) { first_positional(tl(tl(args)), i + 2) }
+            else { first_positional(tl(args), i + 1) }
+        } else { i } }
+    }
+}
+
+# Every flag main() understands — never mistaken for a prompt or a profile.
+fun is_cli_flag(a) {
+    if (a == "--json" || a == "--no-resume" || a == "-p" || a == "--print") { 'true' }
+    else { if (a == "--profile" || a == "-P" || a == "--mcp-server" || a == "--print-config") { 'true' }
+    else { if (a == "--help" || a == "-h" || a == "--version" || a == "-V" || a == "--doctor") { 'true' }
+    else { 'false' } } }
+}
+
+fun flag_takes_value(a) {
+    if (a == "--profile" || a == "-P") { 'true' } else { 'false' }
+}
+
+fun list_nth(lst, i) {
+    if (i <= 0) { hd(lst) } else { list_nth(tl(lst), i - 1) }
 }
 
 # Slurp all of stdin into one string (newline-joined). Used for the
@@ -412,6 +458,7 @@ fun print_usage() {
     print("  swarm -p \"<prompt>\"     run one task headless, then exit")
     print("  swarm -p \"...\" --json   headless + a final JSON result line")
     print("  swarm -p \"...\" --no-resume   start fresh, ignore .active session")
+    print("  swarm -p - < prompt.txt       read the headless prompt from stdin")
     print("  swarm doctor           validate config, endpoint, dirs, version")
     print("  swarm --mcp-server     start as a stdio MCP tool server (JSON-RPC 2.0)")
     print("  swarm --help, -h       show this help and exit")
@@ -659,30 +706,29 @@ fun resolve_profile_name(args, profiles) {
     else { if (profiles == nil) { nil }
     else {
         rest = if (length(args) == 0) { args } else { tl(args) }
-        find_positional_profile(rest, profiles)
+        find_positional_profile(rest, 1, print_arg_index(args), profiles)
     }}
 }
 
-fun find_positional_profile(args, profiles) {
+# i: argv index of hd(args). The -p prompt (prompt_idx, the SAME argument
+# get_print_arg returns — `-p --json gemma` means prompt "gemma") and the
+# values of --profile / -P are skipped; anything else starting with "-" is a
+# flag.
+fun find_positional_profile(args, i, prompt_idx, profiles) {
     if (length(args) == 0) { nil }
     else {
         a = hd(args)
-        if (string_starts_with(a, "-") == 'true') {
-            rest = tl(args)
-            value_taking = if (a == "-p") { 'true' }
-                           else { if (a == "--print") { 'true' }
-                           else { if (a == "--profile") { 'true' }
-                           else { if (a == "-P") { 'true' }
-                           else { if (a == "--mcp-server") { 'false' }
-                           else { 'false' }}}}}
-            if (value_taking == 'true' && length(rest) > 0) {
-                find_positional_profile(tl(rest), profiles)
+        rest = tl(args)
+        if (i == prompt_idx) { find_positional_profile(rest, i + 1, prompt_idx, profiles) }
+        else { if (string_starts_with(a, "-") == 'true') {
+            if (flag_takes_value(a) == 'true' && length(rest) > 0) {
+                find_positional_profile(tl(rest), i + 2, prompt_idx, profiles)
             } else {
-                find_positional_profile(rest, profiles)
+                find_positional_profile(rest, i + 1, prompt_idx, profiles)
             }
         } else {
             if (lookup_string_key(profiles, a) != nil) { a } else { nil }
-        }
+        }}
     }
 }
 

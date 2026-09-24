@@ -30,6 +30,7 @@
 #   T18 fatal 4xx           — completed tool pairs survive; context overflow retries once
 #   T19 escapes round-trip  — "<div>" / "\u003c" in args and prose, native + inband
 #   T20 profile override    — env beats a stale override; kwargs kept; /model keeps profile
+#   T21 -p prompt parsing   — -p --json "x", either order, "-x"/"-- x" prompts, stdin
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -103,7 +104,8 @@ new_case() {
 # 90s watchdog (LLM retry backoff can stack up on a broken path).
 # Captures stdout/stderr into $CASE, sets RC. RUN_ENV="VAR=val ..." adds or
 # overrides environment variables for this one run; RUN_UNSET="VAR ..."
-# removes defaults (e.g. SWARM_CODE_MODEL, to exercise settings/overrides).
+# removes defaults (e.g. SWARM_CODE_MODEL, to exercise settings/overrides);
+# RUN_STDIN=file feeds stdin (default /dev/null).
 run_swarm() {
     (
         cd "$WORK" || exit 97
@@ -119,7 +121,7 @@ run_swarm() {
         if [ -n "${RUN_ENV:-}" ]; then export $RUN_ENV; fi
         # shellcheck disable=SC2086
         if [ -n "${RUN_UNSET:-}" ]; then unset $RUN_UNSET; fi
-        "$BIN" "$@" </dev/null >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
+        "$BIN" "$@" <"${RUN_STDIN:-/dev/null}" >"$CASE/stdout.txt" 2>"$CASE/stderr.txt"
     ) &
     local pid=$!
     ( sleep 90; kill -9 "$pid" 2>/dev/null ) &
@@ -878,11 +880,48 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T21 — the -p prompt: README's `-p --json "prompt"` (a flag right after
+#       -p used to mean "read stdin" — 0 requests, exit 1), either flag
+#       order, prompts that START with "-" (Scheduler/Flows pass user text
+#       right after -p; "-- summarize…" was dropped), and stdin via `-p -`
+#       or no positional argument.
+# ------------------------------------------------------------
+t21() {
+    new_case t21
+    python3 - "$CASE/scenario.json" <<'PYEOF'
+import json, sys
+json.dump({"responses": [{"type": "text", "content": "OK_T21_%d" % i} for i in range(6)]},
+          open(sys.argv[1], "w"))
+PYEOF
+    printf 't21 from stdin\n' >"$CASE/stdin1.txt"
+    printf 't21 stdin fallback\n' >"$CASE/stdin2.txt"
+    start_mock "$CASE/scenario.json" || { fail T21 "mock failed to start"; return; }
+    local n=0 why=""
+    t21_case() {  # <want-prompt> <args...>
+        local want="$1"; shift
+        run_swarm "$@"
+        if [ "$RC" -ne 0 ]; then why="[$*] exit $RC"; return 1; fi
+        if ! req_has "$n" "$want"; then why="[$*] request $n lacks prompt '$want'"; return 1; fi
+        if ! grep -q "OK_T21_$n" "$CASE/stdout.txt"; then why="[$*] stdout lacks the answer"; return 1; fi
+        n=$((n + 1))
+    }
+    t21_case "t21 list the test files" -p --json "t21 list the test files" --no-resume &&
+    t21_case "t21 other order" --no-resume --json -p "t21 other order" &&
+    t21_case "-- summarize the diff t21" --no-resume -p "-- summarize the diff t21" &&
+    t21_case "-x t21 dash prompt" -p "-x t21 dash prompt" --json --no-resume &&
+    RUN_STDIN="$CASE/stdin1.txt" t21_case "t21 from stdin" --no-resume -p - --json &&
+    RUN_STDIN="$CASE/stdin2.txt" t21_case "t21 stdin fallback" -p --json --no-resume
+    local ok=$?
+    cleanup
+    if [ "$ok" -ne 0 ]; then fail T21 "$why"; else pass T21; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"
