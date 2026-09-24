@@ -935,6 +935,11 @@ fun run_doctor() {
     api_key = map_get(opts, 'api_key')
     print("   ✓ model:    " ++ model)
     print("   ✓ endpoint: " ++ endpoint)
+    if (Config.endpoint_refusal(endpoint) != nil) {
+        print("   ⚠ endpoint is not on the local network — swarm-code will refuse to start")
+        print("     unless SWARM_CODE_ALLOW_REMOTE=1 (an API key alone is not enough)")
+        warnings = warnings + 1
+    }
     if (api_key == nil || string_length(to_string(api_key)) == 0) {
         print("   ⚠ api_key:  (not set — fine for local endpoints, fatal for remote)")
         warnings = warnings + 1
