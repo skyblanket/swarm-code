@@ -1,6 +1,7 @@
 module Browser
 
 import UI
+import PathGuard
 
 # ============================================================
 # Browser — CDP-over-WebSocket browser control, no Node, no Python
@@ -394,6 +395,13 @@ fun interpret_eval_result(result, label) {
 # ------------------------------------------------------------
 fun screenshot(session, path, opts) {
     p = to_string(path)
+    # Same write policy as write/edit: a screenshot must not land on a
+    # credential path or swarm-code's own control files.
+    guard = PathGuard.validate_write(p)
+    if (guard != "ok") { guard } else { screenshot_to(session, p, opts) }
+}
+
+fun screenshot_to(session, p, opts) {
     result = cdp_call_pg(session, "Page.captureScreenshot", %{format: "png"}, 30000, "browser_screenshot", opts)
     if (result == nil) { "error: screenshot failed (capture timed out or browser unresponsive)" }
     else { if (string_starts_with(to_string(result), "error:") == 'true') { result }

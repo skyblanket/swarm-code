@@ -1055,11 +1055,12 @@ fun slash_dispatch(cmd, history, opts) {
         } else {
             expr = hd(parsed)
             prompt = hd(tl(parsed))
-            id = Scheduler.add(expr, prompt)
-            if (id == nil) {
-                print(UI.warn_text("invalid EXPR — try 30s, 5m, 2h, 1d, hourly, daily 09:00"))
+            r = Scheduler.add_checked(expr, prompt)
+            if (elem(r, 0) != 'ok') {
+                print(UI.warn_text(to_string(elem(r, 1)) ++
+                      " — EXPR is 30s, 5m, 2h, 1d, hourly or daily HH:MM"))
             } else {
-                print(UI.brand_color() ++ "✓ scheduled job " ++ id ++
+                print(UI.brand_color() ++ "✓ scheduled job " ++ to_string(elem(r, 1)) ++
                       " (" ++ expr ++ "): " ++ prompt ++ UI.reset())
             }
         }

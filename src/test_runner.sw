@@ -46,6 +46,7 @@ import Hooks
 import ToolSchemas
 import Util
 import Prompts
+import Browser
 
 fun main() {
     print("")
@@ -320,7 +321,9 @@ fun main() {
         t_override_env_beats_stale_override(),
         t_profile_override_keeps_chat_template_kwargs(),
         t_model_override_keeps_active_profile(),
-        t_system_prompt_follows_wire_format()
+        t_system_prompt_follows_wire_format(),
+        # --- browser_screenshot goes through the write guard ---
+        t_browser_screenshot_path_guard()
     ]
 
     passed = sum_list(results, 0)
@@ -4226,4 +4229,15 @@ fun t_system_prompt_follows_wire_format() {
                             bool_not(string_contains(as_inband, "=== TOOL USE ==="))),
                    bool_and(string_contains(as_native, "=== TOOL USE ==="),
                             bool_not(string_contains(as_native, "TOOL-CALLING PROTOCOL")))))
+}
+
+# browser_screenshot wrote wherever the model pointed it, around PathGuard.
+# The guard runs before any browser call, so no browser is needed here.
+fun t_browser_screenshot_path_guard() {
+    home = getenv("HOME")
+    r1 = Browser.screenshot(nil, home ++ "/.ssh/shot.png", %{})
+    r2 = Browser.screenshot(nil, home ++ "/.swarm-code/hooks/pre_tool.sh", %{})
+    check("browser_screenshot: refuses protected paths (.ssh, swarm-code hooks)",
+          bool_and(string_contains(to_string(r1), "sensitive path blocked"),
+                   string_contains(to_string(r2), "blocked")))
 }
