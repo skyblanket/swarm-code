@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `model`, `max_tokens`, `vision`, `chat_template_kwargs`, `llm_timeout_ms`
   and *tighten* `permissions`; hooks, `mcpServers`, `endpoint`, `api_key`,
   `providers`, `profiles` and `fallback_profile` in it are ignored with a
-  one-line notice. Opt a repo in with `"trusted_projects": ["/abs/path"]` in
-  `~/.swarm-code/settings.json`.
+  one-line notice. Opt a repo in with `swarm-code trust` (or `/trust`), which
+  adds it to `"trusted_projects"` in `~/.swarm-code/settings.json`;
+  `swarm-code untrust` and `swarm-code trust --list` manage the list.
 - **Network gate parses URLs properly and covers every LLM dial.** Userinfo
   (`http://127.0.0.1@host`), uppercase schemes, name-prefix and numeric-IP
   tricks no longer pass, and fallback / `providers` / `/profile` override

@@ -323,7 +323,11 @@ fun main() {
         t_model_override_keeps_active_profile(),
         t_system_prompt_follows_wire_format(),
         # --- browser_screenshot goes through the write guard ---
-        t_browser_screenshot_path_guard()
+        t_browser_screenshot_path_guard(),
+        # --- swarm-code trust ---
+        t_trust_edits_settings(),
+        t_trust_refuses_corrupt_settings(),
+        t_json_pretty_round_trips()
     ]
 
     passed = sum_list(results, 0)
@@ -4240,4 +4244,47 @@ fun t_browser_screenshot_path_guard() {
     check("browser_screenshot: refuses protected paths (.ssh, swarm-code hooks)",
           bool_and(string_contains(to_string(r1), "sensitive path blocked"),
                    string_contains(to_string(r2), "blocked")))
+}
+
+# `swarm-code trust` adds the resolved directory to trusted_projects once,
+# keeps every other key, and `untrust` removes it.
+fun t_trust_edits_settings() {
+    d = "/tmp/swc_trust_" ++ to_string(random_int(1, 1000000000))
+    file_mkdir(d)
+    sp = d ++ "/settings.json"
+    file_write(sp, "{\"endpoint\": \"http://127.0.0.1:8000\", \"permissions\": {\"bash\": \"ask\"}}")
+    r1 = Config.set_trusted_at(sp, d, 'true')
+    r2 = Config.set_trusted_at(sp, d ++ "/", 'true')
+    after_add = json_decode(file_read(sp))
+    r3 = Config.set_trusted_at(sp, d, 'false')
+    after_rm = json_decode(file_read(sp))
+    shell("rm -rf " ++ Util.shell_q(d))
+    tp = map_get(after_add, 'trusted_projects')
+    check("trust: adds the dir once (keeps other keys), untrust removes it",
+          sec_all([eqs(elem(r1, 0), 'ok'), eqs(elem(r1, 2), 'true'), eqs(elem(r2, 2), 'false'),
+                   eqs(length(tp), 1), eqs(hd(tp), elem(r1, 1)),
+                   eqs(map_get(after_add, 'endpoint'), "http://127.0.0.1:8000"),
+                   eqs(map_get(map_get(after_add, 'permissions'), 'bash'), "ask"),
+                   eqs(elem(r3, 2), 'true'), eqs(length(map_get(after_rm, 'trusted_projects')), 0)]))
+}
+
+fun t_trust_refuses_corrupt_settings() {
+    d = "/tmp/swc_trust_bad_" ++ to_string(random_int(1, 1000000000))
+    file_mkdir(d)
+    sp = d ++ "/settings.json"
+    file_write(sp, "{broken")
+    r = Config.set_trusted_at(sp, d, 'true')
+    kept = file_read(sp)
+    missing = Config.set_trusted_at(sp, d ++ "/no/such/dir", 'true')
+    shell("rm -rf " ++ Util.shell_q(d))
+    check("trust: never overwrites an unparseable settings.json; missing dir is an error",
+          sec_all([eqs(elem(r, 0), 'error'), eqs(kept, "{broken"), eqs(elem(missing, 0), 'error')]))
+}
+
+fun t_json_pretty_round_trips() {
+    v = json_decode("{\"a\": 1, \"b\": [true, null, \"x\\\"y\"], \"c\": {}, \"d\": []}")
+    out = Util.json_pretty(v)
+    check("json_pretty: indented, parses back to the same value",
+          bool_and(string_contains(out, "\n  \"b\": [\n    true,"),
+                   eqs(json_encode(json_decode(out)), json_encode(v))))
 }

@@ -1220,6 +1220,10 @@ fun slash_dispatch(cmd, history, opts) {
         handle_bg_command(cmd, opts)
         history
     }
+    else { if (cmd == "/trust" || cmd == "/untrust") {
+        slash_trust(cmd, opts)
+        history
+    }
     else { if (cmd == "/mode") {
         nxt = cycle_mode(opts)
         print(UI.brand_color() ++ "✓ mode: " ++ nxt ++ UI.reset())
@@ -1243,7 +1247,26 @@ fun slash_dispatch(cmd, history, opts) {
     else {
         print(UI.warn_text("unknown command: " ++ cmd) ++ "  (type /help)")
         history
-    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+}
+
+# /trust, /untrust — the REPL form of `swarm-code trust` for the session's
+# directory. Settings are read at launch, so it takes effect next start.
+fun slash_trust(cmd, opts) {
+    add = if (cmd == "/trust") { 'true' } else { 'false' }
+    dir = to_string(map_get(opts, 'cwd'))
+    r = Config.set_trusted(dir, add)
+    if (elem(r, 0) != 'ok') { print(UI.warn_text(to_string(elem(r, 1)))) }
+    else {
+        verb = if (add == 'true') { "trusted " } else { "untrusted " }
+        state = if (elem(r, 2) == 'true') { verb } else {
+            if (add == 'true') { "already trusted: " } else { "not trusted: " } }
+        print(UI.brand_color() ++ "✓ " ++ state ++ to_string(elem(r, 1)) ++ UI.reset())
+        if (elem(r, 2) == 'true') {
+            print(UI.grey_text() ++ "  restart swarm-code to load this repo's .swarm-code.json " ++
+                  (if (add == 'true') { "in full" } else { "with only its safe keys" }) ++ UI.reset())
+        } else { 'ok' }
+    }
 }
 
 # /expand — reprint the most recent tool result in full (uncapped),
@@ -1292,6 +1315,7 @@ fun show_help() {
     print("  /bg [tail|kill] [id]  list / tail / kill background tasks")
     print("  /expand               reprint the last tool result in full")
     print("  /mode                 cycle permission mode (default → auto-accept-edits → plan)")
+    print("  /trust, /untrust      let this repo's .swarm-code.json apply in full (next launch)")
     print("  /clear                clear screen")
     print("  /reset                clear conversation history")
     print("  /compact              summarize history to save context")
@@ -3828,8 +3852,10 @@ fun is_known_slash_command(cmd) {
     else { if (cmd == "/flows") { 'true' }
     else { if (cmd == "/bg") { 'true' }
     else { if (cmd == "/mode") { 'true' }
+    else { if (cmd == "/trust") { 'true' }
+    else { if (cmd == "/untrust") { 'true' }
     else { if (cmd == "/expand") { 'true' }
-    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    else { 'false' }}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # (preview_string and string_to_atom moved earlier — see below)

@@ -49,6 +49,7 @@
 #   T26 escapes round-trip  — "<div>" / "\u003c" in args and prose, native + inband
 #   T27 profile override    — env beats a stale override; kwargs kept; /model keeps profile
 #   T28 -p prompt parsing   — -p --json "x", either order, "-x"/"-- x" prompts, stdin
+#   T29 swarm-code trust    — the notice names it; after it, the repo's hook runs
 #
 # `run.sh t4 t11` or INTEG_ONLY="t4 t11" runs just those tests (default: all).
 #
@@ -1291,6 +1292,37 @@ PYEOF
 
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+# T29 — `swarm-code trust`: an untrusted repo's hook doesn't run and the
+#       notice names the command; after `swarm-code trust` in that
+#       directory the same file applies in full (the hook runs).
+# ------------------------------------------------------------
+t29() {
+    new_case t29
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [{"type": "text", "content": "TRUST_T29_A"},
+               {"type": "text", "content": "TRUST_T29_B"}]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T29 "mock failed to start"; return; }
+    cat >"$WORK/.swarm-code.json" <<EOF
+{"hooks": {"SessionStart": [{"command": "touch $WORK/HOOK_RAN"}]}}
+EOF
+    run_swarm -p "t29 untrusted" --no-resume --json
+    if [ -e "$WORK/HOOK_RAN" ]; then cleanup; fail T29 "untrusted hook ran"; return; fi
+    if ! grep -q "swarm-code trust" "$CASE/stderr.txt"; then
+        cleanup; fail T29 "notice does not point at swarm-code trust"; return
+    fi
+    ( cd "$WORK" && HOME="$CASE_HOME" "$BIN" trust >"$CASE/trust.txt" 2>&1 )
+    if ! grep -q "^trusted " "$CASE/trust.txt"; then
+        cleanup; fail T29 "swarm-code trust failed: $(head -c 200 "$CASE/trust.txt")"; return
+    fi
+    run_swarm -p "t29 trusted" --no-resume --json
+    cleanup
+    if [ ! -e "$WORK/HOOK_RAN" ]; then fail T29 "trusted repo's hook did not run"
+    elif ! final_json | grep -q "TRUST_T29_B"; then fail T29 "second run failed: $(final_json)"
+    else pass T29; fi
+}
+
 # Multi-agent / MCP / scheduler / persistence cases (A1..).
 . "$ROOT/tests/integration/agents_cases.sh"
 
@@ -1298,7 +1330,7 @@ echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t4 t11` (or INTEG_ONLY="t4 t11") runs just those cases; no
 # arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 agents_cases"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 agents_cases"
 for t in ${*:-${INTEG_ONLY:-$ALL_TESTS}}; do "$t"; done
 
 echo "----------------------------------------"

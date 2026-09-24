@@ -32,7 +32,10 @@ backported.
   set harmless keys (`model`, `max_tokens`, …) and *tighten* permissions. Its
   hooks, MCP servers, endpoint / API key / providers / profiles, and any
   permission loosening are ignored (with a notice) unless the directory is
-  listed under `trusted_projects` in `~/.swarm-code/settings.json`.
+  listed under `trusted_projects` in `~/.swarm-code/settings.json` —
+  `swarm-code trust` (or `/trust`) adds the current directory for you.
+  Trust only repos you control: a trusted repo's hooks and MCP servers run
+  commands on your machine.
 - **Single policy boundary.** Every tool call — from the main agent, subagents,
   the council, and the MCP server — passes through `ToolExecutor`: context
   allow-lists, argument-rewriting hooks, guardrails, and permissions are applied

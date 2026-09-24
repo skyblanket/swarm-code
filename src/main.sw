@@ -452,7 +452,55 @@ fun handle_cli_flags(args) {
               has_flag(args, "--doctor") == 'true') {
         sys_exit(run_doctor())
     }
-    else { "ok" }}}}
+    else { if (subcommand(args) == "trust" || subcommand(args) == "untrust") {
+        sys_exit(run_trust(subcommand(args), tl(tl(args))))
+    }
+    else { "ok" }}}}}
+}
+
+# First argument after the program name, or nil.
+fun subcommand(args) {
+    if (length(args) < 2) { nil } else { list_nth(args, 1) }
+}
+
+# swarm-code trust [DIR] | untrust [DIR] | trust --list
+# A repo's ./.swarm-code.json only applies its safe keys (model,
+# max_tokens, …) until its directory is listed in "trusted_projects" in
+# ~/.swarm-code/settings.json. This edits that list for the user.
+fun run_trust(cmd, rest) {
+    if (cmd == "trust" && length(rest) > 0 && hd(rest) == "--list") {
+        tp = Config.trusted_list()
+        if (length(tp) == 0) { print("no trusted projects") } else { print_lines(tp) }
+        0
+    } else {
+        dir = if (length(rest) > 0) { hd(rest) } else { "." }
+        add = if (cmd == "trust") { 'true' } else { 'false' }
+        r = Config.set_trusted(dir, add)
+        if (elem(r, 0) != 'ok') {
+            print("swarm-code " ++ cmd ++ ": " ++ to_string(elem(r, 1)))
+            1
+        } else {
+            abs = elem(r, 1)
+            changed = elem(r, 2)
+            if (add == 'true') {
+                if (changed == 'true') { print("trusted " ++ abs) } else { print("already trusted: " ++ abs) }
+                gated = Config.project_gated_keys(abs)
+                if (gated == nil) {
+                    print("  (no .swarm-code.json there yet — one added later applies in full)")
+                } else { if (length(gated) > 0) {
+                    print("  its .swarm-code.json now also applies: " ++ Config.join_names(gated, "") ++
+                          " — hooks and MCP servers run commands, so only trust repos you control")
+                } else { "" } }
+            } else {
+                if (changed == 'true') { print("untrusted " ++ abs) } else { print("not trusted: " ++ abs) }
+            }
+            0
+        }
+    }
+}
+
+fun print_lines(xs) {
+    if (length(xs) == 0) { 'ok' } else { print(to_string(hd(xs))) ; print_lines(tl(xs)) }
 }
 
 fun print_usage() {
@@ -467,6 +515,8 @@ fun print_usage() {
     print("  swarm -p \"...\" --no-resume   start fresh, ignore .active session")
     print("  swarm -p - < prompt.txt       read the headless prompt from stdin")
     print("  swarm doctor           validate config, endpoint, dirs, version")
+    print("  swarm trust [DIR]      let DIR's .swarm-code.json apply in full (hooks, endpoint, MCP);")
+    print("                         untrust [DIR] reverses it, trust --list shows the list")
     print("  swarm --mcp-server     start as a stdio MCP tool server (JSON-RPC 2.0)")
     print("  swarm --help, -h       show this help and exit")
     print("  swarm --version, -V    print the version and exit")

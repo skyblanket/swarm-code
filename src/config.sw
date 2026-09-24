@@ -41,6 +41,7 @@ import Hooks
 
 export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
         llm_timeout_ms, project_scope, project_ignored_keys, is_trusted_dir, project_notice,
+        set_trusted, set_trusted_at, trusted_list, project_gated_keys, join_names,
         endpoint_host, is_local_endpoint, endpoint_refusal,
         command_of, command_risk, denial_message, denial_reason, uses_sudo,
         run_hooks_verdict]
@@ -239,6 +240,81 @@ fun strip_trailing_slash(s) {
     } else { s }
 }
 
+# ------------------------------------------------------------
+# swarm-code trust / untrust — edit "trusted_projects" for the user.
+# ------------------------------------------------------------
+# set_trusted_at(settings_path, dir, add) → {'ok', abs_dir, changed} |
+# {'error', message}. `dir` is resolved to an absolute path (cd + pwd, so
+# symlinks and relative paths work); add='true' appends it once,
+# add='false' removes every matching entry. Every other key in the file
+# is kept, and a settings.json that doesn't parse as an object is never
+# overwritten (the user would lose it) — the error says to fix it first.
+fun set_trusted_at(settings_path, dir, add) {
+    r = shell("cd " ++ Util.shell_q(to_string(dir)) ++ " 2>/dev/null && pwd")
+    abs = string_trim(to_string(elem(r, 1)))
+    if (elem(r, 0) != 0 || string_length(abs) == 0) {
+        {'error', "no such directory: " ++ to_string(dir)}
+    } else {
+        raw = if (file_exists(settings_path) == 'true') { file_read(settings_path) } else { nil }
+        decoded = if (raw == nil || string_length(string_trim(raw)) == 0) { map_new() } else { json_decode(raw) }
+        if (decoded == nil || is_map(decoded) != 'true') {
+            {'error', settings_path ++ " is not a valid JSON object — fix it by hand first " ++
+                      "(swarm-code won't overwrite it)"}
+        } else {
+            cur = map_get(decoded, 'trusted_projects')
+            tp = if (cur != nil && is_list(cur) == 'true') { cur } else { [] }
+            had = is_trusted_dir(tp, [abs])
+            next = if (add == 'true') {
+                if (had == 'true') { tp } else { list_append(tp, abs) }
+            } else { drop_dir(tp, abs, []) }
+            changed = if (add == 'true') { bool_not_str(had) } else { had }
+            if (changed == 'false') { {'ok', abs, 'false'} }
+            else {
+                file_mkdir(dirname_of(settings_path))
+                rc = file_atomic_write(settings_path, Util.json_pretty(map_put(decoded, 'trusted_projects', next)))
+                if (rc == 'ok') { {'ok', abs, 'true'} }
+                else { {'error', "could not write " ++ settings_path} }
+            }
+        }
+    }
+}
+
+fun set_trusted(dir, add) { set_trusted_at(user_settings_path(), dir, add) }
+
+fun trusted_list() {
+    tp = map_get(load_one(user_settings_path()), 'trusted_projects')
+    if (tp != nil && is_list(tp) == 'true') { tp } else { [] }
+}
+
+fun drop_dir(tp, abs, acc) {
+    if (length(tp) == 0) { acc }
+    else {
+        t = strip_trailing_slash(string_trim(to_string(hd(tp))))
+        next = if (t == abs) { acc } else { list_append(acc, hd(tp)) }
+        drop_dir(tl(tp), abs, next)
+    }
+}
+
+fun bool_not_str(b) { if (b == 'true') { 'false' } else { 'true' } }
+
+fun dirname_of(p) {
+    i = last_slash(p, string_length(p) - 1)
+    if (i <= 0) { "/" } else { string_sub(p, 0, i) }
+}
+
+fun last_slash(p, i) {
+    if (i < 0) { 0 - 1 }
+    else { if (string_sub(p, i, 1) == "/") { i } else { last_slash(p, i - 1) } }
+}
+
+# The keys a directory's .swarm-code.json sets that only apply once it is
+# trusted — shown by `swarm-code trust` so the user sees what they grant.
+fun project_gated_keys(dir) {
+    project = load_one(to_string(dir) ++ "/.swarm-code.json")
+    if (map_size(project) == 0) { nil }
+    else { project_ignored_keys(map_new(), project) }
+}
+
 # One-line notice naming what an untrusted ./.swarm-code.json tried to
 # set, or nil when nothing was dropped. main prints it once at startup.
 fun project_notice() {
@@ -252,8 +328,8 @@ fun project_notice() {
             if (length(ignored) == 0) { nil }
             else {
                 "./.swarm-code.json: ignored untrusted project settings (" ++
-                join_names(ignored, "") ++ ") — to trust this repo, add its path to " ++
-                "\"trusted_projects\" in ~/.swarm-code/settings.json"
+                join_names(ignored, "") ++ ") — if you trust this repo, run " ++
+                "`swarm-code trust` here (or /trust) and restart"
             }
         }
     }

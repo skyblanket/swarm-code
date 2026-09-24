@@ -9,7 +9,7 @@ module Util
 # Agent/Config/Tools). Keeping these here means a bug fix lands
 # once, not 8 times.
 
-export [shell_q, noninteractive_wrap, no_stdin, join_all, json_args_well_formed]
+export [shell_q, noninteractive_wrap, no_stdin, join_all, json_args_well_formed, json_pretty]
 
 # POSIX-safe single-quote wrap. Replaces `'` with `'\''` (close,
 # escape, reopen) so the result is always safe to splice into a
@@ -162,5 +162,39 @@ fun jwf_scan(p, i, n, stack, started, done) {
         } else {
             jwf_scan(p, i + 1, n, stack, started, done)
         }}}}}
+    }
+}
+
+# ------------------------------------------------------------
+# Indented JSON for files people also edit by hand (settings.json).
+# json_encode writes one line; this keeps the file readable after
+# swarm-code rewrites it. Map key order is preserved.
+# ------------------------------------------------------------
+fun json_pretty(v) { jp_val(v, "") ++ "\n" }
+
+fun jp_val(v, ind) {
+    if (is_map(v) == 'true') {
+        if (map_size(v) == 0) { "{}" }
+        else { "{\n" ++ jp_members(map_keys(v), map_values(v), ind ++ "  ", "") ++ "\n" ++ ind ++ "}" }
+    } else { if (is_list(v) == 'true') {
+        if (length(v) == 0) { "[]" }
+        else { "[\n" ++ jp_items(v, ind ++ "  ", "") ++ "\n" ++ ind ++ "]" }
+    } else { json_encode(v) } }
+}
+
+fun jp_members(keys, vals, ind, acc) {
+    if (length(keys) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { ",\n" }
+        m = ind ++ json_encode(to_string(hd(keys))) ++ ": " ++ jp_val(hd(vals), ind)
+        jp_members(tl(keys), tl(vals), ind, acc ++ sep ++ m)
+    }
+}
+
+fun jp_items(items, ind, acc) {
+    if (length(items) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { ",\n" }
+        jp_items(tl(items), ind, acc ++ sep ++ ind ++ jp_val(hd(items), ind))
     }
 }
