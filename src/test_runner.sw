@@ -221,7 +221,12 @@ fun main() {
         t_read_js_is_text(),
         t_read_line_count_and_empty(),
         t_read_missing_and_binary(),
-        t_edit_crlf_file()
+        t_edit_crlf_file(),
+        # --- tool-layer review fixes ---
+        t_bash_trailing_comment(),
+        t_bash_heredoc_last(),
+        t_bash_syntax_error_reaches_model(),
+        t_bg_trailing_comment()
     ]
 
     passed = sum_list(results, 0)
@@ -2636,4 +2641,57 @@ fun t_edit_crlf_file() {
     check("edit: LF old_string matches a CRLF file and writes CRLF",
           bool_and(string_starts_with(r, "ok:"),
                    if (aft == "ONE\r\nTWO\r\nthree\r\n") { 'true' } else { 'false' }))
+}
+
+# ------------------------------------------------------------
+# Tool-layer review fixes
+# ------------------------------------------------------------
+
+# bash wrapped the command as `( export …; CMD ) </dev/null 2>&1`, so a
+# trailing `# comment` commented out the closing paren (and a final heredoc
+# terminator became `EOF ) </dev/null…`): sh saw a syntax error, the tool
+# returned `[exit 2]` with EMPTY output, and the error went to the agent's
+# own stderr instead of the model.
+fun t_bash_trailing_comment() {
+    r = Tools.exec_raw('bash', %{command: "echo hi-comment # say hi"}, %{})
+    check("bash: a trailing # comment doesn't break the wrapper",
+          bool_and(string_starts_with(r, "[exit 0]"), string_contains(r, "hi-comment")))
+}
+
+fun t_bash_heredoc_last() {
+    dir = "/tmp/swc_bash_heredoc"
+    shell("rm -rf " ++ dir ++ "; mkdir -p " ++ dir)
+    cmd = "cat > " ++ dir ++ "/app.py <<'EOF'\nprint(1)\nEOF"
+    r = Tools.exec_raw('bash', %{command: cmd}, %{})
+    body = file_read(dir ++ "/app.py")
+    shell("rm -rf " ++ dir)
+    check("bash: a command ending in a heredoc terminator runs",
+          bool_and(string_starts_with(r, "[exit 0]"),
+                   if (body == "print(1)\n") { 'true' } else { 'false' }))
+}
+
+# The model must SEE a shell syntax error — it used to land on the agent's
+# stderr, leaving the model with a bare `[exit 2]`.
+fun t_bash_syntax_error_reaches_model() {
+    r = Tools.exec_raw('bash', %{command: "echo \"unterminated"}, %{})
+    low = string_lower(r)
+    check("bash: a sh syntax error message reaches the model",
+          bool_and(if (string_starts_with(r, "[exit 0]") == 'false') { 'true' } else { 'false' },
+                   if (string_contains(low, "syntax error") == 'true' ||
+                       string_contains(low, "unexpected") == 'true') { 'true' } else { 'false' }))
+}
+
+# The auto-background path (interactive sessions) and the `background` tool
+# run the same wrapped script, so a trailing comment works there too.
+fun t_bg_trailing_comment() {
+    table = Background.init()
+    r = Tools.exec_raw('bash', %{command: "echo bg-comment-ok # note"}, bg_opts(table))
+    r2 = Tools.exec_raw('background', %{command: "echo bgtool-ok # note"}, %{bg_table: table})
+    id2 = "bg-1"
+    st2 = Background.wait_for_task(table, id2, 5000)
+    tail2 = Background.tail_log(table, id2, 5)
+    check("bash auto-bg + background tool: trailing # comment runs, exit 0",
+          bool_and3(bool_and(string_starts_with(r, "[exit 0]"), string_contains(r, "bg-comment-ok")),
+                    if (st2 == 'done') { 'true' } else { 'false' },
+                    string_contains(tail2, "bgtool-ok")))
 }

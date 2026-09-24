@@ -37,7 +37,7 @@ import Util
 #   'next_id'        → counter
 
 export [
-    init, launch, launch_server, status, result, list_all,
+    init, launch, launch_cmd, launch_server, status, result, list_all,
     log_path_for, tail_log, kill_task,
     poll_and_notify, all_pending_ids,
     finalize_if_done, wait_for_task,
@@ -67,6 +67,15 @@ fun pid_file_for(task_id) {
 
 # Launch a command detached. Returns the task id string.
 fun launch(table, command, label) {
+    launch_cmd(table, command, command, label)
+}
+
+# Launch `run_cmd` detached but record `display_cmd` as the task's command.
+# The tool layer passes a wrapped script (Util.noninteractive_wrap) as
+# run_cmd and the model's raw command as display_cmd, so /bg listings show
+# what the model asked for, not the wrapper.
+fun launch_cmd(table, run_cmd, display_cmd, label) {
+    command = display_cmd
     raw_id = ets_get(table, 'next_id')
     next_id = if (raw_id == nil) { 0 } else { raw_id }
     task_id = "bg-" ++ to_string(next_id)
@@ -88,7 +97,7 @@ fun launch(table, command, label) {
     # since the worker leads its own session/process group). No sleep +
     # pid-file readback race any more — the runtime hands us the pid
     # synchronously off its internal pipe.
-    pid = shell_detached(command, log_file, exit_file)
+    pid = shell_detached(run_cmd, log_file, exit_file)
     if (pid == nil) {
         "error: failed to start background task"
     } else {

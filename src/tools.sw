@@ -376,7 +376,7 @@ fun bash_label(cmd_s) {
 
 # Explicit detach — launch and return a task id immediately, no wait.
 fun bash_launch_bg(bg_table, cmd_s) {
-    id = Background.launch(bg_table, cmd_s, bash_label(cmd_s))
+    id = Background.launch_cmd(bg_table, noninteractive_wrap(cmd_s), cmd_s, bash_label(cmd_s))
     # launch returns an "error: ..." STRING if shell_detached failed — surface
     # it directly instead of treating the error string as a task id.
     if (string_starts_with(to_string(id), "error") == 'true') { id }
@@ -391,7 +391,9 @@ fun bash_launch_bg(bg_table, cmd_s) {
 # foreground contract), ESC (kill the whole pgroup, return partial tail),
 # or budget exhausted (leave it running so the heartbeat's bg_done fires).
 fun bash_auto_bg(bg_table, cmd_s, after_ms) {
-    id = Background.launch(bg_table, cmd_s, bash_label(cmd_s))
+    # Same wrapped script as the foreground path, so a command behaves the
+    # same whichever way it ends up running (CI=1 env, comments, heredocs).
+    id = Background.launch_cmd(bg_table, noninteractive_wrap(cmd_s), cmd_s, bash_label(cmd_s))
     # launch returns an "error: ..." STRING if shell_detached failed — surface
     # it directly (no task exists to wait on, claim, or release).
     if (string_starts_with(to_string(id), "error") == 'true') { id }
@@ -475,18 +477,16 @@ fun drain_stdin_keys() {
     }}
 }
 
-# Wrap a user command in a subshell that:
-#   - exports CI=1 and friends BEFORE the command runs (so every
-#     child process, including npm/cargo/pip subcommands, sees them)
-#   - redirects stdin from /dev/null (closes the tty ghost)
-#   - merges stderr into stdout for capture
-# Applied before the timeout wrapper so the alarm covers the whole
-# pipeline including the `export` setup.
+# Wrap a user command so that it:
+#   - runs with CI=1 and friends exported (so every child process,
+#     including npm/cargo/pip subcommands, sees them)
+#   - reads stdin from /dev/null (closes the tty ghost)
+#   - merges stderr into stdout for capture — INCLUDING sh's own syntax
+#     errors, so the model sees why a command didn't parse
+# The command goes in on its own lines (see Util.noninteractive_wrap), so a
+# trailing `# comment` or a final heredoc terminator can't eat the wrapper.
 fun noninteractive_wrap(user_cmd) {
-    "( export CI=1 DEBIAN_FRONTEND=noninteractive NO_COLOR=1 FORCE_COLOR=0 " ++
-    "NPM_CONFIG_YES=true PIP_DISABLE_PIP_VERSION_CHECK=1 " ++
-    "PYTHONUNBUFFERED=1; " ++
-    user_cmd ++ " ) </dev/null 2>&1"
+    Util.noninteractive_wrap(user_cmd)
 }
 
 fun bash_max_lines() { 100 }
@@ -1310,7 +1310,7 @@ fun do_background(args, opts) {
         if (bg_table == nil) { "error: background system not initialized" }
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
-            id = Background.launch(bg_table, to_string(cmd), label_str)
+            id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
             "launched " ++ id ++ ": " ++ label_str ++
                 "\n(use bg_status and bg_result to check progress)"
         }
@@ -1360,7 +1360,7 @@ fun do_bg_server(args, opts) {
         if (bg_table == nil) { "error: background system not initialized" }
         else {
             label_str = if (label == nil) { to_string(cmd) } else { to_string(label) }
-            id = Background.launch_server(bg_table, to_string(cmd), label_str)
+            id = Background.launch_cmd(bg_table, noninteractive_wrap(to_string(cmd)), to_string(cmd), label_str)
             log_file = Background.log_path_for(id)
             "launched detached server " ++ id ++ ": " ++ label_str ++
                 "\nlog: " ++ log_file ++
