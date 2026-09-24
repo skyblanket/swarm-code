@@ -244,7 +244,8 @@ fun main() {
         t_pre_tool_hook_fails_closed(),
         t_hook_matcher_families(),
         t_read_offset_past_64k(),
-        t_read_huge_file_window()
+        t_read_huge_file_window(),
+        t_edit_refuses_nul_and_huge()
     ]
 
     passed = sum_list(results, 0)
@@ -3014,4 +3015,28 @@ fun t_read_huge_file_window() {
           bool_and3(string_starts_with(r, "39998\tline 39998 of"),
                     string_contains(r, "40000\tline 40000 of"),
                     if (string_contains(r, "40001") == 'false') { 'true' } else { 'false' }))
+}
+
+# edit is file_read-based (a C string): a file with a NUL byte was
+# truncated at the NUL and reported ok; a >1MB file (file_read → nil) was
+# treated as MISSING, so old_string="" OVERWROTE it with new_string.
+fun t_edit_refuses_nul_and_huge() {
+    p = "/tmp/swc_edit_nul.bin"
+    file_write_bytes(p, bytes_from_ints([72, 69, 65, 68, 69, 82, 32, 97, 98, 99, 0, 1, 2, 32, 116, 97, 105, 108]))
+    e1 = Tools.exec_raw('edit', %{path: p, old_string: "HEADER", new_string: "HDR"}, %{})
+    e2 = Tools.exec_raw('multi_edit', %{path: p, edits: [%{old_string: "HEADER", new_string: "HDR"}]}, %{})
+    wd = ets_new()
+    Tools.exec_raw('write', %{path: p, content: "replaced"}, %{write_diff_table: wd})
+    stashed = ets_get(wd, p)
+    h = "/tmp/swc_edit_huge.txt"
+    make_lines_file(h, 40000)
+    sz0 = map_get(file_stat(h), 'size')
+    e3 = Tools.exec_raw('edit', %{path: h, old_string: "", new_string: "APPENDED"}, %{})
+    sz1 = map_get(file_stat(h), 'size')
+    file_delete(p)
+    file_delete(h)
+    check("edit/multi_edit refuse NUL-containing and >1MB files (no truncation, no overwrite)",
+          bool_and3(bool_and(string_contains(e1, "NUL"), string_contains(e2, "NUL")),
+                    if (stashed == nil) { 'true' } else { 'false' },
+                    bool_and(string_starts_with(e3, "error:"), if (sz0 == sz1) { 'true' } else { 'false' })))
 }

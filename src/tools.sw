@@ -783,7 +783,11 @@ fun capture_write_prior(opts, path) {
     else {
         if (file_exists(path) == 'true') {
             prior = file_read(path)
-            if (prior != nil && string_length(prior) < 65536) {
+            # file_read stops at a NUL byte: a length that disagrees with the
+            # on-disk size means binary content — no (bogus) diff for that.
+            st = file_stat(path)
+            disk = if (st == nil) { 0 - 1 } else { map_get(st, 'size') }
+            if (prior != nil && string_length(prior) < 65536 && string_length(prior) == disk) {
                 ets_put(wd, path, prior)
             } else {
                 # ≥64KB (or unreadable): clear any stale prior from an
@@ -849,8 +853,41 @@ fun do_edit_impl(path, old_s, new_s, replace_all) {
     else { do_edit_impl_inner(path, old_s, new_s, replace_all) }
 }
 
+# Load a file for edit / multi_edit → {'ok', content} | {'missing', nil} |
+# {'error', message}. file_read is C-string based with a 1MB cap: it stops at
+# the first NUL byte (an edit then wrote back the truncated prefix and said
+# "ok") and returns nil above 1MB (edit then took the file for MISSING, so
+# old_string="" overwrote it with new_string). Comparing the loaded length
+# with the on-disk size catches both — the whole file, not just a prefix.
+fun load_for_edit(path) {
+    p = to_string(path)
+    st = file_stat(p)
+    if (st == nil) { {'missing', nil} }
+    else { if (map_get(st, 'is_dir') == 'true') { {'error', "error: " ++ p ++ " is a directory"} }
+    else {
+        size = map_get(st, 'size')
+        if (size == 0) { {'ok', ""} }
+        else { if (size > file_read_cap()) {
+            {'error', "error: " ++ p ++ " is " ++ to_string(size) ++ " bytes — too large to edit safely " ++
+                      "(edit/multi_edit handle files up to 1MB). Use bash (sed -i, python) for this file."}
+        } else {
+            c = file_read(p)
+            if (c == nil) { {'error', "error: could not read " ++ p} }
+            else { if (string_length(c) != size) {
+                {'error', "error: " ++ p ++ " contains NUL bytes (binary data) — edit works on text and would " ++
+                          "truncate it at the first NUL. The file was not modified; use bash/python for binary files."}
+            } else { {'ok', c} }}
+        }}
+    }}
+}
+
 fun do_edit_impl_inner(path, old_s, new_s, replace_all) {
-    original = file_read(path)
+    loaded = load_for_edit(path)
+    if (elem(loaded, 0) == 'error') { elem(loaded, 1) }
+    else { do_edit_loaded(path, elem(loaded, 1), old_s, new_s, replace_all) }
+}
+
+fun do_edit_loaded(path, original, old_s, new_s, replace_all) {
     if (original == nil) {
         # Missing file. Empty old_string = create it with new_string.
         if (string_length(old_s) == 0) {
@@ -2137,12 +2174,14 @@ fun do_multi_edit(args) {
             guard = PathGuard.validate_write(to_string(path))
             if (guard != "ok") { guard }
             else {
-                original = file_read(path)
-                if (original == nil) {
-                    "error: could not read " ++ path
+                loaded = load_for_edit(path)
+                tag = elem(loaded, 0)
+                if (tag == 'error') { elem(loaded, 1) }
+                else { if (tag == 'missing') {
+                    "error: could not read " ++ path ++ " (no such file — use write to create it)"
                 } else {
-                    apply_edits(path, original, edits, 0, length(edits))
-                }
+                    apply_edits(path, elem(loaded, 1), edits, 0, length(edits))
+                }}
             }
         }
     }
