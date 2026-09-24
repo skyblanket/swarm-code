@@ -24,6 +24,16 @@ module PathGuard
 #   /.config/gh/hosts.yml          (gh CLI auth token)
 #   /.config/git/credentials       (git credentials)
 #   /.swarm-code/settings.json     (our own config)
+#   /.swarm-code/**                (our control files: hooks/ run on every
+#                                   tool call, schedule.json queues headless
+#                                   runs, .profile_override redirects the
+#                                   LLM, sessions/ are replayed as history)
+#                                   EXCEPT memory/ and skills/, the data
+#                                   the agent legitimately manages
+#   */.swarm-code.json             (project-scope settings)
+#
+# Matching is case-insensitive: on a case-insensitive filesystem (macOS
+# default) ~/.SSH/ and ~/.Swarm-Code/hooks/ ARE the protected paths.
 #
 # Blocked on READ (private key material only):
 #   /.gnupg/private-keys*          (GPG private key material)
@@ -52,7 +62,8 @@ fun is_sensitive(path) {
     _sensitive_check(rp)
 }
 
-fun _sensitive_check(rp) {
+fun _sensitive_check(rp_raw) {
+    rp = string_lower(rp_raw)
     if (string_contains(rp, "/.ssh/") == 'true') { 'true' }
     else { if (string_contains(rp, "/.gnupg/") == 'true') { 'true' }
     else { if (string_starts_with(rp, "/etc/") == 'true') { 'true' }
@@ -78,7 +89,8 @@ fun validate_write(path) {
     }
 }
 
-fun _write_check(rp) {
+fun _write_check(rp_raw) {
+    rp = string_lower(rp_raw)
     if (string_contains(rp, "/.ssh/") == 'true') {
         "error: write to sensitive path blocked: refusing to write inside an .ssh directory — set SWARM_CODE_UNSAFE_WRITES=1 to override"
     }
@@ -112,7 +124,40 @@ fun _write_check(rp) {
     else { if (string_contains(rp, "/.swarm-code/settings.json") == 'true') {
         "error: write to sensitive path blocked: refusing to write swarm-code's own settings.json — edit it yourself, or set SWARM_CODE_UNSAFE_WRITES=1 to override"
     }
-    else { "ok" }}}}}}}}}}}
+    else { if (_is_control_path(rp) == 'true') {
+        "error: write to sensitive path blocked: refusing to write swarm-code's own control files (~/.swarm-code/ hooks, schedule, sessions, profile override; ./.swarm-code.json) — only ~/.swarm-code/memory/ and ~/.swarm-code/skills/ are writable; edit it yourself, or set SWARM_CODE_UNSAFE_WRITES=1 to override"
+    }
+    else { "ok" }}}}}}}}}}}}
+}
+
+# 'true' for a (lowercased, resolved) path swarm-code reads as control
+# input: anything under a .swarm-code/ directory other than its memory/
+# and skills/ data dirs, the directory itself, and a project-scope
+# .swarm-code.json. Matches any .swarm-code/ (not just $HOME's) — HOME
+# may be unset or a symlink, and over-blocking here is the safe side.
+fun _is_control_path(rp) {
+    if (string_ends_with(rp, "/.swarm-code.json") == 'true') { 'true' }
+    else { if (string_ends_with(rp, "/.swarm-code") == 'true') { 'true' }
+    else {
+        idx = string_index_of(rp, "/.swarm-code/")
+        if (idx < 0) { 'false' }
+        else {
+            start = idx + string_length("/.swarm-code/")
+            rest = string_sub(rp, start, string_length(rp) - start)
+            data_dir = if (string_starts_with(rest, "memory/") == 'true') { 'true' }
+                       else { string_starts_with(rest, "skills/") }
+            # realpath -m is missing on older macOS (resolve_path then
+            # returns the path as given), so an unresolved ".." must not
+            # climb out of a data dir: memory/../hooks/pre_tool.sh.
+            if (data_dir == 'true' && _has_dotdot(rest) == 'false') { 'false' } else { 'true' }
+        }
+    }}
+}
+
+fun _has_dotdot(p) {
+    if (string_contains(p, "/../") == 'true') { 'true' }
+    else { if (string_ends_with(p, "/..") == 'true') { 'true' }
+    else { string_starts_with(p, "../") }}
 }
 
 # ------------------------------------------------------------------
@@ -126,7 +171,8 @@ fun validate_read(path) {
     _read_check(rp)
 }
 
-fun _read_check(rp) {
+fun _read_check(rp_raw) {
+    rp = string_lower(rp_raw)
     if (string_contains(rp, "/.gnupg/private-keys") == 'true') {
         "error: read blocked: refusing to read GPG private key material in .gnupg/private-keys*"
     }

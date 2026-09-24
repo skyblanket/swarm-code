@@ -504,7 +504,7 @@ fun inject_context_status(messages, opts) {
                 else {
                     # Bracketed marker (not XML) — avoids any future
                     # JSON-escape weirdness on `<`/`>` and reads cleaner
-                    # to humans glancing at /tmp/swarm-code-last-body.json.
+                    # to humans glancing at the SWARM_CODE_DEBUG body dump.
                     new_content = to_string(content) ++ "\n\n[" ++ status ++ "]"
                     new_msg = map_put(last_msg, 'content', new_content)
                     replace_at(messages, last_idx, new_msg, 0, [])
@@ -1353,16 +1353,32 @@ fun use_routed_stream(opts) {
     else { 'true' }}}}}}}
 }
 
+# Network-isolation gate at the point of dial. main.sw's startup check
+# only sees the primary endpoint; the fallback, providers[] and
+# .profile_override endpoints are chosen later, so every URL the LLM
+# layer contacts is re-checked here (Config.endpoint_refusal). Returns
+# nil when the URL may be dialed; otherwise prints the reason (diag() is
+# silent in headless) and returns it.
+fun dial_refusal(url) {
+    reason = Config.endpoint_refusal(url)
+    if (reason != nil) { eprint("  " ++ UI.warn_text("⚠ " ++ reason)) }
+    reason
+}
+
 fun stream_call(url, hdrs, body, opts) {
     routed_ok = use_routed_stream(opts)
-    if (map_get(opts, 'wake_turn') == 'true' && routed_ok == 'true') {
+    # A refused URL surfaces as a FATAL (4xx) failure: never retried; the
+    # fallback / next provider still gets its own (gated) attempt.
+    if (dial_refusal(url) != nil) {
+        {'error', 403, "blocked by network isolation (see above)"}
+    } else { if (map_get(opts, 'wake_turn') == 'true' && routed_ok == 'true') {
         wake_sync_stream(url, hdrs, body, opts)
     } else { if (routed_ok == 'true') {
         routed_stream(url, hdrs, body, opts)
     } else {
         record_stream_mode(opts, 'sync', "")
         http_post_stream(url, hdrs, body)
-    }}
+    }}}
 }
 
 # Which mode the JUST-COMPLETED stream used + what it painted. Read by
@@ -1747,7 +1763,7 @@ fun chat_native(messages, opts) {
     body_chars = string_length(body)
 
     file_mkdir(getenv("HOME") ++ "/.swarm-code")
-    file_write(getenv("HOME") ++ "/.swarm-code/last-body.json", body)
+    dump_last_body(body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     # Substantive live-wait line shown for the whole TTFT window.
     # Suppressed on wake turns — the Reader is pinned in read_line and
@@ -1923,6 +1939,26 @@ fun api_tool_calls_to_internal(raw, acc) {
     }}
 }
 
+# Debug-only copy of the outbound request body — it carries the whole
+# conversation (prompts, tool output, any secrets in them), so it is
+# written only with SWARM_CODE_DEBUG=1 and never world-readable: mkstemp
+# (file_temp) creates the file 0600 and the rename keeps that mode.
+# Nothing reads it back; it is for a human debugging a request.
+fun dump_last_body(body) {
+    home = getenv("HOME")
+    if (getenv("SWARM_CODE_DEBUG") != "1" || home == nil) { 'skip' }
+    else {
+        dir = home ++ "/.swarm-code"
+        file_mkdir(dir)
+        tmp = file_temp(dir ++ "/.last-body.")
+        if (tmp == nil) { 'skip' }
+        else {
+            file_write(tmp, body)
+            file_rename(tmp, dir ++ "/last-body.json")
+        }
+    }
+}
+
 # ============================================================
 # Inband streaming path — parse markers ONCE into structured form
 # ============================================================
@@ -1934,7 +1970,7 @@ fun chat_inband(messages, opts) {
     body = build_request_body(messages, opts)
     body_chars = string_length(body)
 
-    file_write("/tmp/swarm-code-last-body.json", body)
+    dump_last_body(body)
     Log.llm_request(to_string(model), length(messages), body_chars)
     # Same live-wait line for the inband (Gemma-style) path. Suppressed
     # on wake turns (Reader pinned in read_line); newline-less in
@@ -2151,7 +2187,7 @@ fun chat_silent(messages, opts) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = http_post(url, hdrs, body)
+    resp = if (dial_refusal(url) != nil) { nil } else { http_post(url, hdrs, body) }
     if (resp == nil) { nil }
     else {
         usage = extract_usage(resp)
@@ -2200,7 +2236,8 @@ fun chat_for_subagent(messages, opts, target_pid, name) {
     hdrs = if (api_key == nil) { base_hdrs }
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
-    resp = unwrap_stream(http_post_stream(url, hdrs, body, target_pid, name))
+    resp = if (dial_refusal(url) != nil) { nil }
+           else { unwrap_stream(http_post_stream(url, hdrs, body, target_pid, name)) }
     latency = timestamp() - start_ms
 
     if (resp == nil) {

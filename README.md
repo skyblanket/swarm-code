@@ -78,7 +78,9 @@ Point it at any OpenAI-compatible endpoint via `~/.swarm-code/settings.json`. Pr
 }
 ```
 
-Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default). Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
+Remote endpoints are opt-in — set `SWARM_CODE_ALLOW_REMOTE=1` (local-network-only by default; an API key alone is not an opt-in). The check applies to every URL the LLM layer dials — primary, fallback, `providers`, and `/profile` switches. Optional semantic memory recall uses `SWARM_CODE_EMBED_ENDPOINT`.
+
+A repo-local `./.swarm-code.json` is **untrusted** (it ships with whatever you cloned): it may set `model`, `max_tokens`, `vision`, `chat_template_kwargs` and `llm_timeout_ms`, and may only *tighten* `permissions`. Its hooks, MCP servers, endpoints, API keys, providers and profiles are ignored, with a one-line notice. To let a repo you trust apply its file in full, list it in `~/.swarm-code/settings.json`: `"trusted_projects": ["/abs/path/to/repo"]`.
 
 ## Features
 
@@ -119,7 +121,10 @@ Panel agents run under the fail-closed `council_panel` context: they may inspect
 swarm-code runs shell commands, reads and writes files, and can reach the network — so it is built fail-closed:
 
 - **Local-network-only by default**; remote endpoints require an explicit `SWARM_CODE_ALLOW_REMOTE=1`.
+- A cloned repo's `./.swarm-code.json` cannot run hooks, start MCP servers, redirect the endpoint/key, or loosen permissions unless you add the directory to `trusted_projects`.
+- The `write`/`edit` tools refuse swarm-code's own control files (`~/.swarm-code/` hooks, schedule, settings, sessions, profile override; `.swarm-code.json`) — only `~/.swarm-code/memory/` and `skills/` are writable — and credential dirs (`.ssh`, `.aws`, `.gnupg`, …) case-insensitively.
 - Every tool runs through one **`ToolExecutor` policy boundary** — context allow-lists, argument-rewriting hooks, guardrails, and permissions — *before* any raw handler executes, and **fails closed** on a missing or unknown execution context.
+- Headless runs (`-p`, cron jobs, `/flows` children) never auto-approve a call that needs permission — a dangerous command, an explicit `"ask"` setting, or an MCP tool — unless you set `SWARM_CODE_HEADLESS_APPROVE=1`.
 - A **hardline command blocklist** (`rm -rf /`, `mkfs`, `dd`, fork bombs, …) cannot be bypassed by environment overrides.
 - Subagents, MCP, and council contexts run under restricted (often read-only) policies.
 - Secrets are redacted from session logs and trajectory exports.

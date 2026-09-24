@@ -223,7 +223,8 @@ fun spawn_task_list(tasks, bg_table, opts, phase_idx, acc) {
 # settings in load_opts) — the binary has no --model flag, and a bare
 # --model value would be scanned as a positional profile name.
 # SWARM_CODE_DENY_DANGEROUS=1 keeps the dangerous-bash gate a hard deny
-# in the headless children, which otherwise auto-approve every 'ask'.
+# in the headless children, even if SWARM_CODE_HEADLESS_APPROVE=1 is
+# exported (which makes them auto-approve every other 'ask').
 fun build_task_cmd(prompt, model) {
     binary = swarm_binary()
     base = "SWARM_CODE_DENY_DANGEROUS=1 " ++ Util.shell_q(binary) ++

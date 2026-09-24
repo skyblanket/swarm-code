@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A cloned repo's `./.swarm-code.json` is untrusted.** It may set only
+  `model`, `max_tokens`, `vision`, `chat_template_kwargs`, `llm_timeout_ms`
+  and *tighten* `permissions`; hooks, `mcpServers`, `endpoint`, `api_key`,
+  `providers`, `profiles` and `fallback_profile` in it are ignored with a
+  one-line notice. Opt a repo in with `"trusted_projects": ["/abs/path"]` in
+  `~/.swarm-code/settings.json`.
+- **Network gate parses URLs properly and covers every LLM dial.** Userinfo
+  (`http://127.0.0.1@host`), uppercase schemes, name-prefix and numeric-IP
+  tricks no longer pass, and fallback / `providers` / `/profile` override
+  endpoints are checked at the point of dial. **Changed:** an API key no
+  longer bypasses the gate — remote endpoints need `SWARM_CODE_ALLOW_REMOTE=1`
+  as documented; scheme-less endpoints (`host:port`) are refused.
+- **The model can't write swarm-code's control files** (`~/.swarm-code/`
+  hooks, `schedule.json`, `.profile_override`, sessions, `settings.json`,
+  `.swarm-code.json`); `memory/` and `skills/` stay writable. Sensitive-path
+  checks are case-insensitive (`~/.SSH`).
+- **Headless no longer auto-approves an 'ask'.** A dangerous command, an
+  explicit `"ask"` permission or an MCP tool is denied in `-p` / cron /
+  `/flows` runs unless `SWARM_CODE_HEADLESS_APPROVE=1` is set.
+- **The raw request body is no longer written to
+  `/tmp/swarm-code-last-body.json`** (or refreshed in `~/.swarm-code/` on every
+  call); `SWARM_CODE_DEBUG=1` writes `~/.swarm-code/last-body.json`, mode 600.
+
 ## [1.1.0] - 2026-07-15
 
 The responsiveness release: the agent never blocks the terminal and the
