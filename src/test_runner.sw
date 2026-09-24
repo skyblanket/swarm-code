@@ -31,6 +31,7 @@ import JsonCheck
 import Flows
 import Trajectory
 import Log
+import Skills
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -141,6 +142,7 @@ fun main() {
         t_flows_launch_quota(),
         t_trajectory_redacts_valid_jsonl(),
         t_log_redact_value_shapes(),
+        t_skill_slug_traversal_blocked(),
         t_sched_wrong_shape_never_panics(),
         t_sched_corrupt_refuses_write(),
         t_sched_strict_exprs(),
@@ -1033,6 +1035,39 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# forget_skill {"slug":"../../../work/proj"} deleted work/proj/SKILL.md
+# and recall_skill read it: the slug was spliced into a path unchecked.
+# Plant a SKILL.md outside skills_dir and aim a traversal slug at it.
+fun t_skill_slug_traversal_blocked() {
+    d = ag_tmp("skilltrav")
+    file_delete(d)
+    file_mkdir(d)
+    target = d ++ "/SKILL.md"
+    file_write(target, "TRAVERSAL-TARGET-CONTENT")
+    slug = ag_repeat("../", 16, "") ++ string_sub(d, 1, string_length(d) - 1)
+    rec = Skills.recall(slug)
+    fgt = Skills.forget(slug)
+    survived = file_exists(target)
+    file_delete(target)
+    ok = ag_all([
+        ag_is(string_contains(rec, "TRAVERSAL-TARGET-CONTENT"), 'false'),
+        string_starts_with(rec, "error: invalid skill slug"),
+        string_starts_with(fgt, "error: invalid skill slug"),
+        ag_is(survived, 'true'),
+        ag_is(Skills.valid_slug("deploy_mally_otp"), 'true'),
+        ag_is(Skills.valid_slug("ship-openear-dmg"), 'true'),
+        ag_is(Skills.valid_slug("a/b"), 'false'),
+        ag_is(Skills.valid_slug("a\\b"), 'false'),
+        ag_is(Skills.valid_slug(".."), 'false'),
+        ag_is(Skills.valid_slug(".hidden"), 'false'),
+        ag_is(Skills.valid_slug(""), 'false'),
+        ag_is(Skills.valid_slug(nil), 'false'),
+        ag_is(Skills.valid_slug("x\ny"), 'false'),
+        # slugify("") is "" — would have written skills_dir()//SKILL.md
+        string_starts_with(Skills.save("", "d", "t", "i"), "error:")])
+    check("skills: traversal slugs rejected by recall/forget (target untouched)", ok)
 }
 
 # Trajectory export ran Log.redact over the ENCODED line: the blob layer
