@@ -34,9 +34,14 @@
 #   A11 subagent big answer — a 320KB answer reaches the parent capped
 #   A12 subagent LLM hang   — a hung endpoint fails the subagent after
 #                             the configured LLM timeout, with a reason
+#   A13 /flows malformed    — {"phases":"oops"} and friends print an error;
+#                             the session survives and stays responsive
+#   A14 /flows fan-out cap  — 6 tasks with SWARM_CODE_FLOWS_MAX_PARALLEL=2
+#                             run at most 2 at a time, all complete
 #
-# A5-A7 drive the binary INTERACTIVELY (the scheduler runs off main's
-# heartbeat) through tests/integration/pty_run.py.
+# A5-A7, A13, A14 drive the binary INTERACTIVELY (the scheduler runs off
+# main's heartbeat; /flows is a slash command) through
+# tests/integration/pty_run.py.
 #
 # Run standalone: tests/integration/run.sh (these run after T1..T10).
 
@@ -56,6 +61,7 @@ run_pty() {
         SWARM_CODE_TOOL_FORMAT=native \
         SWARM_CODE_PLAN=off \
         SWARM_CODE_BIN="$BIN" \
+        SWARM_CODE_FLOWS_MAX_PARALLEL="${RUN_FLOWS_MAX:-}" \
         TERM=xterm SW_NO_TITLE=1 \
         perl -e 'alarm 90; exec @ARGV' python3 "$PTY_RUN" "$CASE/pty.txt" "$1" \
             "$BIN" --no-resume 2>"$CASE/pty.err"
@@ -453,6 +459,71 @@ print(int(t[2]-t[1]) if 1 in t and 2 in t else 999)' "$REQLOG")"
     else pass A12; fi
 }
 
+# ------------------------------------------------------------
+# A13 — a malformed /flows workflow must not kill the session
+# ------------------------------------------------------------
+a13() {
+    new_case a13
+    printf '%s' '{"phases":"oops"}' >"$WORK/bad1.json"
+    printf '%s' '{"phases":[{"name":"P","tasks":[7, {"prompt":"x"}]}]}' >"$WORK/bad2.json"
+    printf '%s' '{"phases":[{"tasks":[{"label":"a","prompt":"x"}' >"$WORK/bad3.json"
+    echo '{"responses": []}' >"$CASE/scenario.json"
+    cat >"$CASE/pty.json" <<'EOF'
+[{"wait": 4},
+ {"send": "/flows ./bad1.json\r"}, {"until_out": "must be an array", "timeout": 6},
+ {"send": "/flows ./bad2.json\r"}, {"until_out": "task 1 must be an object", "timeout": 6},
+ {"send": "/flows ./bad3.json\r"}, {"until_out": "invalid JSON in", "timeout": 6},
+ {"send": "/schedules\r"}, {"until_out": "see /help for /schedule usage", "timeout": 6}]
+EOF
+    start_mock "$CASE/scenario.json" || { fail A13 "mock failed to start"; return; }
+    run_pty "$CASE/pty.json"
+    cleanup
+    if [ "$PTY_STATUS" != "ALIVE" ] || grep -q "panic:" "$CASE/pty.txt"; then fail A13 "session died on a malformed workflow ($PTY_STATUS)"
+    elif ! grep -q '"phases" must be an array' "$CASE/pty.txt"; then fail A13 "no error for {\"phases\":\"oops\"}"
+    elif ! grep -q "task 1 must be an object" "$CASE/pty.txt"; then fail A13 "no error for a non-object task"
+    elif ! grep -q "invalid JSON in" "$CASE/pty.txt"; then fail A13 "truncated JSON accepted"
+    elif ! grep -q "see /help for /schedule usage" "$CASE/pty.txt"; then fail A13 "session unresponsive afterwards"
+    elif [ "$(req_count)" -ne 0 ]; then fail A13 "a malformed workflow launched tasks"
+    else pass A13; fi
+}
+
+# ------------------------------------------------------------
+# A14 — /flows fan-out honours the concurrency cap
+# ------------------------------------------------------------
+a14() {
+    new_case a14
+    python3 - "$CASE/scenario.json" "$WORK/fan.json" <<'PYEOF2'
+import json, sys
+json.dump({"responses": [{"type": "text", "content": "child done", "delay": 3}] * 6},
+          open(sys.argv[1], "w"))
+json.dump({"name": "fan", "phases": [{"name": "P", "tasks": [
+    {"label": "t%d" % i, "prompt": "child task %d" % i} for i in range(6)]}]},
+    open(sys.argv[2], "w"))
+PYEOF2
+    cat >"$CASE/pty.json" <<EOF
+[{"wait": 4}, {"send": "/flows ./fan.json\r"},
+ {"until_out": "flows complete", "timeout": 60}, {"wait": 1}]
+EOF
+    start_mock "$CASE/scenario.json" || { fail A14 "mock failed to start"; return; }
+    RUN_FLOWS_MAX=2 run_pty "$CASE/pty.json"
+    cleanup
+    # Only the children's requests count (the main session may wake on
+    # the bg_done events afterwards). Peak children in flight ~ most
+    # child requests arriving inside one 2.5s window (each child's one
+    # LLM call is held 3s by the mock).
+    local stats kids peak
+    stats="$(python3 -c 'import json,sys
+ts=sorted(r["t"] for r in map(json.loads, open(sys.argv[1]))
+          if "child task" in json.dumps(r["body"].get("messages", [])[:2]))
+print(len(ts), max([sum(1 for u in ts if t <= u < t + 2.5) for t in ts] or [0]))' "$REQLOG")"
+    kids="${stats% *}"; peak="${stats#* }"
+    if [ "$PTY_STATUS" != "ALIVE" ]; then fail A14 "session died ($PTY_STATUS)"
+    elif [ "$kids" -ne 6 ]; then fail A14 "expected 6 child runs, got $kids"
+    elif [ "$peak" -gt 2 ]; then fail A14 "$peak children in flight with SWARM_CODE_FLOWS_MAX_PARALLEL=2"
+    elif ! grep -q "6/6 tasks done" "$CASE/pty.txt"; then fail A14 "not all tasks completed"
+    else pass A14; fi
+}
+
 agents_cases() {
     a1
     a2
@@ -466,4 +537,6 @@ agents_cases() {
     a10
     a11
     a12
+    a13
+    a14
 }

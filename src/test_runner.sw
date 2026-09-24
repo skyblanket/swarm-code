@@ -28,6 +28,7 @@ import Tools
 import Mcp
 import McpServer
 import JsonCheck
+import Flows
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -134,6 +135,8 @@ fun main() {
         t_subagent_type_allowlists(),
         t_subagent_result_capped(),
         t_subagent_partial_keeps_work(),
+        t_flows_validate_shapes(),
+        t_flows_launch_quota(),
         t_sched_wrong_shape_never_panics(),
         t_sched_corrupt_refuses_write(),
         t_sched_strict_exprs(),
@@ -1026,6 +1029,44 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# /flows with {"phases":"oops"} panicked the interactive session (hd on
+# a string in init_phases). validate_workflow rejects every shape the
+# run would walk, before the alt-screen opens or anything launches.
+fun t_flows_validate_shapes() {
+    bad = ["{\"phases\":\"oops\"}", "[1,2]", "\"str\"",
+           "{\"phases\":[5]}", "{\"phases\":[{\"tasks\":\"x\"}]}",
+           "{\"phases\":[{\"tasks\":[7]}]}", "{\"phases\":[{\"tasks\":[{\"label\":\"a\"}]}]}",
+           "{\"phases\":[{\"tasks\":[{\"prompt\":{\"x\":1}}]}]}",
+           "{\"phases\":[{\"tasks\":[{\"prompt\":\"p\",\"model\":[1]}]}]}"]
+    good = ["{}", "{\"phases\":[]}", "{\"phases\":[{\"name\":\"P\"}]}",
+            "{\"phases\":[{\"tasks\":[{\"prompt\":\"p\",\"label\":3}]}]}"]
+    ok = ag_all([
+        ag_all(map(fn(x) { ag_is(elem(Flows.validate_workflow(json_decode(x)), 0), 'error') }, bad)),
+        ag_all(map(fn(x) { ag_is(elem(Flows.validate_workflow(json_decode(x)), 0), 'ok') }, good)),
+        string_contains(to_string(elem(Flows.validate_workflow(json_decode("{\"phases\":\"oops\"}")), 1)),
+                        "\"phases\" must be an array")])
+    check("flows: malformed workflow shapes rejected with a reason (no panic)", ok)
+}
+
+# /flows fan-out was unbounded (12 tasks → 12 children in 0.15s).
+# launch_quota = free slots under the cap, bounded by what is queued.
+fun t_flows_launch_quota() {
+    q = %{bg_task_id: nil, status: 'pending'}
+    r = %{bg_task_id: "bg-1", status: 'running'}
+    d = %{bg_task_id: "bg-2", status: 'done'}
+    e = %{bg_task_id: nil, status: 'error'}
+    twelve = map(fn(i) { q }, 1..12)
+    ok = ag_all([
+        ag_is(Flows.launch_quota(twelve, 4), 4),
+        ag_is(Flows.launch_quota([r, r, r, q, q], 4), 1),
+        ag_is(Flows.launch_quota([r, r, r, r, q], 4), 0),
+        ag_is(Flows.launch_quota([d, d, r, q, q, q], 2), 1),
+        ag_is(Flows.launch_quota([d, e, q], 4), 1),
+        ag_is(Flows.launch_quota([d, e], 4), 0),
+        ag_is(Flows.flows_max_parallel(), 4)])
+    check("flows: fan-out capped (default 4 in flight), rest queued", ok)
 }
 
 # explore / bash subagent restrictions were prompt-only — an explore
