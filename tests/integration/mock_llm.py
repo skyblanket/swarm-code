@@ -15,6 +15,12 @@ Every request body is appended (one JSON object per line) to the log file,
 so the harness can assert exactly what the binary sent — e.g. that a tool
 result message came back after a tool_calls response.
 
+A response may carry "delay": <seconds> — the mock sleeps that long before
+answering (on its own thread, so later requests are still served). Used to
+simulate a hung endpoint. A text response may carry "chunk": <n> to stream
+its content in n-byte deltas (real servers send many small deltas; the
+default is two halves). Each log line records its arrival time "t".
+
 If more requests arrive than there are scripted responses, a plain text
 "MOCK-EXHAUSTED" response is served (so a looping binary terminates
 instead of hanging) and the harness can detect the overrun in the log.
@@ -30,13 +36,18 @@ import argparse
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def sse_text_events(content):
-    """Chunked OpenAI SSE frames for a plain assistant text response."""
-    mid = max(1, len(content) // 2)
-    parts = [content[:mid], content[mid:]] if len(content) > 1 else [content]
+def sse_text_events(content, chunk=None):
+    """Chunked OpenAI SSE frames for a plain assistant text response —
+    two halves, or `chunk`-sized deltas when given."""
+    if chunk:
+        parts = [content[i:i + chunk] for i in range(0, len(content), chunk)] or [""]
+    else:
+        mid = max(1, len(content) // 2)
+        parts = [content[:mid], content[mid:]] if len(content) > 1 else [content]
     events = [{"choices": [{"index": 0,
                             "delta": {"role": "assistant", "content": ""},
                             "finish_reason": None}]}]
@@ -105,7 +116,7 @@ class MockHandler(BaseHTTPRequestHandler):
             n = self.counter[0]
             self.counter[0] += 1
             with open(self.log_path, "a") as f:
-                f.write(json.dumps({"n": n, "body": body}) + "\n")
+                f.write(json.dumps({"n": n, "t": time.time(), "body": body}) + "\n")
 
         responses = self.scenario.get("responses", [])
         if n < len(responses):
@@ -113,8 +124,13 @@ class MockHandler(BaseHTTPRequestHandler):
         else:
             spec = {"type": "text", "content": "MOCK-EXHAUSTED"}
 
+        if spec.get("delay"):
+            time.sleep(float(spec["delay"]))
+
         if spec.get("type") == "tool_calls":
             events = sse_tool_call_events(spec["calls"])
+        elif spec.get("chunk"):
+            events = sse_text_events(spec.get("content", ""), int(spec["chunk"]))
         else:
             events = sse_text_events(spec.get("content", ""))
 

@@ -147,17 +147,23 @@ fun allowed_in(context, name) {
         if (in_list(subagent_blocked_tools(), to_string(name)) == 'true') {
             'false'
         } else { 'true' }
+    } else { if (context == "subagent_explore") {
+        in_list(subagent_explore_tools(), to_string(name))
+    } else { if (context == "subagent_bash") {
+        in_list(subagent_bash_tools(), to_string(name))
     } else { if (context == "main") { 'true' }
-    else { 'false' }}}}}
+    else { 'false' }}}}}}}
 }
 
 fun names_for(context) {
     if (context == "mcp_server") { mcp_server_tools() }
     else { if (context == "council_panel") { council_panel_tools() }
     else { if (context == "council_judge") { [] }
+    else { if (context == "subagent_explore") { subagent_explore_tools() }
+    else { if (context == "subagent_bash") { subagent_bash_tools() }
     else { if (context == "main" || context == "subagent") {
         all_names(all_tools(), [])
-    } else { [] }}}}
+    } else { [] }}}}}}
 }
 
 fun all_names(entries, acc) {
@@ -175,6 +181,15 @@ fun subagent_blocked_tools() {
     ["task", "remember", "forget", "learn_skill", "forget_skill",
      "bg_server", "browser_launch", "git_commit", "todo_write"]
 }
+
+# Typed subagents (task tool subagent_type). The task schema promises
+# "explore (read-only)" and "bash (shell only)" — these lists make that
+# a policy instead of a prompt suggestion. explore gets the same
+# read-only repository inspection set as a council panelist; no shell,
+# writes, web, MCP (unknown side effects) or host-state tools.
+fun subagent_explore_tools() { council_panel_tools() }
+
+fun subagent_bash_tools() { ["bash"] }
 
 # Council panelists inspect the repository independently. Keep the first
 # prototype read-only and non-recursive: no shell, writes, background work,

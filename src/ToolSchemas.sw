@@ -309,7 +309,7 @@ fun task_s() {
         obj(%{
             description: s("A short (3-5 word) task label, for the UI"),
             prompt: s("The full task instructions for the subagent"),
-            subagent_type: s("'general' (all tools) | 'explore' (read-only: read/glob/grep) | 'bash' (shell only)")
+            subagent_type: s("'general' (all tools but task/memory/skill/git_commit/background-server writes) | 'explore' (read-only, enforced: read/glob/grep/git_status/git_diff/code_search) | 'bash' (shell only, enforced)")
         }, ["description", "prompt"]))
 }
 

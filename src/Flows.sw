@@ -30,8 +30,20 @@ module Flows
 #       }
 #     ]
 #   }
+#
+# Robustness: a workflow file is user input. Its SHAPE is validated
+# (validate_workflow) before the alt-screen opens or anything launches —
+# a malformed file ({"phases":"oops"}, a task that isn't an object, a
+# missing prompt) prints one error line and returns to the prompt
+# instead of panicking the interactive session.
+#
+# Concurrency: a phase's tasks are QUEUED and launched at most
+# flows_max_parallel() at a time (SWARM_CODE_FLOWS_MAX_PARALLEL, default
+# 4); each render tick refills free slots. Previously a 12-task phase
+# forked 12 full swarm-code children within 0.15s.
 
 import Background
+import JsonCheck
 import FlowsRender
 import Scheduler
 import Util
@@ -82,7 +94,10 @@ fun run_from_json_file(path, opts) {
     if (content == nil) {
         print(UI.err_color() ++ "error: cannot read file: " ++ path ++ UI.reset())
     } else {
-        decoded = json_decode(content)
+        # Strict check first: json_decode guesses through damage (a
+        # truncated file decodes to a partial workflow that would run).
+        decoded = if (JsonCheck.valid(string_trim(content)) == 'true') { json_decode(content) }
+                  else { nil }
         if (decoded == nil) {
             print(UI.err_color() ++ "error: invalid JSON in: " ++ path ++ UI.reset())
         } else {
@@ -92,6 +107,79 @@ fun run_from_json_file(path, opts) {
 }
 
 fun run_json_workflow(workflow_map, opts) {
+    v = validate_workflow(workflow_map)
+    if (elem(v, 0) != 'ok') {
+        print(UI.err_color() ++ "error: invalid workflow — " ++ to_string(elem(v, 1)) ++ UI.reset())
+        print(UI.grey_text() ++ "  expected { \"phases\": [ { \"name\": \"…\", \"tasks\": " ++
+              "[ { \"label\": \"…\", \"prompt\": \"…\" } ] } ] }" ++ UI.reset())
+    } else {
+        run_valid_workflow(workflow_map, opts)
+    }
+}
+
+# validate_workflow(w) → {'ok'} | {'error', reason}. Every shape the
+# rest of this module walks with hd/tl/map_get is checked here, so the
+# run itself never meets a non-list or a non-map.
+fun validate_workflow(w) {
+    if (is_map(w) == 'false') { {'error', "the workflow must be a JSON object"} }
+    else {
+        phases = map_get(w, 'phases')
+        if (phases == nil) { {'ok'} }
+        else { if (is_list(phases) == 'false') {
+            {'error', "\"phases\" must be an array (got " ++ typeof(phases) ++ ")"}
+        } else { validate_phases(phases, 0) } }
+    }
+}
+
+fun validate_phases(phases, i) {
+    if (length(phases) == 0) { {'ok'} }
+    else {
+        p = hd(phases)
+        where = "phase " ++ to_string(i + 1)
+        if (is_map(p) == 'false') { {'error', where ++ " must be an object"} }
+        else {
+            tasks = map_get(p, 'tasks')
+            r = if (tasks == nil) { {'ok'} }
+                else { if (is_list(tasks) == 'false') {
+                    {'error', where ++ ": \"tasks\" must be an array (got " ++ typeof(tasks) ++ ")"}
+                } else { validate_tasks(tasks, where, 0) } }
+            if (elem(r, 0) != 'ok') { r } else { validate_phases(tl(phases), i + 1) }
+        }
+    }
+}
+
+fun validate_tasks(tasks, where, j) {
+    if (length(tasks) == 0) { {'ok'} }
+    else {
+        t = hd(tasks)
+        at = where ++ " task " ++ to_string(j + 1)
+        if (is_map(t) == 'false') { {'error', at ++ " must be an object"} }
+        else {
+            prompt = map_get(t, 'prompt')
+            model = map_get(t, 'model')
+            label = map_get(t, 'label')
+            if (prompt == nil || typeof(prompt) != "string" || string_length(string_trim(prompt)) == 0) {
+                {'error', at ++ ": \"prompt\" must be a non-empty string"}
+            } else { if (model != nil && typeof(model) != "string") {
+                {'error', at ++ ": \"model\" must be a string"}
+            } else { if (label != nil && is_map(label) == 'true') {
+                {'error', at ++ ": \"label\" must be a string"}
+            } else { if (label != nil && is_list(label) == 'true') {
+                {'error', at ++ ": \"label\" must be a string"}
+            } else { validate_tasks(tl(tasks), where, j + 1) }}}}
+        }
+    }
+}
+
+# Max concurrently running tasks: SWARM_CODE_FLOWS_MAX_PARALLEL (a
+# positive integer; anything else is ignored), default 4.
+fun flows_max_parallel() {
+    env = getenv("SWARM_CODE_FLOWS_MAX_PARALLEL")
+    n = if (env == nil) { nil } else { to_int(string_trim(env)) }
+    if (n == nil || n < 1 || to_string(n) != string_trim(to_string(env))) { 4 } else { n }
+}
+
+fun run_valid_workflow(workflow_map, opts) {
     # Reuse the agent's Background table (carried in opts): a private
     # table restarts the bg-N id counter at bg-0 and collides with the
     # agent's own (never-cleaned) /tmp/swarm-code-bg-N.* files, so a
@@ -186,35 +274,103 @@ fun init_tasks(tasks, idx, acc) {
     }
 }
 
-# spawn_phase_tasks(phase_idx, state, bg_table, opts) — launch all tasks in a phase
+# spawn_phase_tasks(phase_idx, state, bg_table, opts) — start a phase:
+# mark it running and launch its first flows_max_parallel() tasks; the
+# rest stay queued ('pending', no bg_task_id) for fill_phase_slots.
 fun spawn_phase_tasks(phase_idx, state, bg_table, opts) {
     phases = map_get(state, 'phases')
     phase = list_nth(phases, phase_idx)
     if (phase == nil) { state }
     else {
-        tasks = map_get(phase, 'tasks')
-        new_tasks = spawn_task_list(tasks, bg_table, opts, phase_idx, [])
-        new_phase = map_put(phase, 'tasks', new_tasks)
-        new_phase2 = map_put(new_phase, 'status', 'running')
-        new_phases = list_replace_nth(phases, phase_idx, new_phase2)
-        state2 = map_put(state, 'phases', new_phases)
-        map_put(state2, 'selected_phase', phase_idx)
+        new_phase = map_put(phase, 'status', 'running')
+        state2 = map_put(state, 'phases', list_replace_nth(phases, phase_idx, new_phase))
+        fill_phase_slots(phase_idx, map_put(state2, 'selected_phase', phase_idx), bg_table, opts)
     }
 }
 
-fun spawn_task_list(tasks, bg_table, opts, phase_idx, acc) {
+# Launch queued tasks of phase `phase_idx` into free slots (called on
+# phase start and every render tick). A no-op once the phase is full or
+# drained.
+fun fill_phase_slots(phase_idx, state, bg_table, opts) {
+    phases = map_get(state, 'phases')
+    phase = list_nth(phases, phase_idx)
+    if (phase == nil) { state }
+    else {
+        tasks = map_get(phase, 'tasks')
+        quota = launch_quota(tasks, flows_max_parallel())
+        if (quota <= 0) { state }
+        else {
+            new_tasks = launch_queued(tasks, quota, bg_table, [])
+            new_phase = map_put(phase, 'tasks', new_tasks)
+            map_put(state, 'phases', list_replace_nth(phases, phase_idx, new_phase))
+        }
+    }
+}
+
+# How many queued tasks may start now: free slots (cap − running),
+# bounded by how many are still queued. Pure — unit-tested.
+fun launch_quota(tasks, cap) {
+    running = count_running(tasks, 0)
+    queued = count_queued(tasks, 0)
+    free = cap - running
+    if (free <= 0) { 0 } else { if (queued < free) { queued } else { free } }
+}
+
+# Launched and not finished (bg id set, status not terminal).
+fun count_running(tasks, acc) {
     if (length(tasks) == 0) { acc }
     else {
         t = hd(tasks)
-        prompt = map_get(t, 'prompt')
-        label = map_get(t, 'label')
-        model = map_get(t, 'model')
-        cmd = build_task_cmd(to_string(prompt), model)
-        bg_task_id = Background.launch(bg_table, cmd, to_string(label))
+        live = map_get(t, 'bg_task_id') != nil && task_is_terminal(t) == 'false'
+        count_running(tl(tasks), (if (live) { acc + 1 } else { acc }))
+    }
+}
+
+# Not launched yet (and not failed to launch).
+fun count_queued(tasks, acc) {
+    if (length(tasks) == 0) { acc }
+    else {
+        t = hd(tasks)
+        q = map_get(t, 'bg_task_id') == nil && task_is_terminal(t) == 'false'
+        count_queued(tl(tasks), (if (q) { acc + 1 } else { acc }))
+    }
+}
+
+fun task_is_terminal(t) {
+    s = map_get(t, 'status')
+    s_str = if (s == nil) { "pending" } else { to_string(s) }
+    if (s_str == "done" || s_str == "error" || s_str == "killed") { 'true' } else { 'false' }
+}
+
+# Launch the first `quota` queued tasks, in order; others unchanged.
+fun launch_queued(tasks, quota, bg_table, acc) {
+    if (length(tasks) == 0) { acc }
+    else {
+        t = hd(tasks)
+        queued = map_get(t, 'bg_task_id') == nil && task_is_terminal(t) == 'false'
+        if (quota > 0 && queued) {
+            launch_queued(tl(tasks), quota - 1, bg_table, list_append(acc, launch_task(t, bg_table)))
+        } else {
+            launch_queued(tl(tasks), quota, bg_table, list_append(acc, t))
+        }
+    }
+}
+
+fun launch_task(t, bg_table) {
+    prompt = map_get(t, 'prompt')
+    label = map_get(t, 'label')
+    model = map_get(t, 'model')
+    cmd = build_task_cmd(to_string(prompt), model)
+    bg_task_id = Background.launch(bg_table, cmd, to_string(label))
+    now = timestamp()
+    if (string_starts_with(to_string(bg_task_id), "error:") == 'true') {
+        # Launch failed: finish the task as an error instead of leaving a
+        # bogus id that would read 'pending' forever and hang the flow.
+        map_put(map_put(map_put(t, 'status', 'error'), 'started_ms', now), 'ended_ms', now)
+    } else {
         new_t = map_put(t, 'bg_task_id', bg_task_id)
         new_t2 = map_put(new_t, 'status', 'running')
-        new_t3 = map_put(new_t2, 'started_ms', timestamp())
-        spawn_task_list(tl(tasks), bg_table, opts, phase_idx, list_append(acc, new_t3))
+        map_put(new_t2, 'started_ms', now)
     }
 }
 
@@ -260,9 +416,11 @@ fun render_loop(state, bg_table, opts) {
     w = UI.term_width()
     FlowsRender.render_frame(refreshed3, w, 24)
 
-    # Check if current phase is done, spawn next phase if needed
+    # Refill the current phase's free slots from its queue, then check
+    # whether it is done and the next phase should start.
     selected = map_get(refreshed3, 'selected_phase')
-    phases = map_get(refreshed3, 'phases')
+    refilled = fill_phase_slots(selected, refreshed3, bg_table, opts)
+    phases = map_get(refilled, 'phases')
     current_phase = list_nth(phases, selected)
     cur_done = if (current_phase == nil) { 'true' }
                else { all_agents_done(current_phase) }
@@ -271,12 +429,12 @@ fun render_loop(state, bg_table, opts) {
         next_idx = selected + 1
         if (next_idx < length(phases)) {
             # Spawn next phase
-            spawn_phase_tasks(next_idx, refreshed3, bg_table, opts)
+            spawn_phase_tasks(next_idx, refilled, bg_table, opts)
         } else {
             # All phases done
-            map_put(refreshed3, 'phase', 'done')
+            map_put(refilled, 'phase', 'done')
         }
-    } else { refreshed3 }
+    } else { refilled }
 
     # Check if all done or user requested stop via stop-file
     all_done = all_phases_done(state_after_phase)

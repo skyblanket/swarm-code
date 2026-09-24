@@ -36,7 +36,7 @@ export [
     tool_call, tool_result,
     bg_done, bg_stalled, compaction, permission,
     tail_recent, summarize,
-    redact
+    redact, redact_value
 ]
 
 # Ensure the telemetry directory exists and return the log path.
@@ -55,12 +55,14 @@ fun path() {
 }
 
 # Core writer: serialize a map to JSON + write a single line.
-# The map should already contain a 'type' key. The encoded line passes
-# through redact() so secrets in previews/args never reach disk — this
-# single funnel covers every event constructor below.
+# The map should already contain a 'type' key. Every string VALUE is
+# redacted BEFORE encoding (redact_value) so secrets in previews/args
+# never reach disk — this single funnel covers every event constructor
+# below. Redacting the ENCODED line instead corrupted it: a masked run
+# could swallow the letter of a \n escape, leaving an invalid `\[`.
 fun event(data) {
     with_ts = map_put(data, 'ts', timestamp())
-    line = redact(json_encode(with_ts)) ++ "\n"
+    line = json_encode(redact_value(with_ts)) ++ "\n"
     file_append(path(), line)
 }
 
@@ -229,16 +231,26 @@ fun truncate(s, max_len) {
 # Secret redaction
 # ------------------------------------------------------------
 #
-# redact(s) masks common secret shapes in a string before it is
-# written to disk. Applied to every events.jsonl line (see event())
-# and to trajectory exports (Trajectory module). Layered, cheapest
-# and most-precise first:
+# redact(s) masks common secret shapes in a PLAIN-TEXT string before it
+# is written to disk; redact_value(v) applies it to every string inside
+# a decoded value (maps / lists walked recursively, keys kept) and is
+# what callers use BEFORE json_encode — events.jsonl (event()) and
+# trajectory exports (Trajectory module). Never run redact over encoded
+# JSON: escapes (\n, \") would be masked into invalid JSON.
+# Layered, cheapest and most-precise first:
 #   1. exact match on live SWARM_CODE_API_KEY / SWARM_CODE_EMBED_KEY
-#   2. known token prefixes (sk-, mk_live_, AKIA, ghp_, xoxb-, ...)
-#   3. "Bearer <token>" authorization headers
-#   4. key/value shapes (_key":"..., password":"..., api_key=...,
-#      + JSON-escaped forms)
-#   5. long blobs: >= 40 contiguous [A-Za-z0-9+/=_-] mixing letters+digits
+#   2. PEM blocks (-----BEGIN …----- … -----END …-----): body masked
+#      wholesale — base64 lines with '/' dodged the blob heuristic
+#   3. URL userinfo: scheme://user:pass@host → scheme://user:[REDACTED]@host
+#   4. known token prefixes (sk-, mk_live_, AKIA, ghp_, xoxb-, ...)
+#   5. "Bearer <token>" authorization headers
+#   6. key/value shapes, case-insensitive, for identifiers ENDING in a
+#      secret word (password, passwd, secret, token, api_key, apikey,
+#      access_key, private_key, _key, …: PGPASSWORD=, AWS_SECRET_ACCESS_KEY=,
+#      "password": "…", password: … (YAML), \"token\":\"…\" (JSON in text))
+#      with optional quotes / whitespace around = : or =>
+#   7. long blobs: >= 40 contiguous [A-Za-z0-9+/=_-] mixing letters+digits;
+#      a backslash and the character it escapes end a run
 # sw has no regex, so these are recursive string_index_of/string_sub
 # scans (tail calls, flat stack). Stateless; thresholds are conservative
 # so file paths and short hashes stay readable.
@@ -246,22 +258,34 @@ fun truncate(s, max_len) {
 fun redact(s) {
     if (s == nil) { "" }
     else {
-        s1 = redact_exact(s, getenv("SWARM_CODE_API_KEY"))
+        s1 = redact_exact(to_string(s), getenv("SWARM_CODE_API_KEY"))
         s2 = redact_exact(s1, getenv("SWARM_CODE_EMBED_KEY"))
-        s3 = redact_prefixes(s2, [
+        s3 = redact_pem(s2, 0)
+        s4 = redact_userinfo(s3, 0)
+        s5 = redact_prefixes(s4, [
             "sk-", "mk_live_", "mk_test_", "AKIA", "ghp_", "gho_",
             "github_pat_", "xoxb-", "xoxp-"
         ])
-        s4 = redact_bearers(s3, ["Bearer ", "bearer "])
-        s5 = redact_kvs(s4, [
-            "_key\":\"", "token\":\"", "secret\":\"", "password\":\"",
-            "authorization\":\"", "Authorization\":\"",
-            "_key\\\":\\\"", "token\\\":\\\"", "secret\\\":\\\"", "password\\\":\\\"",
-            "authorization\\\":\\\"", "Authorization\\\":\\\"",
-            "api_key="
-        ])
-        redact_blobs(s5, string_length(s5), 0, 0, 'false', 'false')
+        s6 = redact_bearers(s5, ["Bearer ", "bearer "])
+        s7 = redact_kvs(s6, rd_secret_words())
+        redact_blobs(s7, string_length(s7), 0, 0, 'false', 'false')
     }
+}
+
+# Redact every string inside a decoded JSON-shaped value. Map keys are
+# structure, not data, and are kept verbatim.
+fun redact_value(v) {
+    if (v == nil) { v }
+    else { if (typeof(v) == "string") { redact(v) }
+    else { if (is_list(v) == 'true') { map(fn(x) { redact_value(x) }, v) }
+    else { if (is_map(v) == 'true') {
+        rd_map_loop(map_keys(v), map_values(v), map_new())
+    } else { v } } } }
+}
+
+fun rd_map_loop(keys, vals, acc) {
+    if (length(keys) == 0) { acc }
+    else { rd_map_loop(tl(keys), tl(vals), map_put(acc, hd(keys), redact_value(hd(vals)))) }
 }
 
 # Layer 1: exact-match a live key value (zero false positives).
@@ -273,7 +297,81 @@ fun redact_exact(s, k) {
     }
 }
 
-# Layer 2: known token prefixes. Keeps the prefix visible (so logs
+# Layer 2: PEM blocks. The BEGIN/END lines stay (they say WHAT was
+# there); everything between is masked. A block with no END (a
+# truncated preview) is masked to the end of the string.
+fun redact_pem(s, from) {
+    slen = string_length(s)
+    idx = rd_index_from(s, "-----BEGIN ", from)
+    if (idx < 0) { s }
+    else {
+        close = rd_index_from(s, "-----", idx + 11)
+        body_start = if (close < 0) { slen } else { close + 5 }
+        end_idx = rd_index_from(s, "-----END ", body_start)
+        if (end_idx < 0) {
+            string_sub(s, 0, body_start) ++ "\n[REDACTED]"
+        } else {
+            ns = string_sub(s, 0, body_start) ++ "\n[REDACTED]\n" ++
+                 string_sub(s, end_idx, slen - end_idx)
+            redact_pem(ns, body_start + 12 + 9)
+        }
+    }
+}
+
+# Layer 3: URL userinfo. In scheme://user:pass@host the password is
+# masked (the user stays: it is rarely secret and useful context).
+fun redact_userinfo(s, from) {
+    slen = string_length(s)
+    idx = rd_index_from(s, "://", from)
+    if (idx < 0) { s }
+    else {
+        auth_start = idx + 3
+        auth_end = rd_authority_end(s, auth_start, slen)
+        at = rd_last_at(s, auth_start, auth_end, 0 - 1)
+        colon = if (at < 0) { 0 - 1 } else { rd_index_in(s, 58, auth_start, at) }
+        if (colon < 0 || at - colon - 1 < 1 ||
+            string_sub(s, colon + 1, at - colon - 1) == "[REDACTED]") {
+            redact_userinfo(s, auth_start)
+        } else {
+            ns = string_sub(s, 0, colon + 1) ++ "[REDACTED]" ++ string_sub(s, at, slen - at)
+            redact_userinfo(ns, colon + 11)
+        }
+    }
+}
+
+# End of a URL authority: first / ? # whitespace quote < > \ ) ] or end.
+fun rd_authority_end(s, i, slen) {
+    if (i >= slen) { i }
+    else {
+        c = codepoint_at(s, i)
+        if (c == 47 || c == 63 || c == 35 || c == 32 || c == 9 || c == 10 || c == 13 ||
+            c == 34 || c == 39 || c == 60 || c == 62 || c == 92 || c == 41 || c == 93) { i }
+        else { rd_authority_end(s, i + 1, slen) }
+    }
+}
+
+fun rd_last_at(s, i, stop, found) {
+    if (i >= stop) { found }
+    else { rd_last_at(s, i + 1, stop, (if (codepoint_at(s, i) == 64) { i } else { found })) }
+}
+
+# First index of byte `c` in [i, stop), or -1.
+fun rd_index_in(s, c, i, stop) {
+    if (i >= stop) { 0 - 1 }
+    else { if (codepoint_at(s, i) == c) { i } else { rd_index_in(s, c, i + 1, stop) } }
+}
+
+# string_index_of with a start offset (absolute result, -1 if absent).
+fun rd_index_from(s, needle, from) {
+    slen = string_length(s)
+    if (from >= slen) { 0 - 1 }
+    else {
+        idx = string_index_of(string_sub(s, from, slen - from), needle)
+        if (idx < 0) { 0 - 1 } else { from + idx }
+    }
+}
+
+# Layer 4: known token prefixes. Keeps the prefix visible (so logs
 # still show what KIND of key was masked), masks the token body when
 # prefix + body is >= 16 chars.
 fun redact_prefixes(s, prefixes) {
@@ -312,7 +410,7 @@ fun redact_prefix_from(s, prefix, from) {
     }
 }
 
-# Layer 3: "Bearer <token>" — mask the token after the marker when it
+# Layer 5: "Bearer <token>" — mask the token after the marker when it
 # is >= 12 chars.
 fun redact_bearers(s, markers) {
     if (length(markers) == 0) { s }
@@ -340,39 +438,148 @@ fun redact_bearer_from(s, marker, from) {
     }
 }
 
-# Layer 4: key/value shapes. Covers bare field names (password":",
-# token":", secret":" — token/secret also catch the _token/_secret
-# suffixed forms), the _key suffix (api_key etc.; bare key":" would
-# false-positive on words like monkey), and the backslash-escaped
-# forms (_key\":\"<val>) that appear once tool args are embedded
-# inside a JSON-encoded line. Values >= 8 chars are masked up to the
-# next quote/backslash/whitespace/delimiter.
-fun redact_kvs(s, markers) {
-    if (length(markers) == 0) { s }
-    else { redact_kvs(redact_kv_from(s, hd(markers), 0), tl(markers)) }
+# Layer 6: key/value secrets. Each entry is {word, min_value_len}: an
+# identifier (case-insensitive) ENDING in `word` — PGPASSWORD,
+# db_password, AWS_SECRET_ACCESS_KEY, X-Api-Key — followed by an
+# optional closing quote (" ' or \"), blanks, a separator (= : =>, but
+# not == or ::), blanks and an optional opening quote. Words that are
+# unambiguous secrets mask any non-trivial value; the generic suffixes
+# (token, _key) keep the old >= 8 threshold so `max_token: 4096` or
+# `sort_key: id` stay readable.
+fun rd_secret_words() {
+    [{"password", 1}, {"passwd", 1}, {"passphrase", 1}, {"secret", 1},
+     {"api_key", 1}, {"apikey", 1}, {"api-key", 1}, {"access_key", 1},
+     {"private_key", 1}, {"authorization", 1},
+     {"token", 8}, {"_key", 8}, {"-key", 8}, {"credential", 8}, {"credentials", 8}]
 }
 
-fun redact_kv_from(s, marker, from) {
-    slen = string_length(s)
-    if (from >= slen) { s }
+fun redact_kvs(s, words) {
+    if (length(words) == 0) { s }
     else {
-        idx = string_index_of(string_sub(s, from, slen - from), marker)
-        if (idx < 0) { s }
+        w = hd(words)
+        redact_kvs(redact_kv_from(s, string_lower(s), elem(w, 0), elem(w, 1), 0), tl(words))
+    }
+}
+
+# `low` is string_lower(s): same byte length (ASCII-only lowering), so
+# offsets found in it apply to `s`.
+fun redact_kv_from(s, low, word, min_len, from) {
+    slen = string_length(s)
+    idx = rd_index_from(low, word, from)
+    if (idx < 0) { s }
+    else {
+        wend = idx + string_length(word)
+        ident_ends = if (wend >= slen) { 'true' }
+                     else { if (rd_is_token(codepoint_at(s, wend)) == 'true') { 'false' } else { 'true' } }
+        span = if (ident_ends == 'true') { rd_kv_span(s, wend, slen, min_len <= 1) } else { {0 - 1, 0 - 1} }
+        vs = elem(span, 0)
+        ve = elem(span, 1)
+        if (vs < 0) { redact_kv_from(s, low, word, min_len, wend) }
+        else { if (rd_kv_maskable(s, vs, ve, min_len) == 'false') {
+            redact_kv_from(s, low, word, min_len, (if (ve > wend) { ve } else { wend }))
+        } else {
+            ns = string_sub(s, 0, vs) ++ "[REDACTED]" ++ string_sub(s, ve, slen - ve)
+            redact_kv_from(ns, string_lower(ns), word, min_len, vs + 10)
+        }}
+    }
+}
+
+# Value span {start, end} after a key ending at i, or {-1, -1} when no
+# key/value separator follows. Quoted values run to the matching quote;
+# unquoted `=` values (env / query / ini) stop at whitespace and
+# delimiters; unquoted `:` values (YAML / headers) run to end of line
+# for the unambiguous secret words (`to_eol`: "password: two words")
+# but stop at whitespace for the generic suffixes, so prose such as
+# "max_token: 4096 sort_key: id" keeps its short values.
+fun rd_kv_span(s, i, slen, to_eol) {
+    j0 = rd_skip_key_quote(s, i, slen)
+    j1 = rd_skip_blanks(s, j0, slen)
+    if (j1 >= slen) { {0 - 1, 0 - 1} }
+    else {
+        c = codepoint_at(s, j1)
+        n1 = if (j1 + 1 < slen) { codepoint_at(s, j1 + 1) } else { 0 }
+        sep_end = if (c == 58 && n1 != 58) { j1 + 1 }                     # :  (not ::)
+                  else { if (c == 61 && n1 == 62) { j1 + 2 }               # =>
+                  else { if (c == 61 && n1 != 61) { j1 + 1 }               # =  (not ==)
+                  else { 0 - 1 } } }
+        if (sep_end < 0) { {0 - 1, 0 - 1} }
         else {
-            val_start = from + idx + string_length(marker)
-            val_end = rd_value_end(s, val_start, slen)
-            if (val_end - val_start >= 8) {
-                ns = string_sub(s, 0, val_start) ++ "[REDACTED]" ++
-                     string_sub(s, val_end, slen - val_end)
-                redact_kv_from(ns, marker, val_start + 10)
+            j = rd_skip_blanks(s, sep_end, slen)
+            q = if (j < slen) { codepoint_at(s, j) } else { 0 }
+            q2 = if (j + 1 < slen) { codepoint_at(s, j + 1) } else { 0 }
+            if (q == 34 || q == 39) {
+                {j + 1, rd_until_quote(s, j + 1, slen, q)}
+            } else { if (q == 92 && q2 == 34) {
+                {j + 2, rd_until_quote(s, j + 2, slen, 92)}
+            } else { if (c == 58 && to_eol == 'true') {
+                {j, rd_trim_end(s, j, rd_until_eol(s, j, slen))}
             } else {
-                redact_kv_from(s, marker, val_start)
-            }
+                {j, rd_value_end(s, j, slen)}
+            }}}
         }
     }
 }
 
-# Layer 5: long-blob heuristic. Any contiguous run of base64-ish chars
+fun rd_skip_key_quote(s, i, slen) {
+    if (i >= slen) { i }
+    else {
+        c = codepoint_at(s, i)
+        if (c == 34 || c == 39) { i + 1 }
+        else { if (c == 92 && i + 1 < slen && codepoint_at(s, i + 1) == 34) { i + 2 }
+        else { i } }
+    }
+}
+
+fun rd_skip_blanks(s, i, slen) {
+    if (i >= slen) { i }
+    else {
+        c = codepoint_at(s, i)
+        if (c == 32 || c == 9) { rd_skip_blanks(s, i + 1, slen) } else { i }
+    }
+}
+
+# Up to (not including) quote byte q, a backslash, or a newline.
+fun rd_until_quote(s, i, slen, q) {
+    if (i >= slen) { i }
+    else {
+        c = codepoint_at(s, i)
+        if (c == q || c == 92 || c == 10 || c == 13) { i } else { rd_until_quote(s, i + 1, slen, q) }
+    }
+}
+
+# Up to end of line, or a flow-style delimiter , } ] or quote.
+fun rd_until_eol(s, i, slen) {
+    if (i >= slen) { i }
+    else {
+        c = codepoint_at(s, i)
+        if (c == 10 || c == 13 || c == 44 || c == 125 || c == 93 || c == 34 || c == 39) { i }
+        else { rd_until_eol(s, i + 1, slen) }
+    }
+}
+
+fun rd_trim_end(s, start, e) {
+    if (e <= start) { e }
+    else {
+        c = codepoint_at(s, e - 1)
+        if (c == 32 || c == 9) { rd_trim_end(s, start, e - 1) } else { e }
+    }
+}
+
+# Worth masking: long enough for its class, not already masked, and not
+# a bare boolean/null ("secret: true" is configuration, not a secret).
+fun rd_kv_maskable(s, vs, ve, min_len) {
+    n = ve - vs
+    if (n < min_len || n < 1) { 'false' }
+    else {
+        v = string_lower(string_sub(s, vs, n))
+        # "[redacted" — the span may stop at the marker's own "]".
+        if (string_starts_with(v, "[redacted") == 'true') { 'false' }
+        else { if (v == "true" || v == "false" || v == "null" || v == "none" || v == "nil") { 'false' }
+        else { 'true' } }
+    }
+}
+
+# Layer 7: long-blob heuristic. Any contiguous run of base64-ish chars
 # [A-Za-z0-9+/=_-] that is >= 40 long AND mixes letters with digits is
 # masked. Threshold 40 keeps file paths and 7-char short hashes
 # readable; "[REDACTED]" (letters only) can never re-match itself.
@@ -380,6 +587,9 @@ fun redact_kv_from(s, marker, from) {
 # exactly 40/64 chars (full git SHA-1/SHA-256) and '/'-bearing runs
 # under 80 chars (digit-containing file paths — '/' stays in the
 # charset because base64 secrets contain it, but those run long).
+# A backslash ends a run AND the byte it escapes is skipped: in text
+# that embeds JSON / C strings, "\nAKIA…" must not become a run
+# starting with the escape letter (masking it yields "\[REDACTED]").
 fun redact_blobs(s, slen, i, start, seen_alpha, seen_digit) {
     if (i >= slen) {
         if (rd_blob_hit(s, start, slen, seen_alpha, seen_digit) == 'true') {
@@ -392,12 +602,14 @@ fun redact_blobs(s, slen, i, start, seen_alpha, seen_digit) {
             nd = if (rd_is_digit(c) == 'true') { 'true' } else { seen_digit }
             redact_blobs(s, slen, i + 1, start, na, nd)
         } else {
+            skip = if (c == 92) { 2 } else { 1 }
             if (rd_blob_hit(s, start, i, seen_alpha, seen_digit) == 'true') {
                 ns = string_sub(s, 0, start) ++ "[REDACTED]" ++
                      string_sub(s, i, slen - i)
-                redact_blobs(ns, string_length(ns), start + 10, start + 10, 'false', 'false')
+                nstart = start + 10 + skip
+                redact_blobs(ns, string_length(ns), nstart, nstart, 'false', 'false')
             } else {
-                redact_blobs(s, slen, i + 1, i + 1, 'false', 'false')
+                redact_blobs(s, slen, i + skip, i + skip, 'false', 'false')
             }
         }
     }
@@ -448,7 +660,7 @@ fun rd_token_end(s, i, slen) {
 }
 
 # End (exclusive) of a secret value: stops at whitespace, quotes,
-# backslash (start of a JSON escape), and ,/}/]/& delimiters.
+# backslash (start of a JSON escape), and , } ] & ; ) delimiters.
 fun rd_value_end(s, i, slen) {
     if (i >= slen) { i }
     else {
@@ -471,8 +683,8 @@ fun rd_is_alpha(c) { (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
 
 fun rd_is_digit(c) { c >= 48 && c <= 57 }
 
-# space tab nl cr " ' \ , } ] &
+# space tab nl cr " ' \ , } ] & ; )
 fun rd_is_stop(c) {
     c == 32 || c == 9 || c == 10 || c == 13 || c == 34 || c == 39 ||
-    c == 92 || c == 44 || c == 125 || c == 93 || c == 38
+    c == 92 || c == 44 || c == 125 || c == 93 || c == 38 || c == 59 || c == 41
 }

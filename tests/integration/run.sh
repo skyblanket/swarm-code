@@ -32,6 +32,7 @@
 #   T14 headless 'ask'      — an explicit "ask" or a dangerous command is
 #                             denied headless unless HEADLESS_APPROVE=1
 #   T15 request-body dump   — never to /tmp; only SWARM_CODE_DEBUG=1, 0600
+#   A*  agents/MCP/scheduler — see tests/integration/agents_cases.sh
 #
 # Exit code: 0 iff every test passes.
 
@@ -695,6 +696,9 @@ EOF
 
 # ------------------------------------------------------------
 
+# Multi-agent / MCP / scheduler / persistence cases (A1..).
+. "$ROOT/tests/integration/agents_cases.sh"
+
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 t1
@@ -712,6 +716,7 @@ t12
 t13
 t14
 t15
+agents_cases
 
 echo "----------------------------------------"
 echo "integration: $PASS passed, $FAIL failed"

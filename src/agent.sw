@@ -2478,9 +2478,20 @@ fun tool_crash_msg(name, reason) {
 # ------------------------------------------------------------
 # Subagent via the Task tool — synchronous in-process loop.
 # ------------------------------------------------------------
+# Isolation rules (each a reviewed bug):
+#   * a FRESH ToolGuardrails table per subagent — sharing the parent's
+#     let a subagent's 8 failing reads set the parent's halt_reason, so
+#     the PARENT's turn halted and never saw the subagent's result. The
+#     subagent's own halt is checked inside run_subagent_loop.
+#   * per-type tool allow-lists are ENFORCED (execution_context +
+#     subagent_exec_all), not just promised in the prompt: an explore
+#     subagent could run bash and write.
+#   * the result is bounded (subagent_result_cap) and never lossy: every
+#     abnormal stop (max steps, guardrail halt, LLM failure) returns what
+#     the subagent had found so far plus the reason.
 fun handle_task_tool(args, opts) {
     prompt = map_get(args, 'prompt')
-    stype = map_get(args, 'subagent_type', "general")
+    stype = subagent_type_of(map_get(args, 'subagent_type'))
 
     if (prompt == nil) {
         "error: task tool requires a 'prompt' argument"
@@ -2488,28 +2499,55 @@ fun handle_task_tool(args, opts) {
         sub_sys = subagent_system_prompt(stype)
         sub_history = [
             LLM.new_message_system(sub_sys),
-            LLM.new_message_user(prompt)
+            LLM.new_message_user(to_string(prompt))
         ]
+        guard = ToolGuardrails.init()
         sub_opts0 = map_put(opts, 'is_subagent', 'true')
-        sub_opts = map_put(sub_opts0, 'execution_context', "subagent")
+        sub_opts1 = map_put(sub_opts0, 'execution_context', subagent_context(stype))
+        sub_opts2 = map_put(sub_opts1, 'subagent_type', stype)
+        sub_opts = map_put(sub_opts2, 'guardrails_table', guard)
         result = run_subagent_loop(sub_history, sub_opts, 0)
-        "[subagent:" ++ stype ++ "]\n" ++ result
+        # ETS tables are a finite resource (1024 live) — one per task call
+        # would leak without this.
+        ets_drop(guard)
+        "[subagent:" ++ stype ++ "]\n" ++ subagent_cap(result)
     }
 }
 
+# Normalise the model-supplied type: only "explore" and "bash" narrow
+# the tool set; anything else (missing, null, 5, "General") is general.
+fun subagent_type_of(v) {
+    t = if (v == nil) { "general" } else { string_lower(string_trim(to_string(v))) }
+    if (t == "explore" || t == "bash") { t } else { "general" }
+}
+
+# ToolExecutor enforces the context allow-list on every dispatch, so a
+# typed subagent's restriction holds even outside subagent_exec_all.
+fun subagent_context(stype) {
+    if (stype == "explore") { "subagent_explore" }
+    else { if (stype == "bash") { "subagent_bash" }
+    else { "subagent" } }
+}
+
 fun subagent_max_steps() { 15 }
+
+# Same cap as bash / MCP output: a subagent's answer is a tool result
+# the parent re-sends on every later turn (a 320KB answer reached the
+# parent uncapped).
+fun subagent_result_cap() { 24000 }
 
 fun subagent_system_prompt(stype) {
     base = "You are a focused subagent spawned from swarm-code for a single " ++
            "task. Use tools as needed, then return a concise final answer."
     if (stype == "explore") {
-        base ++ "\n\nAllowed tools: read, glob, grep. Do NOT call bash, write, " ++
-                "edit, multi_edit, or web_fetch. Your job is to survey the " ++
+        base ++ "\n\nYou are READ-ONLY. Allowed tools: " ++
+                subagent_join(ToolRegistry.names_for("subagent_explore"), "") ++
+                ". Any other tool call is refused. Your job is to survey the " ++
                 "codebase and report findings."
     }
     else { if (stype == "bash") {
-        base ++ "\n\nAllowed tool: bash. Your job is to run shell commands and " ++
-                "report their output."
+        base ++ "\n\nAllowed tool: bash (any other tool call is refused). Your " ++
+                "job is to run shell commands and report their output."
     }
     else {
         base ++ "\n\nYou have the full swarm-code tool set. Be decisive and finish " ++
@@ -2517,35 +2555,92 @@ fun subagent_system_prompt(stype) {
     }}
 }
 
+fun subagent_join(names, acc) {
+    if (length(names) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { ", " }
+        subagent_join(tl(names), acc ++ sep ++ to_string(hd(names)))
+    }
+}
+
 fun subagent_llm_worker(token, parent, history, opts) {
     result = LLM.chat(history, opts)
     send(parent, {'llm_result', token, result})
 }
 
-fun subagent_await_llm(token, deadline) {
+# One LLM round for the subagent, in a MONITORED worker (a crash
+# surfaces as a reason instead of a silent 300s wait) bounded by the
+# configured LLM timeout (Config.llm_timeout_ms: SWARM_CODE_LLM_TIMEOUT_MS
+# → settings llm_timeout_ms → 300s) rather than a hard-coded 300s.
+# Returns {'ok', result_map} | {'error', reason_string}.
+fun subagent_llm_call(history, opts) {
+    token = to_string(self()) ++ "/" ++ to_string(timestamp()) ++ "/" ++
+            to_string(random_int(1, 1000000000))
+    {w, ref} = spawn_monitor(subagent_llm_worker(token, self(), history, opts))
+    timeout_ms = Config.llm_timeout_ms(opts)
+    r = subagent_await_llm(token, ref, timestamp() + timeout_ms)
+    tag = elem(r, 0)
+    if (tag == 'ok') {
+        result = elem(r, 1)
+        if (result == nil) { {'error', subagent_fail_reason(LLM.last_fail(opts))} }
+        else { {'ok', result} }
+    } else { if (tag == 'down') {
+        {'error', "the LLM worker crashed: " ++ to_string(elem(r, 1))}
+    } else {
+        # Give up on the hung call and kill the worker: it is parked in a
+        # blocking HTTP call, so the kill lands when that returns — which
+        # still stops LLM.chat's retry loop from re-sending the request
+        # up to 3 more times. A late reply carries a stale token and is
+        # dropped by any later await.
+        demonitor(ref)
+        exit_proc(w, 'killed')
+        {'error', "no response from the LLM within " ++ to_string(timeout_ms / 1000) ++
+                  "s (llm_timeout_ms / SWARM_CODE_LLM_TIMEOUT_MS)"}
+    }}
+}
+
+fun subagent_fail_reason(why) {
+    if (why == 'fatal') { "the endpoint rejected the request (4xx / malformed request)" }
+    else { if (why == 'transient') { "the endpoint kept failing after retries (5xx / dropped connection)" }
+    else { "the LLM call failed after retries (no usable response)" } }
+}
+
+# Wait for OUR worker's reply ({'ok', r}), its death ({'down', why}),
+# or the deadline ({'timeout'}). On success, also consume the worker's
+# normal-exit DOWN so it can't linger in the caller's (main's) mailbox.
+fun subagent_await_llm(token, ref, deadline) {
     wait = deadline - timestamp()
-    if (wait <= 0) { nil }
+    if (wait <= 0) { {'timeout'} }
     else {
         receive {
             {'llm_result', t, r} ->
-                if (t == token) { r }
-                else { subagent_await_llm(token, deadline) }
-            after wait { nil }
+                if (t == token) {
+                    receive {
+                        {'DOWN', dref, _kind, _pid, _why} when dref == ref -> 'ok'
+                        after 1000 { demonitor(ref) }
+                    }
+                    {'ok', r}
+                }
+                else { subagent_await_llm(token, ref, deadline) }
+            {'DOWN', dref, _kind, _pid, why} when dref == ref ->
+                {'down', why}
+            after wait { {'timeout'} }
         }
     }
 }
 
 fun run_subagent_loop(history, opts, step) {
     if (step >= subagent_max_steps()) {
-        "[subagent hit max steps without final answer]"
+        subagent_partial(history, "hit the " ++ to_string(subagent_max_steps()) ++
+                                  "-step limit before a final answer")
     } else {
-        token = to_string(timestamp())
-        spawn(subagent_llm_worker(token, self(), history, opts))
-        result = subagent_await_llm(token, timestamp() + 300000)
-        if (result == nil) {
-            "[subagent llm call failed]"
+        call = subagent_llm_call(history, opts)
+        if (elem(call, 0) != 'ok') {
+            subagent_partial(history, "LLM call failed — " ++ to_string(elem(call, 1)))
         } else {
-            content = to_string(map_get(result, 'content'))
+            result = elem(call, 1)
+            content_v = map_get(result, 'content')
+            content = if (content_v == nil) { "" } else { to_string(content_v) }
             tcs_v = map_get(result, 'tool_calls')
             reasoning = map_get(result, 'reasoning')
             tool_calls = if (tcs_v == nil) { [] } else { tcs_v }
@@ -2555,10 +2650,126 @@ fun run_subagent_loop(history, opts, step) {
                 asst = LLM.new_message_assistant(content, tool_calls, reasoning)
                 with_assistant = list_append(history, asst)
                 post_tools = subagent_exec_all(tool_calls, with_assistant, opts)
-                run_subagent_loop(post_tools, opts, step + 1)
+                # The subagent's OWN guardrail (fresh table, see
+                # handle_task_tool): a runaway failure streak stops the
+                # subagent, never the parent's turn.
+                guard = map_get(opts, 'guardrails_table')
+                halt = if (guard == nil) { nil } else { ets_get(guard, 'halt_reason') }
+                if (halt != nil) { subagent_partial(post_tools, "guardrail halt — " ++ to_string(halt)) }
+                else { run_subagent_loop(post_tools, opts, step + 1) }
             }
         }
     }
+}
+
+# An abnormal stop still returns what the subagent had: its latest
+# notes (last non-empty assistant text) and a digest of its most recent
+# tool calls + results, headed by why it stopped — the old
+# "[subagent hit max steps…]" discarded all of it.
+fun subagent_partial(history, why) {
+    notes = subagent_last_text(history, "")
+    digest = subagent_tool_digest(history, map_new(), [])
+    recent = subagent_last_n(digest, 4)
+    head = "[subagent stopped: " ++ why ++ " — partial results below]"
+    notes_part = if (string_length(string_trim(notes)) == 0) { "" }
+                 else { "\n\nLatest notes from the subagent:\n" ++ notes }
+    tools_part = if (length(recent) == 0) { "" }
+                 else { "\n\nMost recent tool results (oldest first, " ++
+                        to_string(length(recent)) ++ " of " ++ to_string(length(digest)) ++ "):" ++
+                        subagent_render_digest(recent, "") }
+    if (string_length(notes_part) == 0 && string_length(tools_part) == 0) {
+        head ++ "\n(no findings yet)"
+    } else { head ++ notes_part ++ tools_part }
+}
+
+fun subagent_last_text(msgs, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        c = map_get(m, 'content')
+        next = if (map_get(m, 'role') == 'assistant' && c != nil &&
+                   string_length(string_trim(to_string(c))) > 0) { to_string(c) } else { acc }
+        subagent_last_text(tl(msgs), next)
+    }
+}
+
+# [{label, result}] in history order. `calls` maps tool_call id →
+# "name args" from the assistant turns so each result is labelled.
+fun subagent_tool_digest(msgs, calls, acc) {
+    if (length(msgs) == 0) { acc }
+    else {
+        m = hd(msgs)
+        role = map_get(m, 'role')
+        if (role == 'assistant') {
+            tcs = map_get(m, 'tool_calls')
+            subagent_tool_digest(tl(msgs), subagent_index_calls(if (tcs == nil) { [] } else { tcs }, calls), acc)
+        } else { if (role == 'tool') {
+            id = to_string(map_get(m, 'tool_call_id'))
+            label = map_get(calls, id)
+            entry = {(if (label == nil) { "tool" } else { label }), to_string(map_get(m, 'content'))}
+            subagent_tool_digest(tl(msgs), calls, list_append(acc, entry))
+        } else { subagent_tool_digest(tl(msgs), calls, acc) } }
+    }
+}
+
+fun subagent_index_calls(tcs, calls) {
+    if (length(tcs) == 0) { calls }
+    else {
+        tc = hd(tcs)
+        label = to_string(map_get(tc, 'name')) ++ " " ++
+                preview_string(to_string(map_get(tc, 'arguments')), 120)
+        subagent_index_calls(tl(tcs), map_put(calls, to_string(map_get(tc, 'id')), label))
+    }
+}
+
+fun subagent_last_n(lst, n) {
+    k = length(lst) - n
+    if (k <= 0) { lst } else { subagent_drop(lst, k) }
+}
+
+fun subagent_drop(lst, k) {
+    if (k <= 0 || length(lst) == 0) { lst } else { subagent_drop(tl(lst), k - 1) }
+}
+
+fun subagent_render_digest(entries, acc) {
+    if (length(entries) == 0) { acc }
+    else {
+        e = hd(entries)
+        body = string_trim(elem(e, 1))
+        shown = if (string_length(body) > 2000) {
+            string_sub(body, 0, subagent_utf8_floor(body, 2000)) ++ "\n…[result truncated]"
+        } else { body }
+        subagent_render_digest(tl(entries), acc ++ "\n- " ++ elem(e, 0) ++ "\n" ++ shown)
+    }
+}
+
+# Head+tail cap with an explicit marker; the head (where findings are
+# usually summarised) gets two thirds. Cut points are moved back onto
+# UTF-8 character boundaries so the parent never re-sends a split
+# multi-byte sequence to the LLM.
+fun subagent_cap(s) {
+    n = string_length(s)
+    cap = subagent_result_cap()
+    if (n <= cap) { s }
+    else {
+        head_len = subagent_utf8_floor(s, cap * 2 / 3)
+        tail_start = subagent_utf8_floor(s, n - (cap - cap * 2 / 3))
+        string_sub(s, 0, head_len) ++
+            "\n\n…[" ++ to_string(tail_start - head_len) ++ " bytes of the subagent's answer elided " ++
+            "(cap " ++ to_string(cap) ++ ") — give it a narrower task for the details]…\n\n" ++
+            string_sub(s, tail_start, n - tail_start)
+    }
+}
+
+# Largest i' <= i that does not point into the middle of a UTF-8
+# sequence (continuation bytes are 0x80-0xBF).
+fun subagent_utf8_floor(s, i) {
+    if (i <= 0) { 0 }
+    else { if (i >= string_length(s)) { string_length(s) }
+    else {
+        c = codepoint_at(s, i)
+        if (c >= 128 && c < 192) { subagent_utf8_floor(s, i - 1) } else { i }
+    }}
 }
 
 # Tools the main agent can use but subagents cannot. Anything that
@@ -2569,9 +2780,26 @@ fun SUBAGENT_BLOCKED_TOOLS() {
     ToolRegistry.subagent_blocked_tools()
 }
 
-fun subagent_blocked(name) {
-    if (ToolRegistry.allowed_in("subagent", name) == 'true') { 'false' }
+# Blocked for a general subagent (the host-state blocklist above).
+fun subagent_blocked(name) { subagent_blocked_for("general", name) }
+
+# Per-type policy: explore = read-only inspection tools, bash = bash,
+# general = everything but SUBAGENT_BLOCKED_TOOLS. Backed by the same
+# ToolRegistry contexts ToolExecutor enforces on dispatch.
+fun subagent_blocked_for(stype, name) {
+    if (ToolRegistry.allowed_in(subagent_context(stype), to_string(name)) == 'true') { 'false' }
     else { 'true' }
+}
+
+fun subagent_block_msg(stype, name_str) {
+    if (stype == "explore") {
+        "error: tool '" ++ name_str ++ "' is not available to an explore (read-only) subagent — allowed: " ++
+            subagent_join(ToolRegistry.names_for("subagent_explore"), "")
+    } else { if (stype == "bash") {
+        "error: tool '" ++ name_str ++ "' is not available to a bash subagent — only bash is allowed"
+    } else {
+        "error: tool '" ++ name_str ++ "' is not available to subagents — only the main agent can use it"
+    }}
 }
 
 fun subagent_exec_all(tool_calls, history, opts) {
@@ -2580,9 +2808,10 @@ fun subagent_exec_all(tool_calls, history, opts) {
         tc = hd(tool_calls)
         id = to_string(map_get(tc, 'id'))
         name_str = to_string(map_get(tc, 'name'))
-        if (subagent_blocked(name_str) == 'true') {
-            blocked = "error: tool '" ++ name_str ++ "' is not available to subagents — only the main agent can use it"
-            tool_msg = LLM.new_message_tool(id, blocked)
+        stype_v = map_get(opts, 'subagent_type')
+        stype = if (stype_v == nil) { "general" } else { to_string(stype_v) }
+        if (subagent_blocked_for(stype, name_str) == 'true') {
+            tool_msg = LLM.new_message_tool(id, subagent_block_msg(stype, name_str))
             new_hist = list_append(history, tool_msg)
             subagent_exec_all(tl(tool_calls), new_hist, opts)
         } else {

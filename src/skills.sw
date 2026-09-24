@@ -43,7 +43,7 @@ import Util
 export [
     load, skills_dir, index_path, skill_dir, skill_file_path,
     save, recall, list_index, forget,
-    as_prompt_section, slugify
+    as_prompt_section, slugify, valid_slug
 ]
 
 fun skills_dir()             { getenv("HOME") ++ "/.swarm-code/skills" }
@@ -64,6 +64,14 @@ fun load() {
 # ------------------------------------------------------------
 fun save(name, description, triggers, instructions) {
     slug = slugify(to_string(name))
+    if (valid_slug(slug) == 'false') {
+        "error: skill name must contain letters or digits"
+    } else {
+        save_as(slug, name, description, triggers, instructions)
+    }
+}
+
+fun save_as(slug, name, description, triggers, instructions) {
     dir = skill_dir(slug)
     file_mkdir(dir)
     body =
@@ -82,7 +90,40 @@ fun save(name, description, triggers, instructions) {
     }
 }
 
+# ------------------------------------------------------------
+# Slug validation — recall/forget take the slug straight from the
+# model's tool call and splice it into a path. `../../../work/proj`
+# made forget_skill delete work/proj/SKILL.md and recall_skill read it.
+# A slug is ONE path component under skills_dir(): non-empty, no '/' or
+# '\', no '..', no leading '.', no control characters. save() already
+# slugifies names to [a-z0-9_]; hand-made skill directories with other
+# safe names (dashes, capitals, spaces) keep working.
+# ------------------------------------------------------------
+fun valid_slug(slug) {
+    s = if (slug == nil) { "" } else { to_string(slug) }
+    if (string_length(s) == 0 || string_length(s) > 128) { 'false' }
+    else { if (string_contains(s, "/") == 'true' || string_contains(s, "\\") == 'true') { 'false' }
+    else { if (string_contains(s, "..") == 'true' || string_starts_with(s, ".") == 'true') { 'false' }
+    else { slug_no_ctrl(s, 0) } } }
+}
+
+fun slug_no_ctrl(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else { if (codepoint_at(s, i) < 32 || codepoint_at(s, i) == 127) { 'false' }
+    else { slug_no_ctrl(s, i + 1) } }
+}
+
+fun invalid_slug_msg(slug) {
+    "error: invalid skill slug '" ++ to_string(slug) ++
+        "' — use a slug from the skills index (one name, no '/', '\\', '..' or leading '.')"
+}
+
 fun recall(slug) {
+    if (valid_slug(slug) == 'false') { invalid_slug_msg(slug) }
+    else { recall_valid(slug) }
+}
+
+fun recall_valid(slug) {
     p = skill_file_path(slug)
     if (file_exists(p) == 'false') {
         "error: no skill named '" ++ slug ++ "' — see /skills"
@@ -103,6 +144,11 @@ fun list_index() {
 }
 
 fun forget(slug) {
+    if (valid_slug(slug) == 'false') { invalid_slug_msg(slug) }
+    else { forget_valid(slug) }
+}
+
+fun forget_valid(slug) {
     p = skill_file_path(slug)
     if (file_exists(p) == 'false') {
         "error: no skill named '" ++ slug ++ "'"

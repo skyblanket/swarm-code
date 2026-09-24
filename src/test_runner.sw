@@ -26,6 +26,13 @@ import UI
 import Memory
 import Tools
 import Mcp
+import McpServer
+import JsonCheck
+import Flows
+import Trajectory
+import Log
+import Skills
+import SessionSearch
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -125,6 +132,25 @@ fun main() {
         t_scheduler_next_id_empty(),
         t_scheduler_next_id_nonempty(),
         t_scheduler_jobs_dir_suffix(),
+        # --- agents / MCP / scheduler / persistence regressions ---
+        t_mcp_msg_kind_collision(),
+        t_mcp_health_structured(),
+        t_mcp_server_spec_envelope(),
+        t_json_check_strict(),
+        t_subagent_type_allowlists(),
+        t_subagent_result_capped(),
+        t_subagent_partial_keeps_work(),
+        t_flows_validate_shapes(),
+        t_flows_launch_quota(),
+        t_trajectory_redacts_valid_jsonl(),
+        t_log_redact_value_shapes(),
+        t_skill_slug_traversal_blocked(),
+        t_session_search_reindexes_changed(),
+        t_sched_wrong_shape_never_panics(),
+        t_sched_corrupt_refuses_write(),
+        t_sched_strict_exprs(),
+        t_sched_hourly_on_the_hour(),
+        t_sched_dispatch_denies_dangerous(),
         t_memory_embed_db_path(),
         t_memory_dir_suffix(),
         t_memory_slugify_spaces(),
@@ -633,6 +659,127 @@ fun t_mcp_unconfigured() {
     check("mcp: unconfigured -> no schemas, no prompt section", ok)
 }
 
+# 'true' iff every element of a list of 'true'/'false' atoms is 'true'.
+# (ag_ prefix: helpers for the agents/MCP/scheduler regression block.)
+fun ag_all(lst) {
+    if (length(lst) == 0) { 'true' }
+    else { if (hd(lst) != 'true') { 'false' } else { ag_all(tl(lst)) } }
+}
+
+fun ag_is(a, b) { if (a == b) { 'true' } else { 'false' } }
+
+# A server→client request whose id COLLIDES with our in-flight call id
+# (the reviewer's {"id":100,"method":"roots/list"}) used to be taken as
+# the response → "MCP response carried no result". Anything carrying
+# `method` is a request/notification, never our reply; ping is answered
+# with {} and other requests with -32601.
+fun t_mcp_msg_kind_collision() {
+    req = json_decode("{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"roots/list\"}")
+    ping = json_decode("{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"method\":\"ping\"}")
+    note = json_decode("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}")
+    resp = json_decode("{\"jsonrpc\":\"2.0\",\"id\":100,\"result\":{}}")
+    sresp = json_decode("{\"jsonrpc\":\"2.0\",\"id\":\"100\",\"error\":{\"code\":1}}")
+    stale = json_decode("{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}")
+    ping_reply = Mcp.mcp_server_request_reply(ping)
+    roots_reply = Mcp.mcp_server_request_reply(req)
+    rerr = map_get(roots_reply, 'error')
+    ok = ag_all([
+        ag_is(Mcp.mcp_msg_kind(req, 100), 'request'),
+        ag_is(Mcp.mcp_msg_kind(note, 100), 'notification'),
+        ag_is(Mcp.mcp_msg_kind(resp, 100), 'response'),
+        ag_is(Mcp.mcp_msg_kind(sresp, 100), 'response'),
+        ag_is(Mcp.mcp_msg_kind(stale, 100), 'other'),
+        ag_is(Mcp.mcp_msg_kind(json_decode("[1]"), 100), 'other'),
+        ag_is(Mcp.mcp_msg_kind(nil, 100), 'other'),
+        ag_is(json_encode(ping_reply), "{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"result\":{}}"),
+        ag_is(map_get(roots_reply, 'id'), 100),
+        ag_is(map_get(rerr, 'code'), -32601)])
+    check("mcp: colliding-id server request is not our response; ping -> {}, others -> -32601", ok)
+}
+
+# Health bookkeeping keys on the structured call status, never the text:
+# a SUCCESSFUL result mentioning "connection lost" used to mark the
+# server failed (forced reconnect, then "not running" for 60s), and
+# "did not respond" in output counted as a timeout strike. EOF / write
+# failure ('lost') must fail the server at once.
+fun t_mcp_health_structured() {
+    ok_text = Mcp.mcp_format_result(json_decode(
+        "{\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"db connection lost; peer did not respond\"}]}}"))
+    is_err = Mcp.mcp_format_result(json_decode(
+        "{\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"boom\"}],\"isError\":true}}"))
+    rpc_err = Mcp.mcp_format_result(json_decode("{\"id\":1,\"error\":{\"code\":-1,\"message\":\"bad\"}}"))
+    t = ets_new()
+    ets_put(t, "s/status", "ok")
+    Mcp.mcp_note_result(t, "s", elem(ok_text, 0))
+    Mcp.mcp_note_result(t, "s", elem(ok_text, 0))
+    after_ok = ets_get(t, "s/status")
+    Mcp.mcp_note_result(t, "s", 'timeout')
+    after_one_timeout = ets_get(t, "s/status")
+    Mcp.mcp_note_result(t, "s", 'error')
+    Mcp.mcp_note_result(t, "s", 'timeout')
+    after_reset_timeout = ets_get(t, "s/status")
+    Mcp.mcp_note_result(t, "s", 'timeout')
+    after_two_timeouts = ets_get(t, "s/status")
+    ets_put(t, "s/status", "ok")
+    Mcp.mcp_note_result(t, "s", 'lost')
+    after_lost = ets_get(t, "s/status")
+    ets_drop(t)
+    ok = ag_all([
+        ag_is(elem(ok_text, 0), 'ok'),
+        ag_is(elem(ok_text, 1), "db connection lost; peer did not respond"),
+        ag_is(elem(is_err, 0), 'error'),
+        ag_is(elem(rpc_err, 0), 'error'),
+        ag_is(after_ok, "ok"),
+        ag_is(after_one_timeout, "ok"),
+        ag_is(after_reset_timeout, "ok"),
+        ag_is(after_two_timeouts, "failed"),
+        ag_is(after_lost, "failed")])
+    check("mcp: health follows call status (ok/error/timeout/lost), never result text", ok)
+}
+
+# --mcp-server spec conformance: ping used to be -32601 (spec: empty
+# result), an unknown tool -32601 (spec: -32602 Invalid params), and
+# neither "jsonrpc" nor the id type was validated (object ids echoed).
+fun ag_rpc(line) {
+    out = McpServer.dispatch(json_decode(line),
+                             %{settings: map_new(), execution_context: "mcp_server"})
+    if (out == nil) { nil } else { json_decode(to_string(out)) }
+}
+
+fun ag_rpc_code(r) {
+    if (r == nil) { nil }
+    else { e = map_get(r, 'error') ; if (e == nil) { nil } else { map_get(e, 'code') } }
+}
+
+fun t_mcp_server_spec_envelope() {
+    ping = McpServer.dispatch(json_decode("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}"),
+                              %{settings: map_new(), execution_context: "mcp_server"})
+    unknown_tool = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\",\"arguments\":{}}}")
+    bad_args = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"read\",\"arguments\":[1]}}")
+    unknown_method = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"nope/x\"}")
+    wrong_ver = ag_rpc("{\"jsonrpc\":\"1.0\",\"id\":5,\"method\":\"ping\"}")
+    no_ver = ag_rpc("{\"id\":6,\"method\":\"ping\"}")
+    obj_id = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":{\"a\":1},\"method\":\"ping\"}")
+    null_id = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}")
+    str_id = ag_rpc("{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"ping\"}")
+    note = ag_rpc("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+    ok = ag_all([
+        ag_is(to_string(ping), "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}"),
+        ag_is(ag_rpc_code(unknown_tool), -32602),
+        ag_is(ag_rpc_code(bad_args), -32602),
+        ag_is(ag_rpc_code(unknown_method), -32601),
+        ag_is(ag_rpc_code(wrong_ver), -32600),
+        ag_is(map_get(wrong_ver, 'id'), 5),
+        ag_is(ag_rpc_code(no_ver), -32600),
+        ag_is(ag_rpc_code(obj_id), -32600),
+        ag_is(map_get(obj_id, 'id'), nil),
+        ag_is(ag_rpc_code(null_id), -32600),
+        ag_is(map_get(str_id, 'id'), "abc"),
+        ag_is(ag_rpc_code(str_id), nil),
+        ag_is(note, nil)])
+    check("mcp-server: ping -> {}, unknown tool -> -32602, jsonrpc/id validated (-32600)", ok)
+}
+
 # remember saved frontmatter but an empty body: the schema named the
 # content field `body` while do_remember read `content`, so the
 # mismatch silently dropped every memory's content. Guard: a remember
@@ -908,6 +1055,232 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# A journal still being written by another instance when this one
+# booted was marked indexed and never refreshed (only presence in meta
+# was checked). Now size+mtime are recorded and a changed journal is
+# reindexed at the next init — here: a line appended after indexing.
+fun t_session_search_reindexes_changed() {
+    d = ag_tmp("sessidx")
+    file_delete(d)
+    file_mkdir(d)
+    j = d ++ "/journal-100.jsonl"
+    file_write(j, "{\"role\":\"user\",\"content\":\"alphaword first turn\"}\n")
+    SessionSearch.init_at(d)
+    h1 = SessionSearch.search_at(d, "alphaword", 10)
+    file_append(j, "{\"role\":\"assistant\",\"content\":\"zuluword appended later\"}\n")
+    SessionSearch.init_at(d)
+    h2 = SessionSearch.search_at(d, "zuluword", 10)
+    h3 = SessionSearch.search_at(d, "alphaword", 10)
+    SessionSearch.init_at(d)
+    h4 = SessionSearch.search_at(d, "alphaword", 10)
+    file_delete(j)
+    file_delete(d ++ "/index.db")
+    exec_argv("rmdir", [d])
+    ok = ag_all([
+        ag_is(length(h1), 1),
+        ag_is(length(h2), 1),
+        ag_is(length(h3), 1),
+        ag_is(length(h4), 1)])
+    check("session search: a journal that changed after indexing is reindexed", ok)
+}
+
+# forget_skill {"slug":"../../../work/proj"} deleted work/proj/SKILL.md
+# and recall_skill read it: the slug was spliced into a path unchecked.
+# Plant a SKILL.md outside skills_dir and aim a traversal slug at it.
+fun t_skill_slug_traversal_blocked() {
+    d = ag_tmp("skilltrav")
+    file_delete(d)
+    file_mkdir(d)
+    target = d ++ "/SKILL.md"
+    file_write(target, "TRAVERSAL-TARGET-CONTENT")
+    slug = ag_repeat("../", 16, "") ++ string_sub(d, 1, string_length(d) - 1)
+    rec = Skills.recall(slug)
+    fgt = Skills.forget(slug)
+    survived = file_exists(target)
+    file_delete(target)
+    exec_argv("rmdir", [d])
+    ok = ag_all([
+        ag_is(string_contains(rec, "TRAVERSAL-TARGET-CONTENT"), 'false'),
+        string_starts_with(rec, "error: invalid skill slug"),
+        string_starts_with(fgt, "error: invalid skill slug"),
+        ag_is(survived, 'true'),
+        ag_is(Skills.valid_slug("deploy_mally_otp"), 'true'),
+        ag_is(Skills.valid_slug("ship-openear-dmg"), 'true'),
+        ag_is(Skills.valid_slug("a/b"), 'false'),
+        ag_is(Skills.valid_slug("a\\b"), 'false'),
+        ag_is(Skills.valid_slug(".."), 'false'),
+        ag_is(Skills.valid_slug(".hidden"), 'false'),
+        ag_is(Skills.valid_slug(""), 'false'),
+        ag_is(Skills.valid_slug(nil), 'false'),
+        ag_is(Skills.valid_slug("x\ny"), 'false'),
+        # slugify("") is "" — would have written skills_dir()//SKILL.md
+        string_starts_with(Skills.save("", "d", "t", "i"), "error:")])
+    check("skills: traversal slugs rejected by recall/forget (target untouched)", ok)
+}
+
+# Trajectory export ran Log.redact over the ENCODED line: the blob layer
+# swallowed the `n` of a `\n` escape → `\[REDACTED]` → invalid JSONL;
+# and AWS_SECRET_ACCESS_KEY=…/…, PGPASSWORD=, postgres://user:pw@,
+# {"password": "…"} (space after colon), YAML password:, PEM lines with
+# '/' all leaked. Every exported line must be strict JSON and carry none
+# of the secrets.
+fun t_trajectory_redacts_valid_jsonl() {
+    out = ag_tmp("traj")
+    blob = "Z9x8Y7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0Z9x8"
+    h = [LLM.new_message_user("connect with PGPASSWORD=pgsecret1 psql, or postgres://admin:urlsecret2@db:5432/x"),
+         LLM.new_message_assistant("on it", [%{id: "c1", name: "bash",
+             arguments: "{\"command\":\"export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"}"}], nil),
+         LLM.new_message_tool("c1", "config:\n  password: yamlsecret3\n" ++
+             "{\"password\": \"jsonsecret4\", \"api_key\": \"apisecret5xyz\"}\n" ++
+             "-----BEGIN RSA PRIVATE KEY-----\nMIIEpemline/abc+def123\nsecondpemline/Zz9\n-----END RSA PRIVATE KEY-----\n" ++
+             "tail\n" ++ blob ++ "\n\"quoted\" and a \\ backslash"),
+         LLM.new_message_assistant("done", [], nil)]
+    Trajectory.export_current(out, h)
+    body = file_read(out)
+    file_delete(out)
+    lines = filter(string_split(to_string(body), "\n"), fn(l) { string_length(string_trim(l)) > 0 })
+    secrets = ["pgsecret1", "urlsecret2", "wJalrXUtnFEMI", "K7MDENG", "yamlsecret3", "jsonsecret4",
+               "apisecret5xyz", "MIIEpemline", "secondpemline", "Z9x8Y7w6V5u4"]
+    ok = ag_all([
+        ag_is(length(lines), 1),
+        ag_all(map(fn(l) { JsonCheck.valid(l) }, lines)),
+        ag_all(map(fn(l) { if (json_decode(l) == nil) { 'false' } else { 'true' } }, lines)),
+        ag_all(map(fn(x) { ag_is(string_contains(to_string(body), x), 'false') }, secrets)),
+        string_contains(to_string(body), "postgres://admin:[REDACTED]@db"),
+        string_contains(to_string(body), "BEGIN RSA PRIVATE KEY")])
+    check("trajectory: export is valid JSONL and masks env/URL/JSON/YAML/PEM secrets", ok)
+}
+
+# redact_value walks decoded values (what Log.event now encodes): nested
+# maps/lists redacted, keys and non-strings kept; the encoded result is
+# strict JSON even when a masked run sits right after a newline.
+fun t_log_redact_value_shapes() {
+    v = %{type: "tool_call", n: 3, ok: 'true',
+          args: "{\"api_key\": \"topsecret-api-value\"}",
+          nested: [%{note: "line\nZ9x8Y7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0Z9x8"}, nil, 7]}
+    r = Log.redact_value(v)
+    enc = json_encode(r)
+    keep = Log.redact("max_tokens: 4096 max_token: 4096 sort_key: id; if password == x; /usr/lib/x86_64-linux-gnu/libc.so.6")
+    ok = ag_all([
+        JsonCheck.valid(enc),
+        ag_is(string_contains(enc, "topsecret"), 'false'),
+        ag_is(string_contains(enc, "Z9x8Y7"), 'false'),
+        ag_is(map_get(r, 'n'), 3),
+        ag_is(map_get(r, 'ok'), 'true'),
+        ag_is(length(map_get(r, 'nested')), 3),
+        ag_is(keep, "max_tokens: 4096 max_token: 4096 sort_key: id; if password == x; /usr/lib/x86_64-linux-gnu/libc.so.6")])
+    check("log: redact_value masks nested strings, keeps structure; benign text untouched", ok)
+}
+
+# /flows with {"phases":"oops"} panicked the interactive session (hd on
+# a string in init_phases). validate_workflow rejects every shape the
+# run would walk, before the alt-screen opens or anything launches.
+fun t_flows_validate_shapes() {
+    bad = ["{\"phases\":\"oops\"}", "[1,2]", "\"str\"",
+           "{\"phases\":[5]}", "{\"phases\":[{\"tasks\":\"x\"}]}",
+           "{\"phases\":[{\"tasks\":[7]}]}", "{\"phases\":[{\"tasks\":[{\"label\":\"a\"}]}]}",
+           "{\"phases\":[{\"tasks\":[{\"prompt\":{\"x\":1}}]}]}",
+           "{\"phases\":[{\"tasks\":[{\"prompt\":\"p\",\"model\":[1]}]}]}"]
+    good = ["{}", "{\"phases\":[]}", "{\"phases\":[{\"name\":\"P\"}]}",
+            "{\"phases\":[{\"tasks\":[{\"prompt\":\"p\",\"label\":3}]}]}"]
+    ok = ag_all([
+        ag_all(map(fn(x) { ag_is(elem(Flows.validate_workflow(json_decode(x)), 0), 'error') }, bad)),
+        ag_all(map(fn(x) { ag_is(elem(Flows.validate_workflow(json_decode(x)), 0), 'ok') }, good)),
+        string_contains(to_string(elem(Flows.validate_workflow(json_decode("{\"phases\":\"oops\"}")), 1)),
+                        "\"phases\" must be an array")])
+    check("flows: malformed workflow shapes rejected with a reason (no panic)", ok)
+}
+
+# /flows fan-out was unbounded (12 tasks → 12 children in 0.15s).
+# launch_quota = free slots under the cap, bounded by what is queued.
+fun t_flows_launch_quota() {
+    q = %{bg_task_id: nil, status: 'pending'}
+    r = %{bg_task_id: "bg-1", status: 'running'}
+    d = %{bg_task_id: "bg-2", status: 'done'}
+    e = %{bg_task_id: nil, status: 'error'}
+    twelve = map(fn(i) { q }, 1..12)
+    ok = ag_all([
+        ag_is(Flows.launch_quota(twelve, 4), 4),
+        ag_is(Flows.launch_quota([r, r, r, q, q], 4), 1),
+        ag_is(Flows.launch_quota([r, r, r, r, q], 4), 0),
+        ag_is(Flows.launch_quota([d, d, r, q, q, q], 2), 1),
+        ag_is(Flows.launch_quota([d, e, q], 4), 1),
+        ag_is(Flows.launch_quota([d, e], 4), 0),
+        ag_is(Flows.flows_max_parallel(), 4)])
+    check("flows: fan-out capped (default 4 in flight), rest queued", ok)
+}
+
+# explore / bash subagent restrictions were prompt-only — an explore
+# subagent ran bash and write. Now a policy (ToolRegistry contexts +
+# subagent_blocked_for), with a clear refusal naming what IS allowed.
+fun t_subagent_type_allowlists() {
+    ok = ag_all([
+        ag_is(Agent.subagent_blocked_for("explore", "bash"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "write"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "edit"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "web_fetch"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "mcp__srv__tool"), 'true'),
+        ag_is(Agent.subagent_blocked_for("explore", "read"), 'false'),
+        ag_is(Agent.subagent_blocked_for("explore", "grep"), 'false'),
+        ag_is(Agent.subagent_blocked_for("explore", "glob"), 'false'),
+        ag_is(Agent.subagent_blocked_for("bash", "bash"), 'false'),
+        ag_is(Agent.subagent_blocked_for("bash", "write"), 'true'),
+        ag_is(Agent.subagent_blocked_for("general", "write"), 'false'),
+        ag_is(Agent.subagent_blocked_for("general", "task"), 'true'),
+        ag_is(ToolRegistry.allowed_in("subagent_explore", "bash"), 'false'),
+        ag_is(ToolRegistry.allowed_in("subagent_explore", "read"), 'true'),
+        ag_is(Agent.subagent_type_of(nil), "general"),
+        ag_is(Agent.subagent_type_of(5), "general"),
+        ag_is(Agent.subagent_type_of(" Explore "), "explore"),
+        ag_is(Agent.subagent_context("explore"), "subagent_explore"),
+        string_contains(Agent.subagent_block_msg("explore", "bash"), "read-only")])
+    check("subagent: explore = read-only, bash = shell only (enforced, not prompt-only)", ok)
+}
+
+# A 320KB subagent answer reached the parent uncapped. Capped like
+# bash/MCP output (24000) with an explicit marker; head + tail kept;
+# cut points never split a UTF-8 sequence.
+fun t_subagent_result_capped() {
+    big = "HEAD-MARK " ++ ag_repeat("finding: details details details\n", 10000, "") ++ " TAIL-MARK"
+    capped = Agent.subagent_cap(big)
+    # One ASCII byte first puts every 'é' (2 bytes) at an ODD offset, so
+    # a naive cut at 16000 would split one; a boundary-safe cut is odd.
+    uni = "x" ++ ag_repeat("é", 20000, "")
+    ucap = Agent.subagent_cap(uni)
+    marker_at = string_index_of(ucap, "\n\n…[")
+    ok = ag_all([
+        if (string_length(capped) <= 24400) { 'true' } else { 'false' },
+        string_contains(capped, "bytes of the subagent's answer elided"),
+        string_starts_with(capped, "HEAD-MARK "),
+        string_ends_with(capped, " TAIL-MARK"),
+        ag_is(Agent.subagent_cap("short answer"), "short answer"),
+        ag_is(marker_at % 2, 1),
+        string_ends_with(ucap, "é")])
+    check("subagent: answer capped at 24000 with marker, UTF-8 safe", ok)
+}
+
+# Hitting max steps returned only "[subagent hit max steps…]" — the
+# work was discarded. subagent_partial keeps the latest notes plus a
+# digest of the most recent tool calls/results, headed by the reason.
+fun t_subagent_partial_keeps_work() {
+    h = [LLM.new_message_system("sys"), LLM.new_message_user("task"),
+         LLM.new_message_assistant("looking at config", [%{id: "c1", name: "bash", arguments: "{\"command\":\"echo F1\"}"}], nil),
+         LLM.new_message_tool("c1", "[exit 0]\nFINDING_ONE"),
+         LLM.new_message_assistant("", [%{id: "c2", name: "read", arguments: "{\"path\":\"x\"}"}], nil),
+         LLM.new_message_tool("c2", "FINDING_TWO")]
+    p = Agent.subagent_partial(h, "hit the 15-step limit before a final answer")
+    empty = Agent.subagent_partial([LLM.new_message_user("t")], "LLM call failed — boom")
+    ok = ag_all([
+        string_contains(p, "subagent stopped: hit the 15-step limit"),
+        string_contains(p, "looking at config"),
+        string_contains(p, "FINDING_ONE"),
+        string_contains(p, "FINDING_TWO"),
+        string_contains(p, "read {\"path\":\"x\"}"),
+        string_contains(empty, "LLM call failed — boom"),
+        string_contains(empty, "no findings yet")])
+    check("subagent: abnormal stop returns partial work + reason", ok)
 }
 
 # Non-interactive entry points cannot answer an "ask" permission
@@ -1422,6 +1795,142 @@ fun t_scheduler_jobs_dir_suffix() {
     d = Scheduler.jobs_dir()
     check("scheduler jobs_dir() ends with 'telemetry'",
           string_ends_with(d, "telemetry"))
+}
+
+# A fresh, empty temp file path (mkstemp) — no shell() round-trip.
+fun ag_tmp(prefix) { file_temp("/tmp/swarm-test-" ++ prefix ++ "-") }
+
+fun ag_repeat(s, n, acc) { if (n <= 0) { acc } else { ag_repeat(s, n - 1, acc ++ s) } }
+
+# json_decode guesses through damage ("[1,,2]" → [1, nil, 2], "[tru]"
+# → [nil, nil, nil]), so writers need a strict well-formedness check
+# before trusting a file enough to rewrite it.
+fun t_json_check_strict() {
+    bad = ["[1, 2", "[1 2]", "{\"a\":1} x", "[{\"a\":1},]", "[", "{\"a\":}", "[tru]",
+           "[\"abc]", "{\"a\" 1}", "[1,,2]", "01", "1.", "\"a\\q\"", "", "nul"]
+    good = ["[]", "{}", " [1, -2.5e+3, 0, true, false, null, \"x\\\"\\u00e9\", {\"k\": [{}]}] ",
+            "\"é\"", "-0", "1E5"]
+    long_arr = "[" ++ ag_repeat("1,", 20000, "") ++ "1]"
+    ok = ag_all([
+        ag_all(map(fn(x) { ag_is(JsonCheck.valid(x), 'false') }, bad)),
+        ag_all(map(fn(x) { ag_is(JsonCheck.valid(x), 'true') }, good)),
+        ag_is(JsonCheck.valid(long_arr), 'true')])
+    check("json-check: strict RFC 8259 validity (rejects what json_decode guesses at)", ok)
+}
+
+# schedule.json of the wrong SHAPE used to crash every interactive
+# session ~2s after launch, inside main's heartbeat handler:
+# {"jobs":[]} decoded to a map → hd() panic in prune_jobs_loop, and a
+# job with "last_run":"yesterday" → "str" + int panic in
+# compute_next_fire. tick_at must report, skip and never panic; valid
+# entries still load (numeric strings coerced), invalid ones untouched.
+fun t_sched_wrong_shape_never_panics() {
+    p = ag_tmp("sched-shape")
+    file_write(p, "{\"jobs\":[]}")
+    r1 = Scheduler.tick_at(p, 2)
+    far = "99999999999999"
+    body = "[5, \"str\", null, " ++
+        "{\"id\":\"1\",\"expr\":\"1h\",\"prompt\":\"x\",\"last_run\":\"yesterday\"}," ++
+        "{\"id\":\"2\",\"expr\":\"1h\",\"prompt\":\"y\",\"last_run\":\"" ++ far ++ "\"}," ++
+        "{\"id\":\"../x\",\"expr\":\"1h\",\"prompt\":\"z\"}," ++
+        "{\"id\":\"4\",\"expr\":\"1.5h\",\"prompt\":\"w\"}]"
+    file_write(p, body)
+    r2 = Scheduler.tick_at(p, 2)
+    disk_now = file_read(p)
+    valid = Scheduler.valid_jobs_of(Scheduler.read_state_at(p))
+    file_delete(p)
+    ok = ag_all([
+        ag_is(map_get(r1, 'status'), 'corrupt'),
+        ag_is(length(map_get(r1, 'problems')), 1),
+        ag_is(map_get(r2, 'status'), 'ok'),
+        ag_is(map_get(r2, 'fired'), 0),
+        ag_is(length(map_get(r2, 'problems')), 6),
+        ag_is(disk_now, body),
+        ag_is(length(valid), 1),
+        ag_is(map_get(hd(valid), 'last_run'), 99999999999999)])
+    check("scheduler: wrong-shape schedule.json / bad fields are skipped, never panic", ok)
+}
+
+# /schedule on a corrupt schedule.json used to treat it as [] and
+# overwrite it with just the new job — silently deleting every other
+# job. It must refuse (file byte-identical); entries it can't parse in
+# an otherwise-valid array survive an add.
+fun t_sched_corrupt_refuses_write() {
+    p = ag_tmp("sched-corrupt")
+    file_write(p, "[{\"id\":\"1\",\"expr\":\"1h\",\"prompt\":\"keep me\"} ,,, oops")
+    before = file_read(p)
+    r1 = Scheduler.add_at(p, "5m", "new job")
+    same1 = file_read(p)
+    file_write(p, "{\"jobs\":[{\"id\":\"1\"}]}")
+    r2 = Scheduler.add_at(p, "5m", "new job")
+    same2 = file_read(p)
+    file_write(p, "[7, {\"id\":\"3\",\"expr\":\"1h\",\"prompt\":\"old\"}]")
+    r3 = Scheduler.add_at(p, "5m", "new job")
+    grown = Scheduler.read_state_at(p)
+    file_delete(p)
+    r4 = Scheduler.add_at(p, "bogus", "x")
+    missing_after_bad = file_exists(p)
+    r5 = Scheduler.add_at(p, "2h", "fresh")
+    fresh = Scheduler.read_state_at(p)
+    file_delete(p)
+    entries = elem(grown, 1)
+    ok = ag_all([
+        ag_is(elem(r1, 0), 'error'),
+        string_contains(to_string(elem(r1, 1)), "refusing to overwrite"),
+        ag_is(same1, before),
+        ag_is(elem(r2, 0), 'error'),
+        ag_is(same2, "{\"jobs\":[{\"id\":\"1\"}]}"),
+        ag_is(r3, {'ok', "4"}),
+        ag_is(length(entries), 3),
+        ag_is(hd(entries), 7),
+        ag_is(elem(r4, 0), 'error'),
+        ag_is(missing_after_bad, 'false'),
+        ag_is(r5, {'ok', "1"}),
+        ag_is(length(elem(fresh, 1)), 1)])
+    check("scheduler: add refuses to overwrite a corrupt schedule.json, keeps unknown entries", ok)
+}
+
+# Loose parsing accepted garbage by reading leading digits: 1.5h ran
+# hourly, 10x5m every 10m, "daily :" at 00:00, "daily 9:5x" at 09:05.
+fun t_sched_strict_exprs() {
+    rejects = ["1.5h", "10x5m", "5 m", "-1h", "+1h", "0m", "1234567890s", "5", "m",
+               "daily :", "daily 9:5x", "daily 9:5", "daily 24:00", "daily 12:60",
+               "daily 9", "daily :30", "hourlyx", "1h30m"]
+    accepts = ["30s", "5m", "2h", "1d", "hourly", "daily", "daily 9:05", "daily 23:59", " 10m "]
+    ok = ag_all([
+        ag_all(map(fn(e) { ag_is(Scheduler.parse_expr(e), nil) }, rejects)),
+        ag_all(map(fn(e) { if (Scheduler.expr_error(e) == nil) { 'false' } else { 'true' } }, rejects)),
+        ag_all(map(fn(e) { if (Scheduler.parse_expr(e) == nil) { 'false' } else { 'true' } }, accepts)),
+        ag_is(Scheduler.daily_time_ms("daily 9:05"), (9 * 3600 + 5 * 60) * 1000),
+        ag_is(elem(Scheduler.add_at("/nonexistent-dir/s.json", "1.5h", "x"), 0), 'error')])
+    check("scheduler: strict expression parsing rejects 1.5h / 10x5m / 'daily :' / 'daily 9:5x'", ok)
+}
+
+# `hourly` is documented as "every hour on the hour" but ran 60 min
+# after creation. Next fire is now the first :00 (UTC) after last_run.
+fun t_sched_hourly_on_the_hour() {
+    hour = 3600000
+    last = 1779635000000        # 15:03:20 UTC — mid-hour
+    nf = Scheduler.compute_next_fire("hourly", last, last + 1000)
+    on_hour = (last / hour + 1) * hour
+    nf2 = Scheduler.compute_next_fire("hourly", on_hour, on_hour + 5)
+    nf_1h = Scheduler.compute_next_fire("1h", last, last + 1000)
+    ok = ag_all([
+        ag_is(nf, on_hour),
+        ag_is(nf % hour, 0),
+        if (nf > last && nf - last < hour) { 'true' } else { 'false' },
+        ag_is(nf2, on_hour + hour),
+        ag_is(nf_1h, last + hour)])
+    check("scheduler: hourly fires at the top of the hour, 1h stays relative", ok)
+}
+
+# Scheduled children run unattended in headless mode, which
+# auto-approves 'ask' — without SWARM_CODE_DENY_DANGEROUS=1 a job whose
+# model ran `rm -rf ~/victim` deleted it. /flows already set it.
+fun t_sched_dispatch_denies_dangerous() {
+    cmd = Scheduler.dispatch_cmd("/bin/swarm", "clean up", "/tmp/o.out", "/tmp/p.pid")
+    check("scheduler: dispatched jobs run with SWARM_CODE_DENY_DANGEROUS=1",
+          string_contains(cmd, "SWARM_CODE_DENY_DANGEROUS=1 nohup "))
 }
 
 # ------------------------------------------------------------
