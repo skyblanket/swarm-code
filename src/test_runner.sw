@@ -29,6 +29,8 @@ import Mcp
 import McpServer
 import JsonCheck
 import Flows
+import Trajectory
+import Log
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -137,6 +139,8 @@ fun main() {
         t_subagent_partial_keeps_work(),
         t_flows_validate_shapes(),
         t_flows_launch_quota(),
+        t_trajectory_redacts_valid_jsonl(),
+        t_log_redact_value_shapes(),
         t_sched_wrong_shape_never_panics(),
         t_sched_corrupt_refuses_write(),
         t_sched_strict_exprs(),
@@ -1029,6 +1033,60 @@ fun t_subagent_blocked_tool() {
         if (blocked_task == 'true' && blocked_remember == 'true') { 'true' } else { 'false' },
         if (allowed_read == 'false' && allowed_bash == 'false') { 'true' } else { 'false' })
     check("subagent_blocked: blocks task/remember, allows read/bash", ok)
+}
+
+# Trajectory export ran Log.redact over the ENCODED line: the blob layer
+# swallowed the `n` of a `\n` escape → `\[REDACTED]` → invalid JSONL;
+# and AWS_SECRET_ACCESS_KEY=…/…, PGPASSWORD=, postgres://user:pw@,
+# {"password": "…"} (space after colon), YAML password:, PEM lines with
+# '/' all leaked. Every exported line must be strict JSON and carry none
+# of the secrets.
+fun t_trajectory_redacts_valid_jsonl() {
+    out = ag_tmp("traj")
+    blob = "Z9x8Y7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0Z9x8"
+    h = [LLM.new_message_user("connect with PGPASSWORD=pgsecret1 psql, or postgres://admin:urlsecret2@db:5432/x"),
+         LLM.new_message_assistant("on it", [%{id: "c1", name: "bash",
+             arguments: "{\"command\":\"export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"}"}], nil),
+         LLM.new_message_tool("c1", "config:\n  password: yamlsecret3\n" ++
+             "{\"password\": \"jsonsecret4\", \"api_key\": \"apisecret5xyz\"}\n" ++
+             "-----BEGIN RSA PRIVATE KEY-----\nMIIEpemline/abc+def123\nsecondpemline/Zz9\n-----END RSA PRIVATE KEY-----\n" ++
+             "tail\n" ++ blob ++ "\n\"quoted\" and a \\ backslash"),
+         LLM.new_message_assistant("done", [], nil)]
+    Trajectory.export_current(out, h)
+    body = file_read(out)
+    file_delete(out)
+    lines = filter(string_split(to_string(body), "\n"), fn(l) { string_length(string_trim(l)) > 0 })
+    secrets = ["pgsecret1", "urlsecret2", "wJalrXUtnFEMI", "K7MDENG", "yamlsecret3", "jsonsecret4",
+               "apisecret5xyz", "MIIEpemline", "secondpemline", "Z9x8Y7w6V5u4"]
+    ok = ag_all([
+        ag_is(length(lines), 1),
+        ag_all(map(fn(l) { JsonCheck.valid(l) }, lines)),
+        ag_all(map(fn(l) { if (json_decode(l) == nil) { 'false' } else { 'true' } }, lines)),
+        ag_all(map(fn(x) { ag_is(string_contains(to_string(body), x), 'false') }, secrets)),
+        string_contains(to_string(body), "postgres://admin:[REDACTED]@db"),
+        string_contains(to_string(body), "BEGIN RSA PRIVATE KEY")])
+    check("trajectory: export is valid JSONL and masks env/URL/JSON/YAML/PEM secrets", ok)
+}
+
+# redact_value walks decoded values (what Log.event now encodes): nested
+# maps/lists redacted, keys and non-strings kept; the encoded result is
+# strict JSON even when a masked run sits right after a newline.
+fun t_log_redact_value_shapes() {
+    v = %{type: "tool_call", n: 3, ok: 'true',
+          args: "{\"api_key\": \"topsecret-api-value\"}",
+          nested: [%{note: "line\nZ9x8Y7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2H1g0Z9x8"}, nil, 7]}
+    r = Log.redact_value(v)
+    enc = json_encode(r)
+    keep = Log.redact("max_tokens: 4096 max_token: 4096 sort_key: id; if password == x; /usr/lib/x86_64-linux-gnu/libc.so.6")
+    ok = ag_all([
+        JsonCheck.valid(enc),
+        ag_is(string_contains(enc, "topsecret"), 'false'),
+        ag_is(string_contains(enc, "Z9x8Y7"), 'false'),
+        ag_is(map_get(r, 'n'), 3),
+        ag_is(map_get(r, 'ok'), 'true'),
+        ag_is(length(map_get(r, 'nested')), 3),
+        ag_is(keep, "max_tokens: 4096 max_token: 4096 sort_key: id; if password == x; /usr/lib/x86_64-linux-gnu/libc.so.6")])
+    check("log: redact_value masks nested strings, keeps structure; benign text untouched", ok)
 }
 
 # /flows with {"phases":"oops"} panicked the interactive session (hd on
