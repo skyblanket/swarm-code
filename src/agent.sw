@@ -57,13 +57,12 @@ fun max_steps() { 200 }
 # ------------------------------------------------------------
 # Context budget — token-based, sourced from server usage
 # ------------------------------------------------------------
-fun max_tokens_env()      { parse_env_int("SWARM_CODE_MAX_TOKENS",      262144) }
-fun output_reserve_env()  { parse_env_int("SWARM_CODE_OUTPUT_RESERVE",   16384) }
-fun compact_buffer_env()  { parse_env_int("SWARM_CODE_COMPACT_BUFFER",   52000) }
-
-fun context_budget_tokens() {
-    max_tokens_env() - output_reserve_env() - compact_buffer_env()
-}
+# ONE definition, in llm.sw (LLM.context_budget_tokens), shared with the
+# context meter: the output reserve and compaction buffer scale down with
+# the window, so a small SWARM_CODE_MAX_TOKENS no longer yields a NEGATIVE
+# budget (32768 - 16384 - 52000 = -35616 compacted on every step).
+fun max_tokens_env()        { LLM.context_window_tokens() }
+fun context_budget_tokens() { LLM.context_budget_tokens() }
 
 # When a compaction fires (over context_budget_tokens), trim/summarize down to
 # THIS lower level — not just barely under the trigger — so the next several tool
@@ -75,15 +74,6 @@ fun compact_target_tokens() { context_budget_tokens() * 70 / 100 }
 
 fun context_budget_chars_fallback() {
     context_budget_tokens() * 4
-}
-
-fun parse_env_int(name, fallback) {
-    env = getenv(name)
-    if (env == nil) { fallback }
-    else {
-        parsed = parse_budget_env(env, 0, 0, 'false')
-        if (parsed < 0) { fallback } else { parsed }
-    }
 }
 
 fun parse_budget_env(s, i, acc, saw_digit) {

@@ -230,7 +230,9 @@ fun main() {
         t_cut_turn_calls_refused(),
         t_sanitize_cut_tool_calls(),
         # --- headless reports only this run's answer ---
-        t_headless_answer_this_run_only()
+        t_headless_answer_this_run_only(),
+        # --- context budget scales with the window ---
+        t_context_budget_scales_with_window()
     ]
 
     passed = sum_list(results, 0)
@@ -2738,3 +2740,23 @@ fun t_headless_answer_this_run_only() {
                     bool_and(eqs(Agent.headless_answer(answered, "run-2"), "SECOND"),
                              eqs(Agent.headless_answer(mid_tools, "run-2"), ""))))
 }
+
+# ------------------------------------------------------------
+# Context budget scales with the window
+# ------------------------------------------------------------
+# window − reserve − buffer with the 262K-sized defaults (16384 / 52000) went
+# negative below 68,385 tokens (32K → −35,616: compaction on every step).
+# Reserve and buffer are capped at window/4, so the budget is ≥ window/2.
+fun t_context_budget_scales_with_window() {
+    b8 = LLM.budget_for_window(8192, 16384, 52000)
+    b32 = LLM.budget_for_window(32768, 16384, 52000)
+    b128 = LLM.budget_for_window(131072, 16384, 52000)
+    b262 = LLM.budget_for_window(262144, 16384, 52000)
+    explicit_big = LLM.budget_for_window(32768, 30000, 30000)
+    degenerate = LLM.budget_for_window(0, 16384, 52000)
+    check("context budget: 8K→4096, 32K→16384, 128K→81920, 262K→193760; never below 1",
+          bool_and3(bool_and(eqs(b8, 4096), eqs(b32, 16384)),
+                    bool_and(eqs(b128, 81920), eqs(b262, 193760)),
+                    bool_and(eqs(explicit_big, 16384), eqs(degenerate, 1))))
+}
+

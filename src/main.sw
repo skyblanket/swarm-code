@@ -18,6 +18,8 @@ module Main
 #   SWARM_CODE_API_KEY     default: (none)
 #   SWARM_CODE_MAX_TOKENS  default: 262144 (Kimi K2.7 context window)
 #   SWARM_CODE_OUTPUT_RESERVE  default: 16384 (Kimi K2.7 max output)
+#   SWARM_CODE_COMPACT_BUFFER  default: 52000 — reserve and buffer are each
+#                          capped at 1/4 of SWARM_CODE_MAX_TOKENS
 #   SWARM_CODE_TEMP        default: "0.2" (string — parsed to float)
 #   SWARM_CODE_CWD         default: "." (used in system prompt)
 #

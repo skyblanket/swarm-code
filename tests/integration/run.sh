@@ -24,6 +24,7 @@
 #   T12 malformed args      — cut mid-string, no finish_reason: strict check stops it
 #   T13 interrupted stream  — tool calls of an ESC-interrupted stream never run
 #   T14 stale headless ok   — a failed resumed run never reports the prior answer
+#   T15 small window        — SWARM_CODE_MAX_TOKENS=32768 keeps a positive budget
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -95,10 +96,13 @@ new_case() {
 
 # run_swarm <args...> — run the binary headless with the isolated env,
 # 90s watchdog (LLM retry backoff can stack up on a broken path).
-# Captures stdout/stderr into $CASE, sets RC.
+# Captures stdout/stderr into $CASE, sets RC. RUN_ENV="VAR=val ..." adds
+# (or overrides) environment variables for this one run.
 run_swarm() {
     (
         cd "$WORK" || exit 97
+        # shellcheck disable=SC2086
+        if [ -n "${RUN_ENV:-}" ]; then export $RUN_ENV; fi
         HOME="$CASE_HOME" \
         SWARM_CODE_EXECUTION_CONTEXT="${RUN_EXECUTION_CONTEXT:-main}" \
         SWARM_CODE_ENDPOINT="http://127.0.0.1:$PORT" \
@@ -534,11 +538,36 @@ EOF
 }
 
 # ------------------------------------------------------------
+# T15 — a small context window (SWARM_CODE_MAX_TOKENS=32768) gets a positive,
+#       window-scaled budget (16384): no "compacting" on every step, and the
+#       context meter reads x/16k (the old budget was -35616).
+# ------------------------------------------------------------
+t15() {
+    new_case t15
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [
+    {"id": "call_t15", "name": "bash", "arguments": {"command": "echo small-window-t15"}}]},
+  {"type": "text", "content": "SMALL_WINDOW_OK_T15"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail T15 "mock failed to start"; return; }
+    RUN_ENV="SWARM_CODE_MAX_TOKENS=32768" run_swarm -p "t15 run it" --no-resume --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T15 "exit code $RC"
+    elif grep -q "compacting" "$CASE/stderr.txt"; then
+        fail T15 "compacted with a tiny history: $(grep compacting "$CASE/stderr.txt" | head -1)"
+    elif ! req_has 0 "/16k tok"; then fail T15 "context meter does not show the 16k budget"
+    elif ! final_json | grep -q SMALL_WINDOW_OK_T15; then fail T15 "final text missing: $(final_json)"
+    else pass T15; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"

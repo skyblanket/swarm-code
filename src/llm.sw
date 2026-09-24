@@ -49,7 +49,8 @@ export [
     api_tool_calls_to_internal,
     repair_history, apply_override,
     inject_context_status, build_status_string,
-    routed_collect, maybe_large_context_hint
+    routed_collect, maybe_large_context_hint,
+    context_window_tokens, context_budget_tokens, budget_for_window
 ]
 
 # ============================================================
@@ -515,14 +516,9 @@ fun inject_context_status(messages, opts) {
 }
 
 fun build_status_string(messages, opts) {
-    max_tok = parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144)
-    out_res = parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384)
-    buf = parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000)
-    # Clamp to a floor of 1 — a degenerate env (reserve + buffer >= max_tokens)
-    # would otherwise make this 0 or negative and the division below PANICS
-    # (swarmrt traps integer divide-by-zero) on the very first turn.
-    raw_budget = max_tok - out_res - buf
-    tok_budget = if (raw_budget < 1) { 1 } else { raw_budget }
+    # The same budget the compactor triggers on (always >= 1, so the
+    # division below can't trap on a degenerate env).
+    tok_budget = context_budget_tokens()
 
     # Use the server's real prompt-token count once we have it; fall back to a
     # char/4 estimate before the first response.
@@ -541,6 +537,34 @@ fun build_status_string(messages, opts) {
 
     "ctx " ++ to_string(pct) ++ "% used · " ++
     fmt_k(tok_used) ++ "/" ++ fmt_k(tok_budget) ++ " tok"
+}
+
+# ------------------------------------------------------------
+# Context budget — the ONE definition (Agent's compaction trigger and the
+# context meter above both use it; agent.sw imports llm.sw, not the reverse).
+# ------------------------------------------------------------
+# budget = window − output reserve − compaction buffer. The reserve (16384,
+# Kimi's max output) and buffer (52000) defaults are sized for a 262K window;
+# subtracted from a small one they drove the budget NEGATIVE — at
+# SWARM_CODE_MAX_TOKENS=32768 it was −35,616, so every step read "context at
+# ~1197 / -35616 tokens, compacting" and paid a summarizer call. Each is now
+# capped at a quarter of the window (explicit env values too), so the budget
+# is always at least half the window: 8K→4096, 32K→16384, 128K→81920,
+# 262K→193760 (unchanged). Floor of 1 for a degenerate window.
+fun context_window_tokens() { parse_env_int_local("SWARM_CODE_MAX_TOKENS", 262144) }
+
+fun context_budget_tokens() {
+    budget_for_window(context_window_tokens(),
+                      parse_env_int_local("SWARM_CODE_OUTPUT_RESERVE", 16384),
+                      parse_env_int_local("SWARM_CODE_COMPACT_BUFFER", 52000))
+}
+
+fun budget_for_window(window, reserve_cfg, buffer_cfg) {
+    quarter = window / 4
+    reserve = if (reserve_cfg < quarter) { reserve_cfg } else { quarter }
+    buffer = if (buffer_cfg < quarter) { buffer_cfg } else { quarter }
+    b = window - reserve - buffer
+    if (b < 1) { 1 } else { b }
 }
 
 # Estimate token count from char count (≈4 chars/token) for use on
