@@ -2,6 +2,7 @@ module Browser
 
 import UI
 import PathGuard
+import Chrome   # chrome_launch is a swarmrt battery: only importers get it
 
 # ============================================================
 # Browser — CDP-over-WebSocket browser control, no Node, no Python
