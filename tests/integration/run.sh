@@ -27,6 +27,7 @@
 #   T15 small window        — SWARM_CODE_MAX_TOKENS=32768 keeps a positive budget
 #   T16 /compact safety     — no-op when nothing is old, merges summaries, 503 keeps all
 #   T17 mid-turn compaction — the live user request survives compaction
+#   T18 fatal 4xx           — completed tool pairs survive; context overflow retries once
 #
 # Usage: run.sh [tN ...] — no arguments runs every test.
 # Exit code: 0 iff every test passes.
@@ -696,11 +697,90 @@ PYEOF
 }
 
 # ------------------------------------------------------------
+# T18 — a fatal 4xx keeps the turn's completed work.
+#   a) "maximum context length" after a big tool result: trimmed and retried
+#      once — the retry carries the stub, the turn succeeds;
+#   b) a plain 400 after two writes: the journal keeps both write results
+#      (it used to keep only the user message), and a resumed run sends them;
+#   c) the overflow retry happens once, not in a loop.
+# ------------------------------------------------------------
+t18() {
+    new_case t18
+    python3 - "$CASE/scenario.json" "$WORK" <<'PYEOF'
+import json, sys
+out, work = sys.argv[1], sys.argv[2]
+over = {"type": "http", "status": 400,
+        "body": json.dumps({"error": {"message": "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens."}})}
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_big", "name": "bash",
+      "arguments": {"command": "head -c 12000 /dev/zero | tr '\\0' B"}}]},
+    {"type": "tool_calls", "calls": [{"id": "call_w", "name": "write",
+      "arguments": {"path": work + "/a.txt", "content": "A"}}]},
+    over,
+    {"type": "text", "content": "RECOVERED_T18"}]}, open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T18 "a: mock failed to start"; return; }
+    run_swarm -p "t18 build it" --no-resume --json
+    cleanup
+    if [ "$RC" -ne 0 ]; then fail T18 "a: exit code $RC: $(final_json)"; return; fi
+    if ! final_json | grep -q RECOVERED_T18; then fail T18 "a: no recovery: $(final_json)"; return; fi
+    if ! req_has 3 "chars elided"; then fail T18 "a: retry did not carry the trimmed result"; return; fi
+    if req_has 3 "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"; then fail T18 "a: retry still carried the 12KB result"; return; fi
+    if ! req_has 3 "call_w"; then fail T18 "a: retry lost the completed write"; return; fi
+
+    new_case t18b
+    python3 - "$CASE/scenario.json" "$WORK" <<'PYEOF'
+import json, sys
+out, work = sys.argv[1], sys.argv[2]
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_w1", "name": "write",
+      "arguments": {"path": work + "/a.txt", "content": "A"}}]},
+    {"type": "tool_calls", "calls": [{"id": "call_w2", "name": "write",
+      "arguments": {"path": work + "/b.txt", "content": "B"}}]},
+    {"type": "http", "status": 400, "body": "{\"error\":{\"message\":\"bad request\"}}"}]},
+    open(out, "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T18 "b: mock failed to start"; return; }
+    run_swarm -p "t18 write two files" --json
+    cleanup
+    local journal; journal="$(journal_file)"
+    if [ "$RC" -eq 0 ]; then fail T18 "b: exit 0 after a fatal 400"; return; fi
+    if [ ! -f "$WORK/a.txt" ] || [ ! -f "$WORK/b.txt" ]; then fail T18 "b: writes did not land"; return; fi
+    if [ "$(grep -c '"tool_call_id":"call_w[12]"' "$journal")" -ne 2 ]; then
+        fail T18 "b: journal lost the completed writes: $(cat "$journal")"; return
+    fi
+    cat >"$CASE/scenario2.json" <<'EOF'
+{"responses": [{"type": "text", "content": "RESUMED_T18"}]}
+EOF
+    start_mock "$CASE/scenario2.json" || { fail T18 "b: mock 2 failed to start"; return; }
+    run_swarm -p "t18 what did you write" --json
+    cleanup
+    if ! req_has 0 "call_w1" || ! req_has 0 "call_w2"; then fail T18 "b: resumed request has no record of the writes"; return; fi
+
+    new_case t18c
+    python3 - "$CASE/scenario.json" <<'PYEOF'
+import json, sys
+over = {"type": "http", "status": 400,
+        "body": json.dumps({"error": {"message": "context_length_exceeded"}})}
+json.dump({"responses": [
+    {"type": "tool_calls", "calls": [{"id": "call_big", "name": "bash",
+      "arguments": {"command": "head -c 12000 /dev/zero | tr '\\0' B"}}]},
+    over, over, over, {"type": "text", "content": "SHOULD_NOT_GET_HERE"}]}, open(sys.argv[1], "w"))
+PYEOF
+    start_mock "$CASE/scenario.json" || { fail T18 "c: mock failed to start"; return; }
+    run_swarm -p "t18 loop" --no-resume --json
+    cleanup
+    if [ "$RC" -eq 0 ]; then fail T18 "c: exit 0 after repeated overflow"
+    elif [ "$(req_count)" -ne 3 ]; then fail T18 "c: expected 3 requests (one retry), got $(req_count)"
+    else pass T18; fi
+}
+
+# ------------------------------------------------------------
 
 echo "integration: binary $BIN"
 echo "integration: scratch $TMP"
 # `run.sh t11 t12` runs just those cases; no arguments runs them all.
-ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17"
+ALL_TESTS="t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18"
 for t in ${*:-$ALL_TESTS}; do "$t"; done
 
 echo "----------------------------------------"

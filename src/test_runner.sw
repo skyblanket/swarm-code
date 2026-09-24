@@ -237,7 +237,10 @@ fun main() {
         t_compact_split_keeps_live_user(),
         t_compact_split_pair_boundary(),
         t_compact_nothing_old_is_noop(),
-        t_compact_failed_summary_keeps_history()
+        t_compact_failed_summary_keeps_history(),
+        # --- a fatal 4xx keeps completed work; context overflow retries ---
+        t_context_overflow_detection(),
+        t_mech_trim_protects_live_user()
     ]
 
     passed = sum_list(results, 0)
@@ -2828,3 +2831,35 @@ fun t_compact_failed_summary_keeps_history() {
     check("compact_history: failed summarizer → history unchanged, nothing elided",
           bool_and(eqs(length(out), 31), eqs(out, h)))
 }
+
+# ------------------------------------------------------------
+# A fatal 4xx keeps completed work; "context too long" is recoverable
+# ------------------------------------------------------------
+fun t_context_overflow_detection() {
+    yes = bool_and3(LLM.is_context_overflow_msg("HTTP 400: This model's maximum context length is 8192 tokens"),
+                    LLM.is_context_overflow_msg("{\"code\":\"context_length_exceeded\"}"),
+                    bool_and(LLM.is_context_overflow_msg("prompt is too long: 250000 tokens > 200000 maximum"),
+                             LLM.is_context_overflow_msg("Too many tokens in request")))
+    no = bool_and(bool_not(LLM.is_context_overflow_msg("bad request")),
+                  bool_not(LLM.is_context_overflow_msg("invalid api key")))
+    check("context-overflow wording detected (4 phrasings); other 4xx messages are not", bool_and(yes, no))
+}
+
+# The live user request is never stubbed (mid-turn it isn't the last message);
+# the overflow path may stub the LAST result, the normal pre-flight may not.
+fun t_mech_trim_protects_live_user() {
+    big = rep_tail("xxxxxxxxxx", 1000, "")
+    h = [LLM.new_message_system("s"), LLM.new_message_user(big),
+         LLM.new_message_assistant("", [%{id: "a", name: "read", arguments: "{}"}], nil),
+         LLM.new_message_tool("a", big)]
+    normal = Agent.mechanical_trim_ex(h, 10, 'true')
+    overflow = Agent.mechanical_trim_ex(h, 10, 'false')
+    user_kept = bool_and(eqs(map_get(hd(tl(normal)), 'content'), big),
+                         eqs(map_get(hd(tl(overflow)), 'content'), big))
+    last_n = to_string(map_get(hd(tl(tl(tl(normal)))), 'content'))
+    last_o = to_string(map_get(hd(tl(tl(tl(overflow)))), 'content'))
+    check("mechanical trim: live user request never stubbed; last result stubbed only on overflow",
+          bool_and3(user_kept, eqs(last_n, big), string_contains(last_o, "chars elided")))
+}
+
+fun rep_tail(s, n, acc) { if (n <= 0) { acc } else { rep_tail(s, n - 1, acc ++ s) } }

@@ -49,7 +49,7 @@ export [run, run_headless, subagent_blocked, SUBAGENT_BLOCKED_TOOLS,
         show_expand, handle_bg_command, route_input,
         skip_remaining_tools, turn_interrupted,
         args_malformed, sanitize_tool_calls, turn_cut_reason, refuse_tool_calls,
-        headless_answer, compact_history, compact_split]
+        headless_answer, compact_history, compact_split, mechanical_trim_ex]
 
 # Maximum tool-call rounds per user turn.
 fun max_steps() { 200 }
@@ -344,11 +344,11 @@ fun nth_at(lst, i) {
 # ------------------------------------------------------------
 # F2 — poison / clean-exit markers beside .active
 # ------------------------------------------------------------
-# A turn that ends on an UNRECOVERED llm error writes .poison (holding the
-# journal path) so the next launch knows the recorded session died mid-turn
-# and trims the failing turn back to the last clean user message instead of
-# replaying the poisoned tool_call. A clean /quit writes .clean_exit. Both
-# are cleared when a fresh session starts.
+# A turn that ends on an UNRECOVERED fatal llm error writes .poison (holding
+# the journal path) so the next launch can say the recorded session ended on
+# a request error. (It used to also cut the resumed history back to the last
+# user message, losing completed tool results — see run.) A clean /quit
+# writes .clean_exit. Both are cleared when a fresh session starts.
 fun journal_poison_ptr()      { session_dir() ++ "/.poison" }
 fun journal_clean_exit_ptr()  { session_dir() ++ "/.clean_exit" }
 
@@ -388,9 +388,10 @@ fun journal_is_poisoned(journal_path) {
 }
 
 # Drop trailing assistant/tool records back to (and including) the last
-# role:'user' message — the last clean point. Used on resume of a poisoned
-# session so the failing turn never re-fires. Keeps system + everything up
-# to and including the last user message.
+# role:'user' message — the last clean point. Keeps system + everything up
+# to and including the last user message. (No longer applied on a fatal
+# error or on resume: it threw away completed tool results whose effects
+# were real — both keep completed pairs and trim only the dangling tail.)
 fun drop_to_last_clean_user(msgs) {
     idx = last_user_index(msgs, length(msgs) - 1)
     if (idx < 0) { msgs }
@@ -440,12 +441,12 @@ fun run(opts, system_prompt_text) {
                           replay_journal(prev_path)
                       } else { [] }
                   }
-    # F2: on a poisoned session, trim the failing turn back to the last clean
-    # user message (drop the poisoned tool_call) BEFORE the usual incomplete
-    # trim, so resume never re-fires the call that killed the prior session.
-    resumed_clean = if (prev_poisoned == 'true') { drop_to_last_clean_user(resumed_raw) }
-                    else { resumed_raw }
-    resumed = trim_incomplete(resumed_clean)
+    # F2: a poisoned session (it ended on a fatal request error) resumes like
+    # any other — trim_incomplete drops only the dangling tail. It used to be
+    # cut back to the last user message, throwing away tool results whose
+    # effects (written files) are real; nothing in a completed pair can
+    # re-fire on resume, and cut-off tool arguments are stored as "{}".
+    resumed = trim_incomplete(resumed_raw)
 
     journal_path = if (length(resumed) > 0) {
         prev_path
@@ -464,8 +465,9 @@ fun run(opts, system_prompt_text) {
     history = if (length(resumed) > 0) {
         print("")
         if (prev_poisoned == 'true') {
-            print(UI.grey_text() ++ "  ⏺ previous session ended on an error — trimmed the " ++
-                  "failing turn; resumed " ++ to_string(length(resumed)) ++ " messages" ++ UI.reset())
+            print(UI.grey_text() ++ "  ⏺ previous session ended on a request error — resumed " ++
+                  to_string(length(resumed)) ++ " messages (completed tool results kept; " ++
+                  "/compact or /reset if the error repeats)" ++ UI.reset())
         } else {
             print(UI.grey_text() ++ "  ⏺ resumed crashed session — " ++
                   to_string(length(resumed)) ++ " messages recovered" ++ UI.reset())
@@ -1990,17 +1992,28 @@ fun tcs_chars(tcs, acc) {
 # → snip before any LLM auto-compaction. Walk OLDEST-first; for each role:'tool'
 # or role:'user' message whose content exceeds ~8KB, replace the body with a
 # "[N chars elided]" stub. Stop as soon as approx_tokens(history) < budget.
-# Never touches system, assistant prose, tool_calls, or the LAST message (the
-# live user turn). Needs no network — works even when the LLM is unreachable.
+# Never touches system, assistant prose, tool_calls, the MOST RECENT user
+# message (the live request — mid-turn it is no longer the last message, and a
+# pasted 10KB request used to get stubbed), or the LAST message (the result the
+# model is about to read). Needs no network — works even when the LLM is
+# unreachable.
 fun MECH_TRIM_THRESHOLD_CHARS() { 8000 }
 
-fun mechanical_trim(history, budget_t) {
+fun mechanical_trim(history, budget_t) { mechanical_trim_ex(history, budget_t, 'true') }
+
+# protect_last 'false': the overflow retry (shrink_for_overflow) — the server
+# already refused a request containing that last result (a giant `read`), so
+# it may be stubbed too; the live user request stays protected.
+fun mechanical_trim_ex(history, budget_t, protect_last) {
     n = length(history)
     if (n == 0) { history }
-    else { mech_trim_loop(history, 0, n, budget_t, []) }
+    else {
+        live_user = last_user_index(history, n - 1)
+        mech_trim_loop(history, 0, n, budget_t, [], live_user, protect_last)
+    }
 }
 
-fun mech_trim_loop(msgs, i, total, budget_t, acc) {
+fun mech_trim_loop(msgs, i, total, budget_t, acc, live_user, protect_last) {
     if (length(msgs) == 0) { acc }
     else {
         m = hd(msgs)
@@ -2012,13 +2025,25 @@ fun mech_trim_loop(msgs, i, total, budget_t, acc) {
             acc ++ msgs
         } else {
             role = map_get(m, 'role')
-            is_last = if (i == total - 1) { 'true' } else { 'false' }
-            stubbable = if (is_last == 'true') { 'false' }
+            protected = if (i == live_user) { 'true' }
+                        else { if (protect_last == 'true' && i == total - 1) { 'true' } else { 'false' } }
+            stubbable = if (protected == 'true') { 'false' }
                         else { if (role == 'tool' || role == 'user') { 'true' } else { 'false' }}
             new_m = if (stubbable == 'true') { stub_if_large(m) } else { m }
-            mech_trim_loop(tl(msgs), i + 1, total, budget_t, list_append(acc, new_m))
+            mech_trim_loop(tl(msgs), i + 1, total, budget_t, list_append(acc, new_m), live_user, protect_last)
         }
     }
+}
+
+# The server rejected the request as longer than its context. Aim well below
+# what was sent — half of it (or the usual compaction target, if lower):
+# mechanical trim first (no LLM call; the last result may go too), then
+# summarize whatever is old enough if that wasn't enough.
+fun shrink_for_overflow(history, opts) {
+    half = approx_tokens(history) / 2
+    target = if (half < compact_target_tokens()) { half } else { compact_target_tokens() }
+    trimmed = mechanical_trim_ex(history, target, 'false')
+    if (approx_tokens(trimmed) > target) { compact_history(trimmed, opts) } else { trimmed }
 }
 
 # Replace an oversized string body with a stub; small or non-string (multimodal
@@ -2103,23 +2128,37 @@ fun run_turn(history, opts, step) {
             # is signalled by exit 1 / the --json status. (Transport detail is
             # on stderr via the runtime.) Interactive keeps the inline error.
             if (map_get(opts, 'headless') != 'true') { turn_print(opts, UI.err_text("[error] llm call failed")) }
-            # F2/F1: distinguish a POISONED context from a TRANSIENT failure.
-            #  - FATAL (a 4xx request rejection or an unparseable body — re-sending
-            #    the identical bytes can't fix it): drop back to the last clean user
-            #    message so the offending tool_call is never journaled/re-fired, and
-            #    flag the journal poisoned so even an immediate resume trims it.
-            #  - TRANSIENT (network blip / 5xx after the retry budget): the context
-            #    is fine, the wire failed. KEEP all completed work; only trim a
-            #    dangling unsendable tail. Do NOT poison — a later resume is valid.
+            # KEEP every completed assistant+tool pair; only the dangling tail the
+            # API can't take (a trailing assistant with unanswered tool_calls, a
+            # partial result set) is dropped — fatal and transient alike. A FATAL
+            # rejection (4xx / unparseable body) used to drop the turn back to its
+            # user message: two writes landed on disk, a 400 followed, and after
+            # resume the model had no record of them. (Cut-off tool arguments —
+            # the old reason to drop — are stored as "{}" now; see
+            # sanitize_tool_calls.) A fatal failure still flags the journal
+            # poisoned, which now only changes the resume notice.
+            #
+            # "The context is too long" (context_length_exceeded, "maximum context
+            # length", …) is recoverable: the server's window can be smaller than
+            # SWARM_CODE_MAX_TOKENS claims. Shrink — mechanical trim first, then
+            # summarize — and retry ONCE per turn ('ctx_retry'), if that actually
+            # made the history smaller.
             fatal = LLM.last_fail(opts)
-            recovered = if (fatal == 'fatal') {
-                mark_poison(opts)
-                drop_to_last_clean_user(working_hist)
+            recovered = trim_incomplete(working_hist)
+            overflow = if (fatal == 'fatal' && map_get(opts, 'ctx_retry') != 'true') {
+                LLM.last_fail_context_overflow(opts)
+            } else { 'false' }
+            shrunk = if (overflow == 'true') { shrink_for_overflow(recovered, opts) } else { recovered }
+            if (overflow == 'true' && approx_tokens(shrunk) < approx_tokens(recovered)) {
+                turn_print(opts, "  " ++ UI.dim_text("(the server says the context is too long — trimmed to ~" ++
+                      to_string(approx_tokens(shrunk)) ++ " tokens, retrying once)"))
+                journal_sync(opts, shrunk)
+                run_turn(shrunk, map_put(opts, 'ctx_retry', 'true'), step + 1)
             } else {
-                trim_incomplete(working_hist)
+                if (fatal == 'fatal') { mark_poison(opts) }
+                journal_sync(opts, recovered)
+                recovered
             }
-            journal_sync(opts, recovered)
-            recovered
         } else {
             content = to_string(map_get(result, 'content'))
             tool_calls_v = map_get(result, 'tool_calls')

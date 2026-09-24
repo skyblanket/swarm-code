@@ -43,6 +43,7 @@ export [
     last_prompt_tokens, last_reasoning, last_fail,
     record_usage, record_reasoning, extract_usage, extract_reasoning,
     extract_content, extract_finish_reason,
+    last_fail_detail, last_fail_context_overflow, is_context_overflow_msg,
     new_message_system, new_message_user,
     new_message_assistant, new_message_tool,
     parse_inband_tool_calls, inband_assistant_text,
@@ -933,6 +934,42 @@ fun last_fail(opts) {
     if (table == nil) { nil } else { ets_get(table, 'fail_reason') }
 }
 
+# The server's message for the last FATAL rejection ("" when none) — lets the
+# agent tell "the context is too long" (recoverable: compact and retry) from
+# any other 4xx.
+fun record_fail_detail(opts, msg) {
+    table = map_get(opts, 'llm_stats_table')
+    if (table == nil) { 'ok' }
+    else { ets_put(table, 'fail_detail', to_string(msg)) }
+}
+
+fun last_fail_detail(opts) {
+    table = map_get(opts, 'llm_stats_table')
+    v = if (table == nil) { nil } else { ets_get(table, 'fail_detail') }
+    if (v == nil) { "" } else { v }
+}
+
+# Did the last fatal rejection say the prompt exceeds the model's context?
+fun last_fail_context_overflow(opts) {
+    if (last_fail(opts) != 'fatal') { 'false' }
+    else { is_context_overflow_msg(last_fail_detail(opts)) }
+}
+
+# Wording used by OpenAI-compatible servers (OpenAI / vLLM "maximum context
+# length", "context_length_exceeded"), Anthropic ("prompt is too long"),
+# llama.cpp ("exceeds the available context size") and others.
+fun is_context_overflow_msg(msg) {
+    low = string_lower(to_string(msg))
+    if (string_contains(low, "maximum context length") == 'true') { 'true' }
+    else { if (string_contains(low, "context_length_exceeded") == 'true') { 'true' }
+    else { if (string_contains(low, "too many tokens") == 'true') { 'true' }
+    else { if (string_contains(low, "prompt is too long") == 'true') { 'true' }
+    else { if (string_contains(low, "exceeds the available context size") == 'true') { 'true' }
+    else { if (string_contains(low, "context window") == 'true' &&
+               string_contains(low, "exceed") == 'true') { 'true' }
+    else { 'false' }}}}}}
+}
+
 fun retry_delay_ms(attempt) {
     base = if (attempt == 0) { 1000 }
            else { if (attempt == 1) { 2000 }
@@ -1794,6 +1831,7 @@ fun chat_native(messages, opts) {
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     record_fail(opts, "fail")
+    record_fail_detail(opts, "")
     record_retry_after(opts, 0)
     cls = classify_stream(stream_call(url, hdrs, body, opts))
     latency = timestamp() - start_ms
@@ -1810,6 +1848,7 @@ fun chat_native(messages, opts) {
             f_status = elem(cls, 1)
             f_msg = elem(cls, 2)
             record_fail(opts, 'fatal')
+            record_fail_detail(opts, f_msg)
             diag(opts, "  " ++ UI.err_text("✗ request rejected (HTTP " ++
                   to_string(f_status) ++ ") — not retrying: " ++ to_string(f_msg)))
             Log.llm_error("fatal request error " ++ to_string(f_status), to_string(f_msg))
@@ -1840,6 +1879,7 @@ fun chat_native(messages, opts) {
                 # identical body just re-fails. Mark fatal so the retry
                 # loop stops instead of hammering the same poisoned body.
                 record_fail(opts, 'fatal')
+                record_fail_detail(opts, to_string(em) ++ " " ++ to_string(map_get(err, 'code')))
                 diag(opts, "  " ++ UI.err_text("[llm error] " ++ to_string(em)))
                 Log.llm_error("server error", to_string(em))
                 nil
@@ -1991,6 +2031,7 @@ fun chat_inband(messages, opts) {
            else { list_append(base_hdrs, {"Authorization", "Bearer " ++ api_key}) }
 
     record_fail(opts, "fail")
+    record_fail_detail(opts, "")
     record_retry_after(opts, 0)
     cls = classify_stream(stream_call(url, hdrs, body, opts))
     latency = timestamp() - start_ms
@@ -2003,6 +2044,7 @@ fun chat_inband(messages, opts) {
         # retry loop (chat_inband_retry checks last_fail), transient ones retry.
         if (cls_tag == 'fatal') {
             record_fail(opts, 'fatal')
+            record_fail_detail(opts, elem(cls, 2))
             diag(opts, "  " ++ UI.err_text("✗ request rejected (HTTP " ++
                   to_string(elem(cls, 1)) ++ ") — not retrying: " ++ to_string(elem(cls, 2))))
             Log.llm_error("fatal request error (inband, HTTP " ++ to_string(elem(cls, 1)) ++ ")", to_string(elem(cls, 2)))
