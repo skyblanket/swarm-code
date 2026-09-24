@@ -30,8 +30,8 @@ search: docker compose  (3 hits)
 > recall_skill deploy-mally-otp   # pull full playbook from ~/.swarm-code/skills/
 SKILL.md loaded. Building burrito binary …
 
-> /schedule add 1h "review open PRs"   # heartbeat-driven cron
-job 3 added (every 1h)
+> /schedule "1h" "review open PRs"   # heartbeat-driven cron (or "hourly", "daily 09:00")
+✓ scheduled job 3 (1h): review open PRs
 ```
 
 ## Quickstart

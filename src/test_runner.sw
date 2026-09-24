@@ -27,6 +27,7 @@ import Memory
 import Tools
 import Mcp
 import McpServer
+import JsonCheck
 import ToolGuardrails
 import Agent
 import Scheduler
@@ -129,6 +130,12 @@ fun main() {
         t_mcp_msg_kind_collision(),
         t_mcp_health_structured(),
         t_mcp_server_spec_envelope(),
+        t_json_check_strict(),
+        t_sched_wrong_shape_never_panics(),
+        t_sched_corrupt_refuses_write(),
+        t_sched_strict_exprs(),
+        t_sched_hourly_on_the_hour(),
+        t_sched_dispatch_denies_dangerous(),
         t_memory_embed_db_path(),
         t_memory_dir_suffix(),
         t_memory_slugify_spaces(),
@@ -1530,6 +1537,142 @@ fun t_scheduler_jobs_dir_suffix() {
     d = Scheduler.jobs_dir()
     check("scheduler jobs_dir() ends with 'telemetry'",
           string_ends_with(d, "telemetry"))
+}
+
+# A fresh, empty temp file path (mkstemp) — no shell() round-trip.
+fun ag_tmp(prefix) { file_temp("/tmp/swarm-test-" ++ prefix ++ "-") }
+
+fun ag_repeat(s, n, acc) { if (n <= 0) { acc } else { ag_repeat(s, n - 1, acc ++ s) } }
+
+# json_decode guesses through damage ("[1,,2]" → [1, nil, 2], "[tru]"
+# → [nil, nil, nil]), so writers need a strict well-formedness check
+# before trusting a file enough to rewrite it.
+fun t_json_check_strict() {
+    bad = ["[1, 2", "[1 2]", "{\"a\":1} x", "[{\"a\":1},]", "[", "{\"a\":}", "[tru]",
+           "[\"abc]", "{\"a\" 1}", "[1,,2]", "01", "1.", "\"a\\q\"", "", "nul"]
+    good = ["[]", "{}", " [1, -2.5e+3, 0, true, false, null, \"x\\\"\\u00e9\", {\"k\": [{}]}] ",
+            "\"é\"", "-0", "1E5"]
+    long_arr = "[" ++ ag_repeat("1,", 20000, "") ++ "1]"
+    ok = ag_all([
+        ag_all(map(fn(x) { ag_is(JsonCheck.valid(x), 'false') }, bad)),
+        ag_all(map(fn(x) { ag_is(JsonCheck.valid(x), 'true') }, good)),
+        ag_is(JsonCheck.valid(long_arr), 'true')])
+    check("json-check: strict RFC 8259 validity (rejects what json_decode guesses at)", ok)
+}
+
+# schedule.json of the wrong SHAPE used to crash every interactive
+# session ~2s after launch, inside main's heartbeat handler:
+# {"jobs":[]} decoded to a map → hd() panic in prune_jobs_loop, and a
+# job with "last_run":"yesterday" → "str" + int panic in
+# compute_next_fire. tick_at must report, skip and never panic; valid
+# entries still load (numeric strings coerced), invalid ones untouched.
+fun t_sched_wrong_shape_never_panics() {
+    p = ag_tmp("sched-shape")
+    file_write(p, "{\"jobs\":[]}")
+    r1 = Scheduler.tick_at(p, 2)
+    far = "99999999999999"
+    body = "[5, \"str\", null, " ++
+        "{\"id\":\"1\",\"expr\":\"1h\",\"prompt\":\"x\",\"last_run\":\"yesterday\"}," ++
+        "{\"id\":\"2\",\"expr\":\"1h\",\"prompt\":\"y\",\"last_run\":\"" ++ far ++ "\"}," ++
+        "{\"id\":\"../x\",\"expr\":\"1h\",\"prompt\":\"z\"}," ++
+        "{\"id\":\"4\",\"expr\":\"1.5h\",\"prompt\":\"w\"}]"
+    file_write(p, body)
+    r2 = Scheduler.tick_at(p, 2)
+    disk_now = file_read(p)
+    valid = Scheduler.valid_jobs_of(Scheduler.read_state_at(p))
+    file_delete(p)
+    ok = ag_all([
+        ag_is(map_get(r1, 'status'), 'corrupt'),
+        ag_is(length(map_get(r1, 'problems')), 1),
+        ag_is(map_get(r2, 'status'), 'ok'),
+        ag_is(map_get(r2, 'fired'), 0),
+        ag_is(length(map_get(r2, 'problems')), 6),
+        ag_is(disk_now, body),
+        ag_is(length(valid), 1),
+        ag_is(map_get(hd(valid), 'last_run'), 99999999999999)])
+    check("scheduler: wrong-shape schedule.json / bad fields are skipped, never panic", ok)
+}
+
+# /schedule on a corrupt schedule.json used to treat it as [] and
+# overwrite it with just the new job — silently deleting every other
+# job. It must refuse (file byte-identical); entries it can't parse in
+# an otherwise-valid array survive an add.
+fun t_sched_corrupt_refuses_write() {
+    p = ag_tmp("sched-corrupt")
+    file_write(p, "[{\"id\":\"1\",\"expr\":\"1h\",\"prompt\":\"keep me\"} ,,, oops")
+    before = file_read(p)
+    r1 = Scheduler.add_at(p, "5m", "new job")
+    same1 = file_read(p)
+    file_write(p, "{\"jobs\":[{\"id\":\"1\"}]}")
+    r2 = Scheduler.add_at(p, "5m", "new job")
+    same2 = file_read(p)
+    file_write(p, "[7, {\"id\":\"3\",\"expr\":\"1h\",\"prompt\":\"old\"}]")
+    r3 = Scheduler.add_at(p, "5m", "new job")
+    grown = Scheduler.read_state_at(p)
+    file_delete(p)
+    r4 = Scheduler.add_at(p, "bogus", "x")
+    missing_after_bad = file_exists(p)
+    r5 = Scheduler.add_at(p, "2h", "fresh")
+    fresh = Scheduler.read_state_at(p)
+    file_delete(p)
+    entries = elem(grown, 1)
+    ok = ag_all([
+        ag_is(elem(r1, 0), 'error'),
+        string_contains(to_string(elem(r1, 1)), "refusing to overwrite"),
+        ag_is(same1, before),
+        ag_is(elem(r2, 0), 'error'),
+        ag_is(same2, "{\"jobs\":[{\"id\":\"1\"}]}"),
+        ag_is(r3, {'ok', "4"}),
+        ag_is(length(entries), 3),
+        ag_is(hd(entries), 7),
+        ag_is(elem(r4, 0), 'error'),
+        ag_is(missing_after_bad, 'false'),
+        ag_is(r5, {'ok', "1"}),
+        ag_is(length(elem(fresh, 1)), 1)])
+    check("scheduler: add refuses to overwrite a corrupt schedule.json, keeps unknown entries", ok)
+}
+
+# Loose parsing accepted garbage by reading leading digits: 1.5h ran
+# hourly, 10x5m every 10m, "daily :" at 00:00, "daily 9:5x" at 09:05.
+fun t_sched_strict_exprs() {
+    rejects = ["1.5h", "10x5m", "5 m", "-1h", "+1h", "0m", "1234567890s", "5", "m",
+               "daily :", "daily 9:5x", "daily 9:5", "daily 24:00", "daily 12:60",
+               "daily 9", "daily :30", "hourlyx", "1h30m"]
+    accepts = ["30s", "5m", "2h", "1d", "hourly", "daily", "daily 9:05", "daily 23:59", " 10m "]
+    ok = ag_all([
+        ag_all(map(fn(e) { ag_is(Scheduler.parse_expr(e), nil) }, rejects)),
+        ag_all(map(fn(e) { if (Scheduler.expr_error(e) == nil) { 'false' } else { 'true' } }, rejects)),
+        ag_all(map(fn(e) { if (Scheduler.parse_expr(e) == nil) { 'false' } else { 'true' } }, accepts)),
+        ag_is(Scheduler.daily_time_ms("daily 9:05"), (9 * 3600 + 5 * 60) * 1000),
+        ag_is(elem(Scheduler.add_at("/nonexistent-dir/s.json", "1.5h", "x"), 0), 'error')])
+    check("scheduler: strict expression parsing rejects 1.5h / 10x5m / 'daily :' / 'daily 9:5x'", ok)
+}
+
+# `hourly` is documented as "every hour on the hour" but ran 60 min
+# after creation. Next fire is now the first :00 (UTC) after last_run.
+fun t_sched_hourly_on_the_hour() {
+    hour = 3600000
+    last = 1779635000000        # 15:03:20 UTC — mid-hour
+    nf = Scheduler.compute_next_fire("hourly", last, last + 1000)
+    on_hour = (last / hour + 1) * hour
+    nf2 = Scheduler.compute_next_fire("hourly", on_hour, on_hour + 5)
+    nf_1h = Scheduler.compute_next_fire("1h", last, last + 1000)
+    ok = ag_all([
+        ag_is(nf, on_hour),
+        ag_is(nf % hour, 0),
+        if (nf > last && nf - last < hour) { 'true' } else { 'false' },
+        ag_is(nf2, on_hour + hour),
+        ag_is(nf_1h, last + hour)])
+    check("scheduler: hourly fires at the top of the hour, 1h stays relative", ok)
+}
+
+# Scheduled children run unattended in headless mode, which
+# auto-approves 'ask' — without SWARM_CODE_DENY_DANGEROUS=1 a job whose
+# model ran `rm -rf ~/victim` deleted it. /flows already set it.
+fun t_sched_dispatch_denies_dangerous() {
+    cmd = Scheduler.dispatch_cmd("/bin/swarm", "clean up", "/tmp/o.out", "/tmp/p.pid")
+    check("scheduler: dispatched jobs run with SWARM_CODE_DENY_DANGEROUS=1",
+          string_contains(cmd, "SWARM_CODE_DENY_DANGEROUS=1 nohup "))
 }
 
 # ------------------------------------------------------------

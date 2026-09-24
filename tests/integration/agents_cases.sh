@@ -16,10 +16,41 @@
 #   A4  --mcp-server spec   — ping → {}, unknown tool → -32602, bad
 #                             "jsonrpc" / object or null ids → -32600,
 #                             notifications get no reply
+#   A5  schedule.json shape — a wrong-shape file ({"jobs":[]}) or a job
+#                             with "last_run":"yesterday" no longer
+#                             crashes the interactive session; one warning
+#   A6  corrupt schedule    — /schedule refuses to overwrite a damaged
+#                             schedule.json (file byte-identical)
+#   A7  unattended jobs     — a scheduled job's child runs with
+#                             SWARM_CODE_DENY_DANGEROUS=1: `rm -rf ~/…`
+#                             requested by its model is denied
+#
+# A5-A7 drive the binary INTERACTIVELY (the scheduler runs off main's
+# heartbeat) through tests/integration/pty_run.py.
 #
 # Run standalone: tests/integration/run.sh (these run after T1..T10).
 
 FAKE_MCP="$ROOT/tests/integration/fake_mcp.py"
+PTY_RUN="$ROOT/tests/integration/pty_run.py"
+
+# run_pty <script.json> — run the binary interactively in a pty with
+# the isolated env; transcript → $CASE/pty.txt, "ALIVE"/"DEAD n" →
+# $PTY_STATUS. 90s watchdog, like run_swarm.
+run_pty() {
+    PTY_STATUS="$(
+        cd "$WORK" || exit 97
+        HOME="$CASE_HOME" \
+        SWARM_CODE_EXECUTION_CONTEXT=main \
+        SWARM_CODE_ENDPOINT="http://127.0.0.1:$PORT" \
+        SWARM_CODE_MODEL=test \
+        SWARM_CODE_TOOL_FORMAT=native \
+        SWARM_CODE_PLAN=off \
+        SWARM_CODE_BIN="$BIN" \
+        TERM=xterm SW_NO_TITLE=1 \
+        perl -e 'alarm 90; exec @ARGV' python3 "$PTY_RUN" "$CASE/pty.txt" "$1" \
+            "$BIN" --no-resume 2>"$CASE/pty.err"
+    )"
+}
 
 # mcp_settings <mode> — user settings.json wiring the fake MCP server
 # (its stdin log lands in $CASE/mcp.log). The explicit allow keeps the
@@ -171,9 +202,100 @@ PYEOF
     else pass A4; fi
 }
 
+# ------------------------------------------------------------
+# A5 — wrong-shape schedule.json must not kill the session
+# ------------------------------------------------------------
+a5() {
+    new_case a5
+    local sched="$CASE_HOME/.swarm-code/schedule.json"
+    mkdir -p "$CASE_HOME/.swarm-code"
+    echo '{"responses": []}' >"$CASE/scenario.json"
+    # Survive 3+ heartbeat ticks, then prove main still answers input (a
+    # panicked main can leave the process itself lingering).
+    cat >"$CASE/pty.json" <<'EOF'
+[{"wait": 7}, {"send": "/schedules\r"},
+ {"until_out": "see /help for /schedule usage", "timeout": 8}]
+EOF
+    start_mock "$CASE/scenario.json" || { fail A5 "mock failed to start"; return; }
+    printf '%s' '{"jobs":[]}' >"$sched"
+    run_pty "$CASE/pty.json"
+    local s1="$PTY_STATUS"; cp "$CASE/pty.txt" "$CASE/pty1.txt"
+    printf '%s' '[{"id":"1","expr":"1h","prompt":"x","last_run":"yesterday"}]' >"$sched"
+    cp "$sched" "$CASE/sched2.orig"
+    run_pty "$CASE/pty.json"
+    local s2="$PTY_STATUS"
+    cleanup
+    local warns; warns="$(grep -c "schedule: " "$CASE/pty1.txt")"
+    if [ "$s1" != "ALIVE" ] || grep -q "panic:" "$CASE/pty1.txt" ||
+       ! grep -q "see /help for /schedule usage" "$CASE/pty1.txt"; then
+        fail A5 "session crashed/unresponsive with {\"jobs\":[]} ($s1)"
+    elif ! grep -q "must be a JSON array" "$CASE/pty1.txt"; then fail A5 "no warning for a non-array schedule.json"
+    elif [ "$warns" -ne 1 ]; then fail A5 "warning printed $warns times, want once"
+    elif [ "$s2" != "ALIVE" ] || grep -q "panic:" "$CASE/pty.txt" ||
+         ! grep -q "see /help for /schedule usage" "$CASE/pty.txt"; then
+        fail A5 "session crashed/unresponsive on last_run:\"yesterday\" ($s2)"
+    elif ! grep -q "last_run must be a timestamp" "$CASE/pty.txt"; then fail A5 "no warning for the bad job"
+    elif ! cmp -s "$sched" "$CASE/sched2.orig"; then fail A5 "tick rewrote an entry it could not validate"
+    else pass A5; fi
+}
+
+# ------------------------------------------------------------
+# A6 — /schedule must not replace a corrupt schedule.json
+# ------------------------------------------------------------
+a6() {
+    new_case a6
+    local sched="$CASE_HOME/.swarm-code/schedule.json"
+    mkdir -p "$CASE_HOME/.swarm-code"
+    printf '%s' '[{"id":"1","expr":"1d","prompt":"nightly report","last_run":0,"runs":3},{"id":"2",' >"$sched"
+    cp "$sched" "$CASE/sched.orig"
+    echo '{"responses": []}' >"$CASE/scenario.json"
+    cat >"$CASE/pty.json" <<'EOF'
+[{"wait": 4}, {"send": "/schedule \"5m\" \"new job\"\r"},
+ {"until_out": "refusing to overwrite", "timeout": 8}, {"wait": 1}]
+EOF
+    start_mock "$CASE/scenario.json" || { fail A6 "mock failed to start"; return; }
+    run_pty "$CASE/pty.json"
+    cleanup
+    if [ "$PTY_STATUS" != "ALIVE" ] || grep -q "panic:" "$CASE/pty.txt"; then fail A6 "session died ($PTY_STATUS)"
+    elif ! cmp -s "$sched" "$CASE/sched.orig"; then fail A6 "corrupt schedule.json was overwritten: $(head -c 200 "$sched")"
+    elif ! grep -q "refusing to overwrite" "$CASE/pty.txt"; then fail A6 "no clear refusal message"
+    else pass A6; fi
+}
+
+# ------------------------------------------------------------
+# A7 — a due job's child must not auto-approve dangerous bash
+# ------------------------------------------------------------
+a7() {
+    new_case a7
+    mkdir -p "$CASE_HOME/.swarm-code" "$CASE_HOME/victim"
+    touch "$CASE_HOME/victim/keep"
+    cat >"$CASE_HOME/.swarm-code/schedule.json" <<'EOF'
+[{"id":"1","expr":"30s","prompt":"cleanup the victim dir","created_at":0,"last_run":0,"runs":0,"paused":false}]
+EOF
+    cat >"$CASE/scenario.json" <<'EOF'
+{"responses": [
+  {"type": "tool_calls", "calls": [{"id": "c1", "name": "bash", "arguments": {"command": "rm -rf ~/victim && echo gone"}}]},
+  {"type": "text", "content": "CRON_DONE_A7"}
+]}
+EOF
+    start_mock "$CASE/scenario.json" || { fail A7 "mock failed to start"; return; }
+    cat >"$CASE/pty.json" <<EOF
+[{"until": "$CASE/requests.jsonl", "contains": "\"n\": 1", "timeout": 40}, {"wait": 3}]
+EOF
+    run_pty "$CASE/pty.json"
+    cleanup
+    if [ ! -e "$CASE_HOME/victim/keep" ]; then fail A7 "SCHEDULED JOB DELETED ~/victim (dangerous bash auto-approved)"
+    elif [ "$(req_count)" -lt 2 ]; then fail A7 "scheduled job never ran ($(req_count) requests)"
+    elif ! req_has 1 "permission denied"; then fail A7 "child was not told the command was denied"
+    else pass A7; fi
+}
+
 agents_cases() {
     a1
     a2
     a3
     a4
+    a5
+    a6
+    a7
 }

@@ -1,6 +1,7 @@
 module Scheduler
 
 import Util
+import JsonCheck
 
 # ============================================================
 # Scheduler — interval-based recurring agent runs
@@ -25,10 +26,27 @@ import Util
 # Supported expressions (all interpreted internally as milliseconds
 # because timestamp() — and therefore every comparison here — is ms):
 #
-#   30s, 5m, 2h, 1d     interval
+#   30s, 5m, 2h, 1d     interval — a whole positive count + one unit
+#                       (strict: "1.5h", "10x5m", "5 m", "-1h" are rejected)
 #   daily HH:MM         fire once per day at the given UTC time
-#   hourly              every hour on the hour (alias for 1h)
+#                       (H or HH, exactly MM: "daily 9:05", "daily 23:59")
+#   hourly              at the top of every hour (UTC wallclock, :00) —
+#                       NOT "60 minutes after creation"; use 1h for that
 #   daily               every 24h (alias for 1d)
+#
+# Robustness: schedule.json is hand-editable, so every read validates.
+# The file must hold a JSON array; entries that are not objects, or
+# whose id / expr / prompt / numeric fields don't validate, are SKIPPED
+# (left untouched on disk) with a one-time warning — a bad entry never
+# panics main's heartbeat handler. A file that exists but does not
+# parse as an array is never overwritten: /schedule refuses to write
+# instead of silently replacing every job. Writes go through
+# file_atomic_write (temp file + rename), so a crash mid-write can't
+# truncate the schedule.
+#
+# Dispatched children run with SWARM_CODE_DENY_DANGEROUS=1 (like
+# /flows): a headless child otherwise auto-approves every 'ask', and a
+# job firing unattended must not auto-run dangerous bash.
 #
 # Dispatcher: hooked off the Heartbeat. Every tick the heartbeat
 # calls Scheduler.tick(opts), which walks jobs, computes "is this due
@@ -41,9 +59,10 @@ import Util
 # scheduled-<id>-<ts>.out so the user can `tail` later.
 
 export [
-    load, add, remove, list_all, tick,
+    load, add, add_checked, remove, list_all, tick,
     schedule_path, jobs_dir,
     parse_expr, parse_interval, daily_time_ms, compute_next_fire,
+    expr_error, read_state_at, normalize_job, add_at, tick_at, dispatch_cmd,
     swarm_binary_path, prune_old_out_files,
     pause_job, resume_job
 ]
@@ -62,80 +81,248 @@ fun load() {
 }
 
 # ------------------------------------------------------------
-# Read jobs from disk. Returns [] if file missing/unparseable.
+# Reading schedule.json
 # ------------------------------------------------------------
-fun list_all() {
-    p = schedule_path()
-    if (file_exists(p) == 'false') { [] }
+# read_state_at(path) → {'ok', raw_entries} | {'corrupt', why}
+#   missing or blank file          → {'ok', []}
+#   unreadable / not JSON / not an array → {'corrupt', why}
+# "Not JSON" is decided by the STRICT JsonCheck.valid, not by
+# json_decode returning nil: the runtime decoder guesses its way
+# through damage ("[{…} ,,, oops" decodes to a list padded with nils),
+# and rewriting such a guess would destroy the jobs it mangled.
+# The raw entries are returned UNVALIDATED so writers can round-trip
+# entries they don't understand instead of dropping them; readers go
+# through list_all() / normalize_job.
+fun read_state_at(p) {
+    if (file_exists(p) == 'false') { {'ok', []} }
     else {
         c = file_read(p)
-        if (c == nil) { [] }
+        if (c == nil) { {'corrupt', "could not be read"} }
         else {
-            decoded = json_decode(string_trim(c))
-            if (decoded == nil) { [] } else { decoded }
+            trimmed = string_trim(c)
+            if (string_length(trimmed) == 0) { {'ok', []} }
+            else { if (JsonCheck.valid(trimmed) == 'false') { {'corrupt', "is not valid JSON"} }
+            else {
+                decoded = json_decode(trimmed)
+                if (decoded == nil) { {'corrupt', "is not valid JSON"} }
+                else { if (is_list(decoded) == 'false') {
+                    {'corrupt', "must be a JSON array of jobs (found " ++ typeof(decoded) ++ ")"}
+                } else { {'ok', decoded} }}
+            }}
         }
     }
 }
 
-fun save_all(jobs) {
-    file_write(schedule_path(), json_encode(jobs))
-    'ok'
+# Every valid, normalized job (invalid entries skipped). [] when the
+# file is missing or corrupt — readers never see a non-list.
+fun list_all() { valid_jobs_of(read_state_at(schedule_path())) }
+
+fun valid_jobs_of(state) {
+    if (elem(state, 0) != 'ok') { [] }
+    else { valid_jobs_loop(elem(state, 1), []) }
 }
 
-# ------------------------------------------------------------
-# Add a new job. Returns the assigned id (string), or nil if expr
-# doesn't parse.
-# ------------------------------------------------------------
-fun add(expr, prompt) {
-    expr_str = string_trim(to_string(expr))
-    # Validate: either a known interval OR a daily HH:MM form.
-    if (parse_expr(expr_str) == nil && daily_time_ms(expr_str) == nil) { nil }
+fun valid_jobs_loop(entries, acc) {
+    if (length(entries) == 0) { acc }
     else {
-        jobs = list_all()
-        id = to_string(next_id(jobs, 0))
-        job = %{
-            id: id,
-            expr: expr_str,
-            prompt: to_string(prompt),
-            created_at: timestamp(),
-            # Seed last_run to NOW, not 0. With 0 (epoch), compute_next_fire
-            # returns a 1970 timestamp that is always < now, so the next 2s
-            # heartbeat fires the job immediately on creation (and a past-slot
-            # daily HH:MM fires right away) instead of after one interval.
-            last_run: timestamp(),
-            runs: 0,
-            paused: 'false'
-        }
-        save_all(list_append(jobs, job))
-        id
+        r = normalize_job(hd(entries))
+        next = if (elem(r, 0) == 'ok') { list_append(acc, elem(r, 1)) } else { acc }
+        valid_jobs_loop(tl(entries), next)
     }
 }
 
+# Crash-safe write: file_atomic_write writes <path>.tmp.<pid> and
+# rename(2)s it over the old file, so a crash mid-write leaves either
+# the old schedule or the new one — never a truncated file that the
+# next read would treat as corrupt. Returns 'ok' | 'error'.
+fun save_at(p, entries) { file_atomic_write(p, json_encode(entries)) }
+
+# ------------------------------------------------------------
+# normalize_job(raw) → {'ok', job} | {'invalid', why}
+# ------------------------------------------------------------
+# Validates one hand-editable entry. The returned job is the raw map
+# with its fields coerced to the types tick() relies on (extra keys
+# are preserved), so a fire can write it back without losing data:
+#   id          string or integer, [A-Za-z0-9_-]+ (it names pid/.out files)
+#   expr        a schedule expression parse_expr accepts
+#   prompt      a non-empty string
+#   created_at / last_run   non-negative integer ms (numeric strings
+#               coerced; floats truncated; missing → 0)
+#   runs        non-negative integer (missing / junk → 0 — cosmetic)
+#   paused      true/"true" → 'true', anything else → 'false'
+fun normalize_job(raw) {
+    if (is_map(raw) == 'false') { {'invalid', "entry is not a JSON object"} }
+    else {
+        id_v = map_get(raw, 'id')
+        id_s = if (id_v == nil) { "" }
+               else { if (typeof(id_v) == "string" || typeof(id_v) == "int") { to_string(id_v) }
+               else { "" } }
+        expr_v = map_get(raw, 'expr')
+        prompt_v = map_get(raw, 'prompt')
+        last_run = coerce_ms(map_get(raw, 'last_run'))
+        created = coerce_ms(map_get(raw, 'created_at'))
+        runs_c = coerce_ms(map_get(raw, 'runs'))
+        runs = if (runs_c == nil) { 0 } else { runs_c }
+        paused_v = map_get(raw, 'paused')
+        paused = if (paused_v == 'true' || to_string(paused_v) == "true") { 'true' } else { 'false' }
+        label = if (string_length(id_s) == 0) { "?" } else { id_s }
+        if (safe_id(id_s) == 'false') {
+            {'invalid', "job " ++ label ++ ": id must be a number or [A-Za-z0-9_-] string"}
+        } else { if (expr_v == nil || typeof(expr_v) != "string" || parse_expr(to_string(expr_v)) == nil) {
+            {'invalid', "job " ++ label ++ ": unparseable expr " ++ json_encode(expr_v)}
+        } else { if (prompt_v == nil || typeof(prompt_v) != "string" ||
+                     string_length(string_trim(to_string(prompt_v))) == 0) {
+            {'invalid', "job " ++ label ++ ": prompt must be a non-empty string"}
+        } else { if (last_run == nil) {
+            {'invalid', "job " ++ label ++ ": last_run must be a timestamp in ms, got " ++
+                        json_encode(map_get(raw, 'last_run'))}
+        } else { if (created == nil) {
+            {'invalid', "job " ++ label ++ ": created_at must be a timestamp in ms, got " ++
+                        json_encode(map_get(raw, 'created_at'))}
+        } else {
+            j1 = map_put(raw, 'id', id_s)
+            j2 = map_put(j1, 'expr', string_trim(to_string(expr_v)))
+            j3 = map_put(j2, 'last_run', last_run)
+            j4 = map_put(j3, 'created_at', created)
+            j5 = map_put(j4, 'runs', runs)
+            {'ok', map_put(j5, 'paused', paused)}
+        }}}}}
+    }
+}
+
+# Non-negative integer from a JSON value: nil → 0 (field absent), int
+# as-is, float truncated, all-digit string parsed; anything else (a
+# negative, "yesterday", a list, true) → nil = invalid.
+fun coerce_ms(v) {
+    if (v == nil) { 0 }
+    else {
+        t = typeof(v)
+        if (t == "int") { if (v >= 0) { v } else { nil } }
+        else { if (t == "float") { if (v >= 0) { to_int(v) } else { nil } }
+        else { if (t == "string") {
+            if (all_digits(v) == 'true') { to_int(v) } else { nil }
+        } else { nil } } }
+    }
+}
+
+fun safe_id(s) {
+    if (string_length(s) == 0 || string_length(s) > 64) { 'false' }
+    else { safe_id_loop(s, 0) }
+}
+
+fun safe_id_loop(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else {
+        c = codepoint_at(s, i)
+        ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
+             (c >= 97 && c <= 122) || c == 95 || c == 45
+        if (ok) { safe_id_loop(s, i + 1) } else { 'false' }
+    }
+}
+
+# 'true' iff s is one or more ASCII digits and nothing else.
+fun all_digits(s) {
+    if (string_length(s) == 0) { 'false' } else { all_digits_loop(s, 0) }
+}
+
+fun all_digits_loop(s, i) {
+    if (i >= string_length(s)) { 'true' }
+    else {
+        c = codepoint_at(s, i)
+        if (c >= 48 && c <= 57) { all_digits_loop(s, i + 1) } else { 'false' }
+    }
+}
+
+# ------------------------------------------------------------
+# Add a new job.
+# ------------------------------------------------------------
+# add_checked(expr, prompt) → {'ok', id} | {'error', message}. Refuses
+# to write — rather than silently replacing every job — when
+# schedule.json exists but does not parse as an array: the old code
+# treated a corrupt file as [] and overwrote it with just the new job.
+fun add_checked(expr, prompt) { add_at(schedule_path(), expr, prompt) }
+
+# add(expr, prompt) → id string, or nil on any failure. The specific
+# reason (bad expression, corrupt schedule.json, write failure) is
+# printed here, since the /schedule caller only sees nil.
+fun add(expr, prompt) {
+    r = add_checked(expr, prompt)
+    if (elem(r, 0) == 'ok') { elem(r, 1) }
+    else {
+        print("\e[38;5;208m✗ " ++ to_string(elem(r, 1)) ++ "\e[0m")
+        nil
+    }
+}
+
+fun add_at(p, expr, prompt) {
+    expr_str = string_trim(to_string(expr))
+    bad_expr = expr_error(expr_str)
+    prompt_str = to_string(prompt)
+    if (bad_expr != nil) { {'error', bad_expr} }
+    else { if (string_length(string_trim(prompt_str)) == 0) {
+        {'error', "schedule prompt must not be empty"}
+    } else {
+        state = read_state_at(p)
+        if (elem(state, 0) != 'ok') {
+            {'error', p ++ " " ++ to_string(elem(state, 1)) ++
+                      " — refusing to overwrite it (fix or move the file, then retry)"}
+        } else {
+            entries = elem(state, 1)
+            id = to_string(next_id(entries, 0))
+            job = %{
+                id: id,
+                expr: expr_str,
+                prompt: prompt_str,
+                created_at: timestamp(),
+                # Seed last_run to NOW, not 0. With 0 (epoch), compute_next_fire
+                # returns a 1970 timestamp that is always < now, so the next 2s
+                # heartbeat fires the job immediately on creation (and a past-slot
+                # daily HH:MM fires right away) instead of after one interval.
+                last_run: timestamp(),
+                runs: 0,
+                paused: 'false'
+            }
+            # Append to the RAW entries: entries this version can't
+            # validate are preserved on disk, not dropped by the rewrite.
+            if (save_at(p, list_append(entries, job)) == 'ok') { {'ok', id} }
+            else { {'error', "could not write " ++ p} }
+        }
+    }}
+}
+
+# Next free numeric id over the raw entries (non-map / non-numeric ids
+# are ignored, never crash).
 fun next_id(jobs, max_so_far) {
     if (length(jobs) == 0) { max_so_far + 1 }
     else {
         j = hd(jobs)
-        v = to_string(map_get(j, 'id'))
-        n = parse_int_simple(v)
+        n = if (is_map(j) == 'false') { 0 }
+            else { parse_int_simple(to_string(map_get(j, 'id'))) }
         new_max = if (n > max_so_far) { n } else { max_so_far }
         next_id(tl(jobs), new_max)
     }
 }
 
+# Remove by id. Never writes a corrupt file (nothing to remove there).
 fun remove(id) {
-    target = to_string(id)
-    jobs = list_all()
-    kept = remove_loop(jobs, target, [])
-    if (length(kept) == length(jobs)) { 'false' }
-    else { save_all(kept) ; 'true' }
+    p = schedule_path()
+    state = read_state_at(p)
+    if (elem(state, 0) != 'ok') { 'false' }
+    else {
+        jobs = elem(state, 1)
+        kept = remove_loop(jobs, to_string(id), [])
+        if (length(kept) == length(jobs)) { 'false' }
+        else { save_at(p, kept) ; 'true' }
+    }
 }
 
 fun remove_loop(jobs, target, acc) {
     if (length(jobs) == 0) { acc }
     else {
         j = hd(jobs)
-        new_acc = if (to_string(map_get(j, 'id')) == target) { acc }
-                  else { list_append(acc, j) }
+        hit = if (is_map(j) == 'false') { 'false' }
+              else { if (to_string(map_get(j, 'id')) == target) { 'true' } else { 'false' } }
+        new_acc = if (hit == 'true') { acc } else { list_append(acc, j) }
         remove_loop(tl(jobs), target, new_acc)
     }
 }
@@ -146,8 +333,25 @@ fun remove_loop(jobs, target, acc) {
 # actually fired (the dirty-flag gate). Previously this rewrote on
 # every tick because tick_loop always rebuilt a same-length list.
 # ------------------------------------------------------------
+# This runs INSIDE main's heartbeat handler: a panic here kills the
+# interactive session. Hence tick_at's contract — any file content
+# (wrong shape, bad field types) is skipped + reported, never raised.
 fun tick(opts, count) {
-    jobs = list_all()
+    r = tick_at(schedule_path(), count)
+    warn_problems(opts, r)
+    map_get(r, 'status')
+}
+
+# tick_at(path, count) → %{status, fired, problems}
+#   status    'noop' (no valid jobs) | 'ok' | 'corrupt'
+#   fired     number of jobs dispatched this tick
+#   problems  human-readable reasons for every skipped entry / a
+#             corrupt file (surfaced once per distinct problem set)
+fun tick_at(p, count) {
+    state = read_state_at(p)
+    ok_state = if (elem(state, 0) == 'ok') { 'true' } else { 'false' }
+    entries = if (ok_state == 'true') { elem(state, 1) } else { [] }
+    valid = valid_jobs_loop(entries, [])
     # Prune .out files on a ~15-minute cadence (tick 1, then every 450
     # ticks at the 2s default), NEVER per-tick: prune shells out, and
     # shell() runs on the CALLER's fiber — this is main's heartbeat
@@ -155,26 +359,69 @@ fun tick(opts, count) {
     # tick interval and froze the UI behind a growing backlog
     # (2026-07-09). Still prunes even when the job list is empty or
     # corrupt, so .out files can't accumulate unbounded.
-    if (count % 450 == 1) { prune_old_out_files(jobs) } else { 'skip' }
-    if (length(jobs) == 0) { 'noop' }
-    else {
+    if (count % 450 == 1) { prune_old_out_files(valid) } else { 'skip' }
+    if (ok_state == 'false') {
+        %{status: 'corrupt', fired: 0,
+          problems: [p ++ " " ++ to_string(elem(state, 1)) ++ " — no scheduled jobs will run"]}
+    } else {
         now = timestamp()
-        r = tick_loop(jobs, now, [], 'false')
+        r = tick_loop(entries, now, [], 0, [])
         updated = elem(r, 0)
-        dirty = elem(r, 1)
-        if (dirty == 'true') { save_all(updated) }
-        'ok'
+        fired = elem(r, 1)
+        problems = elem(r, 2)
+        if (fired > 0) { save_at(p, updated) }
+        %{status: (if (length(valid) == 0) { 'noop' } else { 'ok' }),
+          fired: fired, problems: problems}
     }
 }
 
-fun tick_loop(jobs, now, acc, dirty) {
-    if (length(jobs) == 0) { {acc, dirty} }
+# Walk the RAW entries: invalid ones are carried through untouched
+# (and reported), valid ones get a fire check. A fired job is written
+# back in its normalized form; an unfired one stays byte-identical.
+fun tick_loop(entries, now, acc, fired, problems) {
+    if (length(entries) == 0) { {acc, fired, problems} }
     else {
-        result = maybe_fire(hd(jobs), now)
-        new_job = elem(result, 0)
-        fired = elem(result, 1)
-        new_dirty = if (fired == 'true') { 'true' } else { dirty }
-        tick_loop(tl(jobs), now, list_append(acc, new_job), new_dirty)
+        raw = hd(entries)
+        n = normalize_job(raw)
+        if (elem(n, 0) != 'ok') {
+            tick_loop(tl(entries), now, list_append(acc, raw), fired,
+                      list_append(problems, to_string(elem(n, 1)) ++ " — skipped"))
+        } else {
+            result = maybe_fire(elem(n, 1), now)
+            did = elem(result, 1)
+            out = if (did == 'true') { elem(result, 0) } else { raw }
+            tick_loop(tl(entries), now, list_append(acc, out),
+                      (if (did == 'true') { fired + 1 } else { fired }), problems)
+        }
+    }
+}
+
+# One-time warning per distinct problem set: the heartbeat ticks every
+# 2s, so re-printing would spam the prompt. The last-warned set lives
+# on the heartbeat ETS table (main's session state); print_above keeps
+# the pinned input line intact. A fixed file clears the latch, so a
+# later breakage warns again.
+fun warn_problems(opts, r) {
+    problems = map_get(r, 'problems')
+    table = if (opts == nil) { nil } else { map_get(opts, 'heartbeat_table') }
+    sig = if (problems == nil) { "" } else { json_encode(problems) }
+    if (table == nil) { 'skip' }
+    else { if (problems == nil || length(problems) == 0) {
+        ets_put(table, 'sched_warned', nil)
+        'ok'
+    } else { if (ets_get(table, 'sched_warned') == sig) { 'skip' }
+    else {
+        ets_put(table, 'sched_warned', sig)
+        print_above("\e[38;5;208m⚠ schedule: " ++ problem_lines(problems, "") ++ "\e[0m")
+        'warned'
+    }}}
+}
+
+fun problem_lines(ps, acc) {
+    if (length(ps) == 0) { acc }
+    else {
+        sep = if (string_length(acc) == 0) { "" } else { "; " }
+        problem_lines(tl(ps), acc ++ sep ++ to_string(hd(ps)))
     }
 }
 
@@ -212,15 +459,19 @@ fun maybe_fire(job, now) {
 # ------------------------------------------------------------
 # compute_next_fire — when (in ms-since-epoch) the next fire is
 # scheduled for, given the expression and the prior fire's epoch ms.
-# Two semantics:
+# Three semantics:
 #   * "daily HH:MM" — wallclock. Compute today's HH:MM slot in UTC.
 #     If that's already past last_run, fire then. Otherwise wait
 #     for tomorrow's slot.
-#   * intervals (30s/5m/2h/1d/hourly/daily) — last_run + interval_ms.
+#   * "hourly" — wallclock, the first top-of-the-hour (:00 UTC) after
+#     last_run. A missed hour (machine asleep) fires once on wake,
+#     then realigns to the next :00.
+#   * intervals (30s/5m/2h/1d/daily) — last_run + interval_ms.
 # Returns nil if the expression is unparseable.
 # ------------------------------------------------------------
 fun compute_next_fire(expr, last_run, now) {
-    daily_ms_offset = daily_time_ms(expr)
+    trimmed = string_trim(to_string(expr))
+    daily_ms_offset = daily_time_ms(trimmed)
     if (daily_ms_offset != nil) {
         day_ms = 86400000
         today_midnight = (now / day_ms) * day_ms
@@ -230,52 +481,84 @@ fun compute_next_fire(expr, last_run, now) {
         if (today_slot > last_run) { today_slot }
         else { today_slot + day_ms }
     }
+    else { if (trimmed == "hourly") {
+        hour_ms = 3600000
+        (last_run / hour_ms + 1) * hour_ms
+    }
     else {
-        interval_ms = parse_expr(expr)
+        interval_ms = parse_expr(trimmed)
         if (interval_ms == nil) { nil }
         else { last_run + interval_ms }
-    }
+    }}
 }
 
 # parse_expr — return the interval in MILLISECONDS for supported
-# expression forms. Returns nil for unparseable, including the
-# "daily HH:MM" form (callers route those through daily_time_ms +
-# compute_next_fire's wallclock branch). "daily" alone is the 24h
-# interval; "daily HH:MM" returns 86400000 here too so add()'s
-# validation accepts both shapes uniformly.
+# expression forms, nil for anything else. "hourly" and "daily HH:MM"
+# are wallclock-aligned (see compute_next_fire) but still report
+# their nominal period here so validation accepts every shape
+# uniformly. Strict: see expr_error for what is rejected and why.
 fun parse_expr(s) {
-    trimmed = string_trim(s)
-    if (string_length(trimmed) == 0) { nil }
-    else { if (trimmed == "hourly") { 3600000 }
-    else { if (trimmed == "daily") { 86400000 }
-    else { if (daily_time_ms(trimmed) != nil) { 86400000 }
-    else { parse_interval(trimmed) }}}}
+    if (expr_error(to_string(s)) == nil) { expr_period_ms(string_trim(to_string(s))) }
+    else { nil }
 }
 
-# parse_interval — `30s`, `5m`, `2h`, `1d` → MILLISECONDS.
-# Previously this returned seconds, which silently mismatched
-# timestamp()'s ms units and made every interval fire ~3.6 seconds
-# after creation (with back-pressure masking it). Fixed: ms throughout.
+fun expr_period_ms(trimmed) {
+    if (trimmed == "hourly") { 3600000 }
+    else { if (trimmed == "daily") { 86400000 }
+    else { if (daily_time_ms(trimmed) != nil) { 86400000 }
+    else { parse_interval(trimmed) }}}
+}
+
+# expr_error(s) → nil when `s` is a valid schedule expression, else a
+# one-line reason. The old parsers read the leading digits and ignored
+# the rest, so "1.5h" ran hourly, "10x5m" every 10 minutes, "daily :"
+# at 00:00 and "daily 9:5x" at 09:05 — all silently accepted.
+fun expr_error(s) {
+    t = string_trim(to_string(s))
+    q = "'" ++ t ++ "'"
+    hint = " — use e.g. 30s, 5m, 2h, 1d, hourly, daily or daily 09:00"
+    if (string_length(t) == 0) { "empty schedule expression" ++ hint }
+    else { if (t == "hourly" || t == "daily") { nil }
+    else { if (string_starts_with(t, "daily ") == 'true') {
+        if (daily_time_ms(t) != nil) { nil }
+        else { "invalid time in " ++ q ++ ": want daily HH:MM (UTC, 00:00-23:59, e.g. daily 9:05)" }
+    }
+    else { if (parse_interval(t) != nil) { nil }
+    else {
+        "invalid schedule " ++ q ++ ": an interval is a whole number plus s/m/h/d" ++ hint
+    }}}}
+}
+
+# parse_interval — `30s`, `5m`, `2h`, `1d` → MILLISECONDS, or nil.
+# Strict: the count must be ONLY digits (no sign, decimal point, space
+# or other junk), >= 1 and <= 9 digits (no int overflow), followed by
+# exactly one unit letter. Previously this returned seconds, which
+# silently mismatched timestamp()'s ms units; ms throughout now.
 fun parse_interval(s) {
     n = string_length(s)
     if (n < 2) { nil }
     else {
         suffix = string_sub(s, n - 1, 1)
         num_str = string_sub(s, 0, n - 1)
-        num = parse_int_simple(num_str)
-        if (num <= 0) { nil }
+        if (all_digits(num_str) == 'false' || string_length(num_str) > 9) { nil }
         else {
-            if (suffix == "s") { num * 1000 }
-            else { if (suffix == "m") { num * 60000 }
-            else { if (suffix == "h") { num * 3600000 }
-            else { if (suffix == "d") { num * 86400000 }
-            else { nil }}}}
+            num = parse_int_simple(num_str)
+            if (num <= 0) { nil }
+            else {
+                if (suffix == "s") { num * 1000 }
+                else { if (suffix == "m") { num * 60000 }
+                else { if (suffix == "h") { num * 3600000 }
+                else { if (suffix == "d") { num * 86400000 }
+                else { nil }}}}
+            }
         }
     }
 }
 
 # daily_time_ms — parse "daily HH:MM" -> ms since midnight, or nil
-# if the expression isn't a daily-with-time form. Used by
+# if the expression isn't a (valid) daily-with-time form. Strict: the
+# hour is 1-2 digits, the minute exactly 2, nothing else — "daily :",
+# "daily 9:5x", "daily 9:5" and "daily 24:00" are all nil. Used by
 # compute_next_fire to schedule wallclock-aligned fires.
 fun daily_time_ms(s) {
     if (string_starts_with(s, "daily ") == 'false') { nil }
@@ -284,12 +567,17 @@ fun daily_time_ms(s) {
         parts = string_split(time_part, ":")
         if (length(parts) != 2) { nil }
         else {
-            h_str = string_trim(hd(parts))
-            m_str = string_trim(hd(tl(parts)))
-            h = parse_int_simple(h_str)
-            m = parse_int_simple(m_str)
-            if (h < 0 || h > 23 || m < 0 || m > 59) { nil }
-            else { (h * 3600 + m * 60) * 1000 }
+            h_str = hd(parts)
+            m_str = hd(tl(parts))
+            shape_ok = all_digits(h_str) == 'true' && all_digits(m_str) == 'true' &&
+                       string_length(h_str) <= 2 && string_length(m_str) == 2
+            if (shape_ok == 'false') { nil }
+            else {
+                h = parse_int_simple(h_str)
+                m = parse_int_simple(m_str)
+                if (h < 0 || h > 23 || m < 0 || m > 59) { nil }
+                else { (h * 3600 + m * 60) * 1000 }
+            }
         }
     }
 }
@@ -319,17 +607,27 @@ fun dispatch(job) {
         prompt = to_string(map_get(job, 'prompt'))
         ts = to_string(timestamp())
         out_path = jobs_dir() ++ "/scheduled-" ++ id ++ "-" ++ ts ++ ".out"
-        bin = swarm_binary_path()
-        # Pidfile records "PID LSTART" (process start-time) so
-        # previous_fire_alive can detect a recycled PID — kill(pid,0)
-        # alone returns alive on EPERM, wedging the job in skipped_busy.
-        inner =
-            "nohup " ++ Util.shell_q(bin) ++ " --no-resume -p " ++ Util.shell_q(prompt) ++
-            " > " ++ Util.shell_q(out_path) ++ " 2>&1 & SW_PID=$!; " ++
-            "echo \"$SW_PID $(ps -o lstart= -p \"$SW_PID\" 2>/dev/null)\" > " ++ Util.shell_q(pid_file)
-        shell("bash -c " ++ Util.shell_q(inner))
+        shell(dispatch_cmd(swarm_binary_path(), prompt, out_path, pid_file))
         'dispatched'
     }
+}
+
+# The shell command dispatch() runs. Pure, so the safety prefix is
+# unit-testable. SWARM_CODE_DENY_DANGEROUS=1 turns the dangerous-bash
+# gate into a hard deny in the child — a headless run otherwise
+# auto-approves every 'ask', and a job firing unattended (nobody at
+# the terminal, possibly hours later) must not auto-run `rm -rf ~/…`.
+# Same rule as Flows.build_task_cmd.
+# Pidfile records "PID LSTART" (process start-time) so
+# previous_fire_alive can detect a recycled PID — kill(pid,0)
+# alone returns alive on EPERM, wedging the job in skipped_busy.
+fun dispatch_cmd(bin, prompt, out_path, pid_file) {
+    inner =
+        "SWARM_CODE_DENY_DANGEROUS=1 nohup " ++ Util.shell_q(bin) ++
+        " --no-resume -p " ++ Util.shell_q(prompt) ++
+        " > " ++ Util.shell_q(out_path) ++ " 2>&1 & SW_PID=$!; " ++
+        "echo \"$SW_PID $(ps -o lstart= -p \"$SW_PID\" 2>/dev/null)\" > " ++ Util.shell_q(pid_file)
+    "bash -c " ++ Util.shell_q(inner)
 }
 
 # Has the previous fire's child exited? Cheap kill(pid, 0) check via
@@ -447,19 +745,23 @@ fun resume_job(id) {
 }
 
 fun set_paused(target_id, paused_val) {
-    jobs = list_all()
-    r = set_paused_loop(jobs, target_id, paused_val, [], 'false')
-    new_jobs = elem(r, 0)
-    found = elem(r, 1)
-    if (found == 'true') { save_all(new_jobs) ; 'true' }
-    else { 'false' }
+    p = schedule_path()
+    state = read_state_at(p)
+    if (elem(state, 0) != 'ok') { 'false' }
+    else {
+        r = set_paused_loop(elem(state, 1), target_id, paused_val, [], 'false')
+        new_jobs = elem(r, 0)
+        found = elem(r, 1)
+        if (found == 'true') { save_at(p, new_jobs) ; 'true' }
+        else { 'false' }
+    }
 }
 
 fun set_paused_loop(jobs, target_id, paused_val, acc, found) {
     if (length(jobs) == 0) { {acc, found} }
     else {
         j = hd(jobs)
-        if (to_string(map_get(j, 'id')) == target_id) {
+        if (is_map(j) == 'true' && to_string(map_get(j, 'id')) == target_id) {
             new_j = map_put(j, 'paused', paused_val)
             set_paused_loop(tl(jobs), target_id, paused_val, list_append(acc, new_j), 'true')
         } else {
