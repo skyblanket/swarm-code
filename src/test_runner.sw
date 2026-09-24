@@ -34,6 +34,7 @@ import MemVec
 import ToolExecutor
 import ToolRegistry
 import Background
+import Hooks
 
 fun main() {
     print("")
@@ -237,7 +238,10 @@ fun main() {
         t_command_tools_gated(),
         t_denial_names_reason(),
         t_sudo_tab_blocked(),
-        t_bg_sessions_isolated()
+        t_bg_sessions_isolated(),
+        t_pre_tool_hook_big_payload(),
+        t_configured_hook_big_payload(),
+        t_pre_tool_hook_fails_closed()
     ]
 
     passed = sum_list(results, 0)
@@ -2899,4 +2903,54 @@ fun to_int_or_zero(v) { if (v == nil) { 0 } else { Tools.to_int(v) } }
 fun proc_live(pid) {
     st = string_trim(to_string(elem(shell("ps -o stat= -p " ++ to_string(pid) ++ " 2>/dev/null"), 1)))
     if (string_length(st) > 0 && string_starts_with(st, "Z") == 'false') { 'true' } else { 'false' }
+}
+
+# Hook payloads went into the command line + an env var: a >128KB write hit
+# E2BIG, so the hook never ran, shell() polled 120s, and then a vetoing
+# pre_tool.sh was SKIPPED (call allowed) while a settings.json PreToolUse
+# hook reported `block` 120s late. The payload now arrives on stdin / in a
+# 0600 file; the hook runs promptly and its verdict is honoured.
+fun big_write_args(marker) {
+    %{path: "/tmp/swc_hook_target.txt", content: repeat_str(repeat_str("0123456789abcdef", 64), 200) ++ marker}
+}
+
+fun t_pre_tool_hook_big_payload() {
+    hook = "/tmp/swc_pre_tool_veto.sh"
+    file_write(hook, "#!/bin/sh\n# veto when the payload (stdin) carries the marker\n" ++
+                     "if grep -q HOOK_MARKER_BIG; then echo '{\"veto\": true}'; fi\n")
+    t0 = timestamp()
+    v = Hooks.run_pre_tool_at(hook, 'write', big_write_args("HOOK_MARKER_BIG"), "/tmp/swarm-code-hook-")
+    el = timestamp() - t0
+    small = Hooks.run_pre_tool_at(hook, 'write', %{path: "/tmp/x", content: "hi"}, "/tmp/swarm-code-hook-")
+    file_delete(hook)
+    check("pre_tool.sh: a >128KB payload reaches the hook (veto honoured, <10s)",
+          bool_and3(if (map_get(v, 'veto') == 'true') { 'true' } else { 'false' },
+                    if (el < 10000) { 'true' } else { 'false' },
+                    if (map_get(small, 'veto') == 'false') { 'true' } else { 'false' }))
+}
+
+fun t_configured_hook_big_payload() {
+    hook_cmd = "if grep -q HOOK_MARKER_BIG; then echo 'refusing big secret write' >&2; exit 3; fi; " ++
+               "[ -n \"$SWARM_CODE_ARGS_OMITTED\" ] || echo \"$SWARM_CODE_ARGS\" | grep -q hi"
+    opts = %{settings: %{hooks: %{PreToolUse: [%{matcher: "write", command: hook_cmd}]}}}
+    t0 = timestamp()
+    big = Config.run_hooks_verdict("PreToolUse", 'write', json_encode(big_write_args("HOOK_MARKER_BIG")), opts)
+    el = timestamp() - t0
+    small = Config.run_hooks_verdict("PreToolUse", 'write', json_encode(%{path: "/tmp/x", content: "hi"}), opts)
+    reason = if (big == 'ok') { "" } else { to_string(elem(big, 1)) }
+    check("settings.json PreToolUse hook: >128KB args via stdin, blocks promptly with its message",
+          bool_and3(bool_and(if (big != 'ok') { 'true' } else { 'false' }, string_contains(reason, "refusing big secret write")),
+                    if (el < 10000) { 'true' } else { 'false' },
+                    if (small == 'ok') { 'true' } else { 'false' }))
+}
+
+# A veto hook that cannot be run at all must fail CLOSED (deny, with why).
+fun t_pre_tool_hook_fails_closed() {
+    hook = "/tmp/swc_pre_tool_noop.sh"
+    file_write(hook, "#!/bin/sh\nexit 0\n")
+    v = Hooks.run_pre_tool_at(hook, 'bash', %{command: "ls"}, "/nonexistent-dir-swc/hook-")
+    file_delete(hook)
+    check("pre_tool.sh that can't be run (no payload file) vetoes with a reason",
+          bool_and(if (map_get(v, 'veto') == 'true') { 'true' } else { 'false' },
+                   string_contains(to_string(map_get(v, 'reason')), "could not run")))
 }

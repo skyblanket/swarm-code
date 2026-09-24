@@ -2,6 +2,7 @@ module Config
 
 import Util
 import CommandGuard
+import Hooks
 
 # ============================================================
 # Config — settings.json, SWARM.md, permissions, hooks
@@ -34,7 +35,8 @@ import CommandGuard
 # }
 
 export [load, load_project_context, check_permission, run_hooks, is_dangerous_bash, is_hardline_bash,
-        llm_timeout_ms, command_of, command_risk, denial_message, denial_reason, uses_sudo]
+        llm_timeout_ms, command_of, command_risk, denial_message, denial_reason, uses_sudo,
+        run_hooks_verdict]
 
 # ------------------------------------------------------------
 # load settings — merged map from user + project config files
@@ -279,14 +281,28 @@ fun is_hardline_bash(args) {
 #   }
 #
 # Matcher is a literal substring of the tool name, or "*" for all.
-# Hooks receive context through environment variables set before shell():
-#   SWARM_CODE_EVENT, SWARM_CODE_TOOL, SWARM_CODE_ARGS
+# Hooks receive context through the environment and stdin:
+#   SWARM_CODE_EVENT, SWARM_CODE_TOOL — event and tool name
+#   stdin, and the private 0600 file $SWARM_CODE_ARGS_FILE — the args JSON
+#     (always; read one of these to see every call)
+#   SWARM_CODE_ARGS — the same JSON inline, only when it is under 100KB;
+#     above that it is unset and SWARM_CODE_ARGS_OMITTED=1
+# (The args used to be spliced into the command line + env: a >128KB
+# write hit E2BIG, the hook never ran, and shell() polled 120s before
+# reporting a block.) Hooks time out after hook_cmd_timeout_ms().
 #
 # Returns 'ok' normally. Returns 'block' if any PreToolUse hook exited
-# non-zero (blocking the tool call).
+# non-zero, timed out, or could not be run at all (fail closed) —
+# blocking the tool call. run_hooks_verdict also says why.
 # ------------------------------------------------------------
 fun run_hooks(event, tool_name, args_json, opts) {
-    settings = map_get(opts, 'settings')
+    v = run_hooks_verdict(event, tool_name, args_json, opts)
+    if (v == 'ok') { 'ok' } else { 'block' }
+}
+
+# 'ok' | {'block', reason}
+fun run_hooks_verdict(event, tool_name, args_json, opts) {
+    settings = if (opts == nil) { nil } else { map_get(opts, 'settings') }
     if (settings == nil) { 'ok' }
     else {
         hooks = map_get(settings, 'hooks')
@@ -343,8 +359,8 @@ fun run_matching_hooks(hooks_list, tool_name, args_json, event) {
         } else {
             if (matches(matcher, tool_name) == 'true') {
                 result = run_hook_cmd(cmd, event, tool_name, args_json)
-                if (result == 'block') {
-                    'block'
+                if (result != 'ok') {
+                    result
                 } else {
                     run_matching_hooks(tl(hooks_list), tool_name, args_json, event)
                 }
@@ -377,19 +393,33 @@ fun matches(matcher, tool_name) {
     }
 }
 
-# Run a single hook command. Wrap with env exports for context.
-# If the command exits non-zero, treat as a block signal.
-# Args JSON is exposed as SWARM_CODE_ARGS so hooks can inspect the
-# tool payload (e.g. a `bash` hook that greps the command). Quoted
-# with shell_q_local because args_json contains arbitrary JSON
-# (including single quotes inside strings).
+# Run a single hook command with the context described above run_hooks.
+# 'ok' on exit 0; {'block', reason} on a non-zero exit, a timeout, or when
+# the hook could not be run at all — the reason carries the exit code and
+# the start of the hook's output (stdout+stderr) so the model can see why.
+fun hook_cmd_timeout_ms() { 60000 }
+
 fun run_hook_cmd(cmd, event, tool_name, args_json) {
-    args_safe = Util.shell_q(to_string(args_json))
-    full = "export SWARM_CODE_EVENT=" ++ Util.shell_q(to_string(event)) ++ "; " ++
-           "export SWARM_CODE_TOOL="  ++ Util.shell_q(to_string(tool_name)) ++ "; " ++
-           "export SWARM_CODE_ARGS="  ++ args_safe ++ "; " ++
-           cmd
-    result = shell(full)
-    code = elem(result, 0)
-    if (code == 0) { 'ok' } else { 'block' }
+    exports = "export SWARM_CODE_EVENT=" ++ Util.shell_q(to_string(event)) ++ "; " ++
+              "export SWARM_CODE_TOOL="  ++ Util.shell_q(to_string(tool_name)) ++ ";"
+    res = Hooks.run_with_payload(cmd, to_string(args_json), "SWARM_CODE_ARGS", exports,
+                                 hook_cmd_timeout_ms(), hook_tmp_prefix())
+    label = to_string(event) ++ " hook `" ++ string_truncate(to_string(cmd), 80) ++ "`"
+    if (map_get(res, 'ran') != 'true') {
+        {'block', label ++ " could not run — " ++ to_string(map_get(res, 'error'))}
+    } else { if (map_get(res, 'interrupted') == 'true') {
+        {'block', label ++ " timed out after " ++ to_string(hook_cmd_timeout_ms() / 1000) ++ "s"}
+    } else { if (map_get(res, 'code') == 0) {
+        'ok'
+    } else {
+        out = string_trim(to_string(map_get(res, 'out')))
+        tail = if (string_length(out) == 0) { "" } else { ": " ++ string_truncate(out, 500) }
+        {'block', label ++ " exited " ++ to_string(map_get(res, 'code')) ++ tail}
+    }}}
+}
+
+fun hook_tmp_prefix() {
+    t = getenv("TMPDIR")
+    base = if (t == nil || string_length(to_string(t)) == 0) { "/tmp" } else { to_string(t) }
+    base ++ "/swarm-code-hook-"
 }
