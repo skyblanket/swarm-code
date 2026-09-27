@@ -239,11 +239,15 @@ fun sw_capabilities() {
     "wsc_connect_tls(url, headers) → handle, wsc_send, wsc_recv(handle, " ++
     "timeout_ms) (non-blocking poll with 0), wsc_close. This is how you build " ++
     "real-time bidirectional agents.\n" ++
-    "- Audio codecs (base64 string twins AND raw-bytes twins): " ++
+    "- Audio codecs (base64 string twins AND raw-bytes twins; need `import Audio` " ++
+    "in the calling module): " ++
     "audio_ulaw_to_pcm16 / audio_pcm16_to_ulaw / audio_resample(b64, from_hz, " ++
     "to_hz), and the bytes versions audio_ulaw_to_pcm16_b / audio_pcm16_to_ulaw_b " ++
     "/ audio_resample_b. For G.711 mu-law passthrough you stay in base64 ASCII " ++
     "end-to-end and never touch raw bytes.\n" ++
+    "- Batteries: pdf_text / pdf_pages / pdf_meta need `import Pdf`, " ++
+    "chrome_launch needs `import Chrome`, the audio_* codecs need `import Audio` — " ++
+    "in each module that calls them; swc rejects the call otherwise.\n" ++
     "- Voice module (`import Voice`): native real-time voice-agent helpers " ++
     "bridging a telephony provider (Telnyx Media Streaming, a swarmrt WS " ++
     "*server*) to a speech-to-speech model (OpenAI Realtime, reached as a WS " ++
